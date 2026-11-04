@@ -175,7 +175,7 @@ enum APIClient {
         let url = TianqiongAPI.baseURL
             .appendingPathComponent("meetings/info")
             .appendingPathComponent(no)
-        sendRequest(url: url, method: "GET", token: AuthStore.load()?.token) { result in
+        request(url: url, method: "GET", token: AuthStore.load()?.token) { result in
             switch result {
             case .success(let json):
                 guard let meeting = json["meeting"] as? [String: Any] else {
@@ -206,7 +206,7 @@ enum APIClient {
         completion: @escaping (Result<[IceServerConfig], Error>) -> Void
     ) {
         let url = TianqiongAPI.baseURL.appendingPathComponent("rtc/ice")
-        sendRequest(url: url, method: "GET", token: AuthStore.load()?.token) { result in
+        request(url: url, method: "GET", token: AuthStore.load()?.token) { result in
             switch result {
             case .success(let json):
                 guard let rawList = json["iceServers"] as? [[String: Any]] else {
@@ -237,7 +237,7 @@ enum APIClient {
         if !title.isEmpty {
             body["title"] = title
         }
-        sendRequest(url: url, method: "POST", token: AuthStore.load()?.token, body: body) { result in
+        request(url: url, method: "POST", token: AuthStore.load()?.token, body: body) { result in
             switch result {
             case .success(let json):
                 guard
@@ -266,7 +266,11 @@ enum APIClient {
     /// 通用 JSON 请求。token 可空（访客接口不需要鉴权）。
     /// 统一处理：网络错误、非 2xx 的业务错误（取 body.error）、JSON 解析。
     /// 回调保证在主线程。
-    private static func sendRequest(
+    ///
+    /// 对内公开（internal）而不是 private：企业空间、会议列表这些模块各自有独立的
+    /// 模型与错误语义，不应该把十几个 endpoint 全塞进这个文件；它们共享同一套
+    /// 超时、鉴权头与错误文案，因此只复用这一条请求管线。
+    static func request(
         url: URL,
         method: String,
         token: String?,

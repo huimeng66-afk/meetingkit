@@ -212,7 +212,7 @@ struct MeetingRoomView: View {
             if let toast = viewModel.toast {
                 ToastView(message: toast)
                     .padding(.horizontal, Theme.Metrics.horizontal)
-                    .padding(.top, insets.top + 52 + (viewModel.isScreenSharing ? 32 : 0) + 8)
+                    .padding(.top, insets.top + 52 + (viewModel.isShareBannerVisible ? 32 : 0) + 8)
                     // id 变化会重建视图，从而重播进入动画：
                     // 连续两次同样的提示（例如连点两次静音）用户才看得出"又触发了一次"。
                     .id(toast.id)

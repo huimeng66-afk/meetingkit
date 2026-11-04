@@ -142,7 +142,7 @@ struct AppRootView: View {
 
             switch router.phase {
             case .home:
-                HomeView(router: router)
+                HomeView(router: router, settings: AppSettings.shared)
                     .transition(.opacity)
             case .preJoin(let info):
                 PreJoinView(router: router, info: info)

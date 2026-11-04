@@ -36,11 +36,11 @@ struct LocalVideoFloatingView: View {
 
     // MARK: - 尺寸与行程
 
-    /// 共享时缩到 76×112，尽量少挡共享内容。
+    /// 共享时整窗隐藏（见 body 的 opacity），因此这里只保留常态尺寸。
+    /// 之前共享时缩到 76×112 仍然会压住 PPT 的右下角，而右下角恰好是
+    /// 幻灯片页码/图表注脚的位置——缩小并不能解决问题，让位才是。
     private var tileSize: CGSize {
-        viewModel.isScreenSharing
-            ? CGSize(width: 76, height: 112)
-            : CGSize(width: 100, height: 150)
+        CGSize(width: 100, height: 150)
     }
 
     private var edgeMargin: CGFloat { 12 }
@@ -49,7 +49,7 @@ struct LocalVideoFloatingView: View {
     /// 只写 `topInset + 60` 时，共享期间顶栏下面多出 32pt 的红色警示条，
     /// 小窗会被它压住 24pt（52 + 8 = 60 < 52 + 32 + 8 = 92）。
     private var topLimit: CGFloat {
-        topInset + 52 + (viewModel.isScreenSharing ? 32 : 0) + 8
+        topInset + 52 + (viewModel.isShareBannerVisible ? 32 : 0) + 8
     }
 
     /// 下边界：底栏顶（64 + bottomInset）再留 12pt。
@@ -109,12 +109,18 @@ struct LocalVideoFloatingView: View {
             // 也套上弹簧，小窗变成"追着手指跑"的橡皮筋。
             windowBody
                 .animationCompat(Theme.Motion.standard, value: isDragging)
-                .animationCompat(Theme.Motion.standard, value: viewModel.isScreenSharing)
+                .animationCompat(Theme.Motion.standard, value: viewModel.isShareBannerVisible)
                 .position(resolvedPosition)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onChange(of: viewModel.isScreenSharing) { sharing in
-            // 开始共享后统一回到右下角，避免正好压住共享内容的主体。
+        // 共享时整窗淡出而不是缩小：共享画面是全场唯一焦点，
+        // 任何尺寸的浮窗都会挡住 PPT 的一角，而且用户此时要看的是内容而不是自己。
+        // 退出共享后原位置淡入，用户不用重新找小窗。
+        .opacity(viewModel.isShareBannerVisible ? 0 : 1)
+        .allowsHitTesting(!viewModel.isShareBannerVisible)
+        .animationCompat(Theme.Motion.standard, value: viewModel.isShareBannerVisible)
+        .onChange(of: viewModel.isShareBannerVisible) { sharing in
+            // 开始共享后统一回到右下角，退出共享时小窗不会停在屏幕正中间。
             if sharing {
                 withAnimation(Theme.Motion.standard) {
                     normalized = CGPoint(x: 1, y: 1)
@@ -140,7 +146,6 @@ struct LocalVideoFloatingView: View {
             )
             // 拖动时轻微放大 + 阴影加深，给出"被拿起来了"的物理感。
             .scaleEffect(isDragging ? 1.03 : 1.0)
-            .opacity(viewModel.isScreenSharing ? 0.9 : 1.0)
             .shadow(
                 color: Color.black.opacity(isDragging ? 0.55 : 0.35),
                 radius: isDragging ? 18 : 10,

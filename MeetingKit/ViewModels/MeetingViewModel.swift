@@ -83,9 +83,41 @@ final class MeetingViewModel: ObservableObject {
 
     // MARK: - 屏幕共享（来自 ScreenShareBridge）
 
+    /// 本机是否正在共享。只由扩展进程的真实状态驱动，不做乐观点值。
     @Published private(set) var isScreenSharing: Bool = false
-    @Published private(set) var sharedFrame: UIImage?
+    /// 本机共享已持续时长 "mm:ss"。
     @Published private(set) var shareDurationText: String = "00:00"
+    /// 远端共享者的显示名。用于共享舞台的"某某正在共享"，空串表示没有远端共享。
+    @Published private(set) var remoteScreenPeerName: String = ""
+    /// 远端共享已持续时长 "mm:ss"。
+    @Published private(set) var remoteShareDurationText: String = "00:00"
+
+    /// 顶栏共享条是否显示。
+    ///
+    /// 之前只判断 `isScreenSharing`：别人共享时顶栏没有任何提示，画面突然从宫格
+    /// 变成一张 PPT，用户不知道发生了什么，也找不到"这是谁在共享"。
+    /// 共享条必须对本机/远端两种情况同时生效。
+    var isShareBannerVisible: Bool {
+        isScreenSharing || remoteScreenPeerID != nil
+    }
+
+    /// 共享条文案。本机共享与观看他人共享是两种完全不同的语义，
+    /// 用一个统一字符串会让"停止共享"按钮出现在观看者身上。
+    var shareBannerText: String {
+        if isScreenSharing {
+            return "你正在共享屏幕"
+        }
+        if remoteScreenPeerID != nil {
+            let name = remoteScreenPeerName.isEmpty ? "参会成员" : remoteScreenPeerName
+            return "\(name) 正在共享屏幕"
+        }
+        return ""
+    }
+
+    /// 共享条右侧的时长。
+    var shareBannerDurationText: String {
+        isScreenSharing ? shareDurationText : remoteShareDurationText
+    }
 
     // MARK: - 布局与面板
 
@@ -126,6 +158,10 @@ final class MeetingViewModel: ObservableObject {
 
     /// 停止请求的最小重发间隔。
     private static let stopRetryInterval: TimeInterval = 3
+
+    /// 远端分享的起始时刻。用于计算"某某已共享 03:12"，
+    /// 不能从 `participants` 里找时间戳——共享是媒体行为，不是参会状态。
+    private var remoteShareStartedAt: Date?
 
     /// 是否已经处理过首次共享状态。冷启动时扩展可能早就在跑，
     /// 首次只同步 UI，不弹提示、也不重复调用 rtc.startScreenShare()。
@@ -177,7 +213,9 @@ final class MeetingViewModel: ObservableObject {
         joinPassword = join.password
         joinToken = join.token.isEmpty ? (AuthStore.load()?.token ?? "") : join.token
         // 入会页的预览开关直接成为会议室初始状态，避免"预览里关了麦、进去又开着"。
-        isMicOn = join.micOn
+        // "入会自动静音"是用户在设置里明确打开的强约束，优先级高于入会页的开关：
+        // 需要这项功能的场景（企业大会、旁听）里，静音比"记住上次选择"更重要。
+        isMicOn = join.micOn && !AppSettings.shared.autoMuteOnJoin
         isCameraOn = join.cameraOn
 
         let resolvedClient: RTCClient
@@ -546,7 +584,7 @@ final class MeetingViewModel: ObservableObject {
         remoteVideoViews.removeValue(forKey: userID)
         remoteScreenViews.removeValue(forKey: userID)
         if remoteScreenPeerID == userID {
-            remoteScreenPeerID = nil
+            clearRemoteShareState()
         }
     }
 
@@ -635,7 +673,7 @@ final class MeetingViewModel: ObservableObject {
         participants = []
         remoteVideoViews.removeAll()
         remoteScreenViews.removeAll()
-        remoteScreenPeerID = nil
+        clearRemoteShareState()
         localPreviewView = nil
         activeSpeakerID = nil
         networkQuality = .unknown
@@ -707,6 +745,16 @@ extension MeetingViewModel: RTCClientDelegate {
         // participants 里的本机行是权威数据（RTC 只认它），而视图读的是三个 @Published 标量。
         // 不在这里回写就会出现"双真相源"：换会话后底栏说静音、成员列表说麦克风已开。
         // 只在值真的变化时赋值，避免每次全量刷新都触发一次无意义的 objectWillChange。
+        //
+        // 同时补齐共享者名字：screen:state 事件可能比 participants 快照先到，
+        // 那一刻只能显示"参会成员 正在共享"；快照到达后必须把真名补上，
+        // 否则共享条会一直停在占位文案上。
+        if let sharingID = remoteScreenPeerID,
+           let sharer = self.participants.first(where: { $0.id == sharingID }),
+           remoteScreenPeerName != sharer.name {
+            remoteScreenPeerName = sharer.name
+        }
+
         guard let local = self.participants.first(where: { $0.isLocal }) else { return }
         if isMicOn != local.isMicOn {
             isMicOn = local.isMicOn
@@ -764,26 +812,48 @@ extension MeetingViewModel: RTCClientDelegate {
 
     func rtcDidReceiveRemoteVideo(_ view: UIView, for userID: String) {
         remoteVideoViews[userID] = view
-        // 同一个 peer 从"共享"切回"摄像头"：清掉共享占位。
-        if remoteScreenPeerID == userID {
-            remoteScreenViews.removeValue(forKey: userID)
-            remoteScreenPeerID = nil
-        }
+        // 这里**不能**因为收到摄像头帧就把共享态清掉。
+        // 远端共享时通常同时开着摄像头轨道，服务端也会周期性重推 participants 快照，
+        // 一旦摄像头帧晚到一点，共享画面就会"闪一下又回到宫格"。
+        // 共享的结束只由两条明确信号驱动：媒体丢失（rtcDidLoseRemoteMedia）
+        // 或共享者离开列表（removeParticipant）。
     }
 
     func rtcDidReceiveRemoteScreen(_ view: UIView, for userID: String) {
+        let isNewSharer = remoteScreenPeerID != userID
         remoteScreenViews[userID] = view
         remoteScreenPeerID = userID
+        if isNewSharer {
+            remoteShareStartedAt = Date()
+            remoteShareDurationText = "00:00"
+        }
+        remoteScreenPeerName = participants.first(where: { $0.id == userID })?.name ?? remoteScreenPeerName
         // 切到共享展示时收起面板，保证画面完整。
         activePanel = nil
+        // 有人开始共享时把控件收起来：共享内容是全场焦点，
+        // 顶栏/底栏会直接压住 PPT 的第一行标题（与网页端观感一致）。
+        // 只在"刚切到共享"时收，避免观看者手动展开后又被每次快照推回隐藏。
+        if isNewSharer {
+            isChromeVisible = false
+        }
     }
 
     func rtcDidLoseRemoteMedia(for userID: String) {
         remoteVideoViews.removeValue(forKey: userID)
         remoteScreenViews.removeValue(forKey: userID)
         if remoteScreenPeerID == userID {
-            remoteScreenPeerID = nil
+            clearRemoteShareState()
         }
+    }
+
+    /// 清空远端共享的展示态。
+    /// 名字与起始时间必须一起清：只清 peerID 的话，下一个人开始共享时
+    /// 会在头 1 秒里显示上一个人的名字和上一场的时长。
+    private func clearRemoteShareState() {
+        remoteScreenPeerID = nil
+        remoteScreenPeerName = ""
+        remoteShareStartedAt = nil
+        remoteShareDurationText = "00:00"
     }
 
     // MARK: 房间级事件
@@ -959,15 +1029,6 @@ private extension MeetingViewModel {
                 }
             }
             .store(in: &cancellables)
-
-        shareBridge.$latestFrame
-            .sink { [weak self] image in
-                Task { @MainActor in
-                    guard let self = self else { return }
-                    self.sharedFrame = image
-                }
-            }
-            .store(in: &cancellables)
     }
 
     /// 共享状态的同步点：只改状态与 RTC 调用，不负责弹提示。
@@ -992,7 +1053,6 @@ private extension MeetingViewModel {
             // 真实链路：开始把 App Group 里的共享帧推上 video sender。
             rtc.beginScreenFramePush()
         } else {
-            sharedFrame = nil
             shareDurationText = "00:00"
             pendingStopAt = nil
             // 真实链路：停止推流并换回摄像头轨。
@@ -1059,6 +1119,14 @@ private extension MeetingViewModel {
             shareDurationText = Self.formatShortClock(now.timeIntervalSince(shareStart))
         } else if !isScreenSharing {
             shareDurationText = "00:00"
+        }
+
+        // 远端共享的时长只能本地计时：服务端 screen:state 只告诉"谁在共享"，
+        // 不带开始时间。走同一拍计时器，避免为一行文字再起一个 Timer。
+        if let remoteStart = remoteShareStartedAt {
+            remoteShareDurationText = Self.formatShortClock(now.timeIntervalSince(remoteStart))
+        } else if remoteShareDurationText != "00:00" {
+            remoteShareDurationText = "00:00"
         }
     }
 

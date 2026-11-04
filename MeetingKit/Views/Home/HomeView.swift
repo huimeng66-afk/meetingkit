@@ -18,10 +18,24 @@ struct HomeView: View {
 
     @ObservedObject var router: AppRouter
 
+    /// 全局设置。首页需要读"默认麦克风/摄像头"，设置页需要写同一份对象；
+    /// 用注入而不是在页面里再取一次单例，是为了让预览也能塞一份内存态。
+    @ObservedObject var settings: AppSettings
+
     @State private var tab: HomeTab = .meetings
     @State private var isEditingProfile = false
     @State private var draftName = ""
     @State private var draftColor = 0
+
+    // MARK: 侧边栏
+
+    @State private var isSidebarOpen = false
+    /// 关闭手势的跟手位移（恒 ≤ 0）。与 isSidebarOpen 分开：打开动画由 transition 负责，
+    /// 手势只负责"往回推"这一段，两者叠加不会互相覆盖。
+    @State private var sidebarDragOffset: CGFloat = 0
+
+    /// 重选当前 tab 时自增，驱动列表滚回顶部。
+    @State private var scrollTopToken = 0
 
     // MARK: 首页入会表单（对齐网页端 hero 的 join-card）
 
@@ -30,14 +44,11 @@ struct HomeView: View {
     @State private var meetingNumber = ""
     /// 选填名称。空串时以「访客」入会，与网页端 placeholder 语义一致。
     @State private var guestName = ""
-    @State private var isMicOn = true
-    @State private var isCameraOn = true
+    @State private var isMicOn: Bool
+    @State private var isCameraOn: Bool
     @State private var isLoginPresented = false
     /// 登录态只在进入首页 / 关闭登录页时读一次，避免每帧读 Keychain。
     @State private var session: AuthSession? = AuthStore.load()
-
-    /// Dock 两块玻璃的融合域。iOS 26 上同 namespace 的玻璃会互相吸附。
-    @Namespace private var dockNamespace
 
     @State private var toast: ToastMessage?
     @State private var toastWork: DispatchWorkItem?
@@ -48,45 +59,49 @@ struct HomeView: View {
     /// 设计稿页面边距 20（比会议室内部的 16 更接近 iOS 阅读习惯）。
     private let pagePadding: CGFloat = 20
 
+    /// 入会页的两个开关从设置里取初值。
+    ///
+    /// 用同步快照而不是在 onAppear 里读：首帧如果先画默认值再跳到用户设置，
+    /// 会看到两个开关"闪一下"。`AppSettings.mediaDefaultsSnapshot` 是 nonisolated 的，
+    /// 正是为了能在 View init 里安全调用。
+    init(router: AppRouter, settings: AppSettings) {
+        _router = ObservedObject(wrappedValue: router)
+        _settings = ObservedObject(wrappedValue: settings)
+
+        let defaults = AppSettings.mediaDefaultsSnapshot
+        _isMicOn = State(initialValue: defaults.mic)
+        _isCameraOn = State(initialValue: defaults.camera)
+    }
+
     var body: some View {
         GeometryReader { geo in
             let insets = geo.safeAreaInsets
+            let drawerWidth = sidebarWidth(for: geo.size.width)
 
             ZStack(alignment: .bottom) {
                 BrandBackground()
 
-                ScrollView(.vertical, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 0) {
-                        topBar
+                tabContent(insets: insets)
 
-                        if tab == .meetings {
-                            meetingsBody
-                        } else {
-                            contactsBody
-                        }
+                HomeDock(
+                    selection: $tab,
+                    bottomInset: insets.bottom,
+                    onReselect: { _ in
+                        scrollTopToken += 1
                     }
-                    .padding(.horizontal, pagePadding)
-                    .padding(.top, insets.top + 8)
-                    // 悬浮 Dock 实际占位 56 + 10，再留 20 呼吸位，
-                    // 保证最后一行历史记录滚到底时不会被胶囊压住。
-                    //
-                    // 首页现在有两个输入框，键盘弹起时必须能把「加入会议」顶上来：
-                    // 根视图整棵忽略了键盘安全区（否则底栏会被顶到键盘上方），
-                    // 所以这里手动把键盘高度补进滚动内容底部。
-                    .padding(.bottom, 86 + insets.bottom + keyboardHeight)
-                }
-                // 手动吃安全区：GeometryReader 里的子视图从屏幕原点开始，
-                // 不加这一行，滚动内容会钻到刘海下面，而顶部留白已经显式给过了。
-                .ignoresSafeArea()
-
-                tabBar(bottomInset: insets.bottom)
+                )
 
                 toastLayer(bottomInset: insets.bottom)
 
                 if isEditingProfile {
                     profileEditor(bottomInset: insets.bottom)
                 }
+
+                sidebarLayer(insets: insets, width: drawerWidth)
             }
+            // 从左边缘向右滑打开抽屉。用 simultaneousGesture 而不是 gesture：
+            // 抽屉内容本身是 ScrollView，独占手势会让竖直滚动被外层吞掉。
+            .simultaneousGesture(edgeOpenGesture(width: drawerWidth))
         }
         // 整个首页屏蔽键盘安全区：否则底栏会被顶到键盘上方，
         // 而资料卡又会被再抬一次。键盘只影响资料卡的显式 offset。
@@ -126,6 +141,244 @@ struct HomeView: View {
         }
     }
 
+    // MARK: - 页面容器
+
+    /// 四个 tab 的容器。
+    ///
+    /// 会议/通讯录共用一条首页滚动轴（品牌头 + 内容），企业/设置各自带滚动容器：
+    /// 把它们塞进外层 ScrollView 会变成"滚动里再套滚动"，在 iPhone 上会出现
+    /// 内层滚到底后手势不传递给外层、以及内容高度塌陷这两类问题。
+    @ViewBuilder
+    private func tabContent(insets: EdgeInsets) -> some View {
+        switch tab {
+        case .meetings, .contacts:
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        topBar
+
+                        if tab == .meetings {
+                            meetingsBody
+                        } else {
+                            contactsBody
+                        }
+                    }
+                    .padding(.horizontal, pagePadding)
+                    .padding(.top, insets.top + 8)
+                    // 悬浮 Dock 实际占位 50 + 10，再留 26 呼吸位，
+                    // 保证最后一行历史记录滚到底时不会被胶囊压住。
+                    //
+                    // 首页有两个输入框，键盘弹起时必须能把「加入会议」顶上来：
+                    // 根视图整棵忽略了键盘安全区（否则底栏会被顶到键盘上方），
+                    // 所以这里手动把键盘高度补进滚动内容底部。
+                    .padding(.bottom, 96 + insets.bottom + keyboardHeight)
+                    .id(Self.scrollTopID)
+                }
+                // 手动吃安全区：GeometryReader 里的子视图从屏幕原点开始，
+                // 不加这一行，滚动内容会钻到刘海下面，而顶部留白已经显式给过了。
+                .ignoresSafeArea()
+                .onChange(of: scrollTopToken) { _ in
+                    // 重选当前 tab = 回到顶部。用 snappy 而不是 standard：
+                    // 这是一次"归位"，不是页面切换，回弹太久会显得拖沓。
+                    withAnimation(Theme.Motion.snappy) {
+                        proxy.scrollTo(Self.scrollTopID, anchor: .top)
+                    }
+                }
+            }
+            .transition(.opacity)
+
+        case .enterprise:
+            EnterpriseView(
+                router: router,
+                onEnterRoom: { info in
+                    Haptics.impact(.medium)
+                    router.openPreJoin(info)
+                },
+                onRequestLogin: {
+                    presentLogin()
+                },
+                onToast: { text, style in
+                    showToast(text, icon: toastIcon(for: style), style: style)
+                },
+                onOpenSidebar: {
+                    openSidebar()
+                }
+            )
+            .ignoresSafeArea()
+            .transition(.opacity)
+
+        case .settings:
+            SettingsView(
+                router: router,
+                settings: settings,
+                onRequestLogin: {
+                    presentLogin()
+                },
+                onEditProfile: {
+                    openProfileEditor()
+                },
+                onToast: { text, style in
+                    showToast(text, icon: toastIcon(for: style), style: style)
+                },
+                topInset: insets.top,
+                bottomInset: insets.bottom,
+                onOpenSidebar: {
+                    openSidebar()
+                }
+            )
+            .ignoresSafeArea()
+            .transition(.opacity)
+        }
+    }
+
+    private static let scrollTopID = "home-scroll-top"
+
+    // MARK: - 侧边栏
+
+    /// min(320, 84%)：SE 上留 16% 让用户还能看到"后面还有页面"，
+    /// Pro Max 上封顶 320，避免抽屉宽到像第二列布局。
+    private func sidebarWidth(for containerWidth: CGFloat) -> CGFloat {
+        min(320, max(268, containerWidth * 0.84))
+    }
+
+    @ViewBuilder
+    private func sidebarLayer(insets: EdgeInsets, width: CGFloat) -> some View {
+        ZStack(alignment: .leading) {
+            if isSidebarOpen {
+                Color.black
+                    .opacity(sidebarBackdropOpacity(width: width))
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        closeSidebar()
+                    }
+                    .transition(.opacity)
+
+                HomeSidebar(
+                    router: router,
+                    currentTab: tab,
+                    topInset: insets.top,
+                    bottomInset: insets.bottom,
+                    onSelectTab: { target in
+                        selectTab(target)
+                        closeSidebar()
+                    },
+                    onStartMeeting: {
+                        closeSidebar()
+                        // 侧边栏里的"发起会议"与首页发起是同一个动作：
+                        // 需要登录、需要服务端分配会议号，不能在抽屉里另写一套。
+                        selectTab(.meetings)
+                        startMeetingFromHome()
+                    },
+                    onLogin: {
+                        closeSidebar()
+                        presentLogin()
+                    },
+                    onEditProfile: {
+                        closeSidebar()
+                        openProfileEditor()
+                    },
+                    onClose: {
+                        closeSidebar()
+                    },
+                    onToast: { text, style in
+                        closeSidebar()
+                        showToast(text, icon: toastIcon(for: style), style: style)
+                    }
+                )
+                .frame(width: width)
+                .offset(x: sidebarDragOffset)
+                .transition(.move(edge: .leading))
+                .simultaneousGesture(sidebarDragGesture(width: width))
+            }
+        }
+        // 必须盖住 Dock 与 Toast：抽屉是模态的，底下的任何入口都不该还能点。
+        .zIndex(30)
+    }
+
+    /// 拖动时遮罩跟着变淡，松手回弹时才不会"啪"地跳一下。
+    private func sidebarBackdropOpacity(width: CGFloat) -> Double {
+        let progress = min(1, abs(sidebarDragOffset) / max(width, 1))
+        return 0.46 * (1 - progress)
+    }
+
+    private func sidebarDragGesture(width: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 16)
+            .onChanged { value in
+                // 只处理水平向左的位移；竖直方向交给抽屉里的 ScrollView。
+                guard abs(value.translation.width) > abs(value.translation.height) else { return }
+                sidebarDragOffset = min(0, value.translation.width)
+            }
+            .onEnded { value in
+                let passedThreshold = value.translation.width < -width * 0.26
+                let willPass = value.predictedEndTranslation.width < -width * 0.5
+                if passedThreshold || willPass {
+                    closeSidebar()
+                } else {
+                    withAnimation(Theme.Motion.sheet) {
+                        sidebarDragOffset = 0
+                    }
+                }
+            }
+    }
+
+    private func edgeOpenGesture(width: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 24)
+            .onEnded { value in
+                guard !isSidebarOpen else { return }
+                // 起点必须在左边缘 32pt 内，且以水平位移为主。
+                // 不加这两条，宫格/历史列表的横向滑动会误开抽屉。
+                guard value.startLocation.x < 32 else { return }
+                guard value.translation.width > 72 else { return }
+                guard abs(value.translation.width) > abs(value.translation.height) else { return }
+                openSidebar()
+            }
+    }
+
+    private func openSidebar() {
+        Keyboard.dismiss()
+        Haptics.impact(.light)
+        sidebarDragOffset = 0
+        withAnimation(Theme.Motion.sheet) {
+            isSidebarOpen = true
+        }
+    }
+
+    private func closeSidebar() {
+        withAnimation(Theme.Motion.sheet) {
+            isSidebarOpen = false
+            sidebarDragOffset = 0
+        }
+    }
+
+    private func selectTab(_ target: HomeTab) {
+        guard tab != target else { return }
+        Keyboard.dismiss()
+        withAnimation(Theme.Motion.standard) {
+            tab = target
+        }
+    }
+
+    private func presentLogin() {
+        Keyboard.dismiss()
+        isLoginPresented = true
+    }
+
+    /// toast 只有文案和样式，图标按语义给一个默认值。
+    /// 让上层传图标会让每个调用点多一个必填参数，收益远小于噪音。
+    private func toastIcon(for style: ToastStyle) -> String {
+        switch style {
+        case .success:
+            return "checkmark.circle.fill"
+        case .warning:
+            return "exclamationmark.triangle.fill"
+        case .danger:
+            return "xmark.octagon.fill"
+        case .info:
+            return "info.circle.fill"
+        }
+    }
+
     // MARK: - 顶部
 
     /// 品牌头：左 Logo + 应用名，右账号入口。
@@ -133,19 +386,39 @@ struct HomeView: View {
     /// 右上角只留一个真正有去处的动作：登录，或已登录时的身份入口。
     private var topBar: some View {
         HStack(spacing: 10) {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Theme.Palette.brandGradient)
-                .frame(width: 32, height: 32)
-                .overlay(
-                    Image(systemName: SymbolCompat.name("video.fill", "video"))
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundColor(.white)
-                )
+            // 品牌区就是侧边栏入口。
+            //
+            // HIG 不推荐汉堡菜单，但抽屉仍然需要一个随时可达的打开方式；
+            // "点应用名 / Logo 打开导航"是系统里已有的心智（邮件、备忘录都是这样）。
+            // 右侧小箭头给出可点的暗示，否则它看起来只是一行标题。
+            Button {
+                openSidebar()
+            } label: {
+                HStack(spacing: 10) {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Theme.Palette.brandGradient)
+                        .frame(width: 32, height: 32)
+                        .overlay(
+                            Image(systemName: SymbolCompat.name("video.fill", "video"))
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundColor(.white)
+                        )
 
-            Text("天穹会议")
-                .font(.system(size: 16, weight: .semibold))
-                .tracking(-0.2)
-                .foregroundColor(Theme.Palette.ink)
+                    Text("天穹会议")
+                        .font(.system(size: 16, weight: .semibold))
+                        .tracking(-0.2)
+                        .foregroundColor(Theme.Palette.ink)
+
+                    Image(systemName: SymbolCompat.name("chevron.right", "chevron.forward"))
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(Theme.Palette.ink3)
+                        .padding(.leading, -3)
+                }
+                .frame(height: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(PlainButtonStyle())
+            .accessibilityLabel("打开导航菜单")
 
             Spacer(minLength: 8)
 
@@ -735,7 +1008,7 @@ struct HomeView: View {
     private var contactsBody: some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
-                Text("联系人")
+                Text("通讯录")
                     .font(.system(size: 28, weight: .semibold))
                     .foregroundColor(Theme.Palette.ink)
 
@@ -792,61 +1065,6 @@ struct HomeView: View {
         }
     }
 
-    // MARK: - 底部 Dock
-
-    /// 悬浮胶囊 Dock。
-    ///
-    /// iOS 26 上走 `GlassEffectContainer` + 每个 tab 独立玻璃：
-    /// 两块玻璃靠近时会像水珠一样吸附、点选后液化成选中态 —— 这是系统
-    /// Liquid Glass 与自绘模糊最本质的差别，用一整块玻璃包住两颗按钮是做不出来的。
-    /// 14~25 上容器退化为普通 HStack，视觉仍是两颗胶囊，布局完全一致。
-    private func tabBar(bottomInset: CGFloat) -> some View {
-        LiquidGlassContainer(spacing: 6) {
-            HStack(spacing: 6) {
-                tabButton(.meetings)
-                tabButton(.contacts)
-            }
-        }
-        .padding(.bottom, bottomInset + 10)
-    }
-
-    private func tabButton(_ item: HomeTab) -> some View {
-        let isSelected = tab == item
-
-        return Button {
-            guard tab != item else { return }
-            Haptics.selection()
-            withAnimation(Theme.Motion.standard) {
-                tab = item
-            }
-        } label: {
-            HStack(spacing: 7) {
-                Image(systemName: isSelected ? item.selectedSymbol : item.symbol)
-                    .font(.system(size: 16, weight: .semibold))
-
-                Text(item.title)
-                    .font(.system(size: 13, weight: .semibold))
-            }
-            .foregroundColor(isSelected ? .white : Theme.Palette.ink2)
-            .padding(.horizontal, 20)
-            .frame(height: 46)
-            .contentShape(Capsule())
-        }
-        .buttonStyle(PlainButtonStyle())
-        // 选中态用染色玻璃而不是实心色块：染色仍然保留折射与高光，
-        // 实心填充会把 Dock 变成两颗普通按钮。
-        .liquidGlass(
-            isSelected ? .tinted(Theme.Palette.accent) : .regular,
-            cornerStyle: .capsule,
-            isInteractive: true,
-            castsShadow: false
-        )
-        // 同一个 namespace 下的玻璃才会互相吸附；去掉这行就退回两团独立模糊。
-        .liquidGlassID(item.title, in: dockNamespace)
-        .accessibilityLabel(item.title)
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
-    }
-
     // MARK: - Toast
 
     private func toastLayer(bottomInset: CGFloat) -> some View {
@@ -858,7 +1076,7 @@ struct HomeView: View {
                     // id 变化时重建，让连续两条提示都能重播进入动画。
                     .id(message.id)
                     .padding(.horizontal, pagePadding)
-                    .padding(.bottom, 86 + bottomInset)
+                    .padding(.bottom, 96 + bottomInset)
                     .transition(.opacity)
                     .allowsHitTesting(false)
             }
@@ -1119,40 +1337,6 @@ struct HomeView: View {
             isLocal: true,
             avatarColorIndex: router.profile.avatarColorIndex
         )
-    }
-}
-
-// MARK: - Tab 枚举
-
-private enum HomeTab {
-    case meetings
-    case contacts
-
-    var title: String {
-        switch self {
-        case .meetings:
-            return "会议"
-        case .contacts:
-            return "联系人"
-        }
-    }
-
-    var symbol: String {
-        switch self {
-        case .meetings:
-            return SymbolCompat.name("video", "calendar")
-        case .contacts:
-            return SymbolCompat.name("person.2", "person.2.fill")
-        }
-    }
-
-    var selectedSymbol: String {
-        switch self {
-        case .meetings:
-            return SymbolCompat.name("video.fill", "video")
-        case .contacts:
-            return SymbolCompat.name("person.2.fill", "person.2")
-        }
     }
 }
 

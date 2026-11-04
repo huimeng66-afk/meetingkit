@@ -13,8 +13,16 @@ import UIKit
 
 enum Haptics {
 
+    /// 设置页的总开关。关掉之后所有入口都不再震，而不是逐个调用点自己判断——
+    /// 调用点有二十多处，漏掉一处就会出现"设置已经关了、某个按钮还在震"。
+    /// 直接读存储快照：触觉回调可能在任意线程，不能跳主线程读设置对象。
+    private static var isEnabled: Bool {
+        AppSettings.hapticsEnabledSnapshot
+    }
+
     /// 轻量撞击反馈。用于按钮点击、面板弹出等常规交互。
     static func impact(_ style: UIImpactFeedbackGenerator.FeedbackStyle = .light) {
+        guard isEnabled else { return }
         let generator = UIImpactFeedbackGenerator(style: style)
         // prepare() 让 Taptic Engine 提前进入就绪态，首次反馈不会延迟。
         generator.prepare()
@@ -23,6 +31,7 @@ enum Haptics {
 
     /// 选择器滚动 / 选项切换反馈。
     static func selection() {
+        guard isEnabled else { return }
         let generator = UISelectionFeedbackGenerator()
         generator.prepare()
         generator.selectionChanged()
@@ -30,6 +39,7 @@ enum Haptics {
 
     /// 结果型反馈：成功、警告、错误。
     static func notify(_ type: UINotificationFeedbackGenerator.FeedbackType) {
+        guard isEnabled else { return }
         let generator = UINotificationFeedbackGenerator()
         generator.prepare()
         generator.notificationOccurred(type)

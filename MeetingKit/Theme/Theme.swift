@@ -140,6 +140,13 @@ enum Theme {
         /// 全项目统一的一档弹性动画。交互反馈都用它，避免出现 0.2s easeInOut 那种廉价感。
         static let standard = Animation.spring(response: 0.34, dampingFraction: 0.86)
 
+        /// 抽屉 / 侧边栏 / 整页位移。行程比普通控件长，必须给更长的响应时间，
+        /// 否则 320pt 的位移会在 0.2s 内"弹"完，看起来像被甩出去而不是被拉开。
+        static let sheet = Animation.spring(response: 0.42, dampingFraction: 0.88)
+
+        /// 小面积、需要紧跟手指的反馈（选中、切换）。比 standard 快一档。
+        static let snappy = Animation.spring(response: 0.24, dampingFraction: 0.9)
+
         /// 呼吸 / 脉冲这类需要无限循环的动画必须是线性往复，
         /// 弹簧动画无法形成稳定的呼吸节奏，这里是有意的例外。
         static let breathing = Animation.easeInOut(duration: 1.2).repeatForever(autoreverses: true)

@@ -31,7 +31,7 @@ struct TopStatusBar: View {
 
     /// 顶栏整条高度（含安全区与共享条）。房间层用它决定画布的安全边距。
     private var totalHeight: CGFloat {
-        topInset + 52 + (viewModel.isScreenSharing ? 32 : 0)
+        topInset + 52 + (viewModel.isShareBannerVisible ? 32 : 0)
     }
 
     var body: some View {
@@ -39,7 +39,7 @@ struct TopStatusBar: View {
             VStack(spacing: 0) {
                 statusRow(width: proxy.size.width)
 
-                if viewModel.isScreenSharing {
+                if viewModel.isShareBannerVisible {
                     sharingBanner
                 }
             }
@@ -266,6 +266,11 @@ struct TopStatusBar: View {
 
     // MARK: - 共享警示条
 
+    /// 共享条对本机/远端两种共享同时生效。
+    ///
+    /// 只在本机共享时显示，是之前最明显的一处信息缺失：别人共享时用户看到画面
+    /// 突然变成 PPT，顶栏却仍是普通状态，既不知道是谁在共享，也不知道怎么退出观看。
+    /// 远端共享时右侧不放"停止"——停止别人的共享既没有权限，也没有语义。
     private var sharingBanner: some View {
         HStack(spacing: 6) {
             Image(systemName: SymbolCompat.name(
@@ -275,38 +280,51 @@ struct TopStatusBar: View {
             ))
                 .font(.system(size: 12, weight: .semibold))
 
-            Text("你正在共享屏幕")
+            Text(viewModel.shareBannerText)
                 .font(.system(size: 12, weight: .medium))
                 .lineLimit(1)
 
-            Text(viewModel.shareDurationText)
+            Text(viewModel.shareBannerDurationText)
                 .font(.system(size: 12, weight: .semibold).monospacedDigit())
                 .opacity(0.9)
 
             Spacer(minLength: 8)
 
-            Button {
-                Haptics.impact(.light)
-                viewModel.stopScreenShare()
-            } label: {
-                Text("停止共享")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 10)
+            if viewModel.isScreenSharing {
+                Button {
+                    Haptics.impact(.light)
+                    viewModel.stopScreenShare()
+                } label: {
+                    Text("停止共享")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .frame(height: 22)
+                        .overlay(
+                            Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1)
+                        )
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(PlainButtonStyle())
+                .accessibilityLabel("停止共享屏幕")
+            } else {
+                Text("观看中")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(0.85))
+                    .padding(.horizontal, 9)
                     .frame(height: 22)
                     .overlay(
-                        Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1)
+                        Capsule().stroke(Color.white.opacity(0.22), lineWidth: 1)
                     )
-                    .contentShape(Capsule())
             }
-            .buttonStyle(PlainButtonStyle())
-            .accessibilityLabel("停止共享屏幕")
         }
         .foregroundColor(.white)
         .padding(.horizontal, 12)
         .frame(height: 32)
         .frame(maxWidth: .infinity)
         // 设计稿指定 #FF453A：比 danger 更亮，红色通栏在深空蓝上必须足够刺眼。
+        // 远端共享用同一底色：这条横幅表达的是"有一块屏幕正在被全場看到"，
+        // 不是"你正在做危险操作"；换成蓝色会让人以为是普通提示，反而看不到。
         .background(Color(hex: 0xFF453A))
     }
 }

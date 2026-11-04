@@ -2,9 +2,9 @@
 //  VideoCanvasView.swift
 //  MeetingKit
 //
-//  视频画布。四种形态按优先级互斥：
+//  视频画布只负责"选形态"，不负责形态内部：
 //    1. 空态（未入会 / 无人 / 已断开）
-//    2. 屏幕共享（共享优先于一切，因为这是全场唯一需要看清的内容）
+//    2. 屏幕共享 → 交给 ScreenShareStage（缩放手势、共享者信息、自动收起控件）
 //    3. 演讲者模式（一人主画面 + 顶部缩略图条）
 //    4. 宫格模式（<=4 两列，5~9 三列，>9 九宫格分页）
 //
@@ -30,7 +30,7 @@ struct VideoCanvasView: View {
 
     /// 顶栏总高（52 + 安全区 + 共享条）。与 TopStatusBar.totalHeight 保持一致。
     private var chromeTop: CGFloat {
-        topInset + 52 + (viewModel.isScreenSharing ? 32 : 0)
+        topInset + 52 + (viewModel.isShareBannerVisible ? 32 : 0)
     }
 
     /// 内容区从顶栏下 8pt 开始，缩略图条不贴死在玻璃边上。
@@ -48,7 +48,21 @@ struct VideoCanvasView: View {
             ZStack {
                 Color.black
 
-                canvasContent(size: proxy.size)
+                // 共享态与非共享态的点击语义不同：共享舞台上单击要交给 UIKit 的
+                // 缩放容器（它还要区分双击），外层再挂一个 SwiftUI tap 会把双击吃掉。
+                // 因此两条分支各自挂手势，而不是在一个视图上写 guard。
+                if isSharingActive {
+                    canvasContent(size: proxy.size)
+                } else {
+                    canvasContent(size: proxy.size)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            // 点画布切换控件显隐，这是全屏视频会议的标准交互。
+                            withAnimation(Theme.Motion.standard) {
+                                viewModel.isChromeVisible.toggle()
+                            }
+                        }
+                }
             }
         }
     }
@@ -60,7 +74,14 @@ struct VideoCanvasView: View {
         if showsEmptyState {
             emptyState
         } else if isSharingActive {
-            screenShareLayer
+            // 共享舞台自己处理全屏铺底、浮层与缩放，画布不再给它补任何 padding。
+            // 之前把共享画面塞进 contentTop/contentBottom 之间，等于让 PPT 给顶栏
+            // 和底栏让位——共享时最该被让位的恰恰是控件。
+            ScreenShareStage(
+                viewModel: viewModel,
+                topInset: topInset,
+                bottomInset: bottomInset
+            )
         } else if viewModel.participants.isEmpty {
             // 连接中（.connecting / .reconnecting）且还没拿到参会者：统一走连接占位。
             // 不能交给下面的布局分发：宫格模式对空数组只会画出一片纯黑，像卡死。
@@ -93,121 +114,7 @@ struct VideoCanvasView: View {
         }
     }
 
-    // MARK: - 1. 屏幕共享
-
-    private var screenShareLayer: some View {
-        ZStack {
-            Color.black
-
-            shareContent
-
-            VStack(spacing: 0) {
-                HStack(spacing: 0) {
-                    sharingBadge
-                    Spacer(minLength: 0)
-                }
-                .padding(.leading, 12)
-                .padding(.top, contentTop)
-
-                Spacer(minLength: 0)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var shareContent: some View {
-        if viewModel.isScreenSharing, viewModel.remoteScreenPeerID == nil {
-            // 自己共享时不再回显自己的画面：一块屏幕上看自己正在共享的屏幕没有意义，
-            // 还会让人误以为画面卡住。这里只给状态与"停止共享"入口（与网页端一致）。
-            selfShareCard
-        } else if let peerID = viewModel.remoteScreenPeerID,
-           let screenView = viewModel.remoteScreenViews[peerID] {
-            RemoteVideoViewRepresentable(view: screenView)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(.top, contentTop)
-                .padding(.bottom, contentBottom)
-        } else if let frame = viewModel.sharedFrame {
-            // 本机共享（Broadcast 扩展的帧）。
-            Image(uiImage: frame)
-                .resizable()
-                .interpolation(.high)
-                .scaledToFit()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(.horizontal, 8)
-                .padding(.top, contentTop)
-                .padding(.bottom, contentBottom)
-        } else {
-            VStack(spacing: Theme.Metrics.space3) {
-                LoadingDotsView(tint: Theme.Palette.textSecondary)
-                Text("正在获取共享画面…")
-                    .font(Theme.Typography.bodySmall)
-                    .foregroundColor(Theme.Palette.textSecondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(.top, contentTop)
-            .padding(.bottom, contentBottom)
-        }
-    }
-
-    /// 本机共享时的状态卡。停止动作走 ViewModel → ScreenShareBridge，
-    /// 真正的"停止"由扩展进程确认后再回写 isScreenSharing。
-    private var selfShareCard: some View {
-        VStack(spacing: 16) {
-            ZStack {
-                Circle()
-                    .fill(Theme.Palette.accent.opacity(0.14))
-                    .frame(width: 68, height: 68)
-
-                Image(systemName: SymbolCompat.name("rectangle.on.rectangle", "rectangle.on.rectangle"))
-                    .font(.system(size: 25, weight: .medium))
-                    .foregroundColor(Theme.Palette.accent)
-            }
-
-            VStack(spacing: 6) {
-                Text("正在共享屏幕中")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundColor(Theme.Palette.textPrimary)
-
-                Text("参会成员可以看到你的屏幕")
-                    .font(Theme.Typography.bodySmall)
-                    .foregroundColor(Theme.Palette.textSecondary)
-            }
-
-            Button {
-                Haptics.impact(.light)
-                viewModel.stopScreenShare()
-            } label: {
-                Text("停止共享")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 24)
-                    .frame(height: 40)
-                    .background(Capsule().fill(Theme.Palette.danger))
-            }
-            .buttonStyle(PlainButtonStyle())
-            .accessibilityLabel("停止共享屏幕")
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.top, contentTop)
-        .padding(.bottom, contentBottom)
-    }
-
-    private var sharingBadge: some View {
-        HStack(spacing: 5) {
-            Circle()
-                .fill(Theme.Palette.success)
-                .frame(width: 6, height: 6)
-
-            Text("正在共享")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(Theme.Palette.textPrimary)
-        }
-        .padding(.horizontal, 10)
-        .frame(height: 26)
-        .liquidGlass(.clear, cornerStyle: .capsule)
-    }
-
-    // MARK: - 2. 演讲者模式
+    // MARK: - 1. 演讲者模式
 
     private var speakerLayer: some View {
         ZStack {
@@ -296,7 +203,7 @@ struct VideoCanvasView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: - 3. 宫格模式
+    // MARK: - 2. 宫格模式
 
     private func gridLayer(size: CGSize) -> some View {
         let columns = gridColumnCount
@@ -378,7 +285,7 @@ struct VideoCanvasView: View {
         .frame(maxWidth: .infinity)
     }
 
-    // MARK: - 4. 空态
+    // MARK: - 3. 空态
 
     private var emptyState: some View {
         ZStack {
