@@ -322,7 +322,23 @@ final class MeetingViewModel: ObservableObject {
 
     /// 点"共享屏幕"不直接开共享，只是打开选择面板。
     /// 真正的广播必须由系统弹窗发起（ReplayKit 的硬性规定）。
+    ///
+    /// 前置校验：ReplayKit 广播扩展与主 App 之间靠 App Group 传递画面，
+    /// 而 App Group 是证书能力、不是代码能力。免费 Apple ID 自签、或者用
+    /// 别人的代签证书重签时，profile 里往往没有我们声明的 group，此时扩展
+    /// 能起播却一帧都传不回来，用户看到的就是"点了共享、对面一直黑屏"。
+    /// 与其让用户对着黑屏猜，不如在这里直接说清楚。
     func toggleScreenShare() {
+        guard AppGroupConfig.isAvailable else {
+            showToast(
+                ToastMessage(
+                    text: "当前签名不支持共享屏幕，请改用网页版共享",
+                    systemImage: "rectangle.slash",
+                    style: .warning
+                )
+            )
+            return
+        }
         openPanel(.sharePicker)
     }
 
