@@ -81,6 +81,22 @@ final class SampleHandler: RPBroadcastSampleHandler {
     // MARK: - 生命周期
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
+        // 第一道也是最后一道防线：扩展与主 App 之间**只有** App Group 这一条通道。
+        // 证书没授权任何 group 时（免费 Apple ID 自签、部分代签工具剥离 entitlements），
+        // 扩展照样能起播、照样在录屏，但一帧都写不出去，用户看到的是"共享中 + 对面黑屏"。
+        // 与其让用户对着黑屏等到自己发现，不如在这里按系统规范立刻结束并给出原因。
+        guard AppGroupConfig.isAvailable else {
+            let error = NSError(
+                domain: Self.stopErrorDomain,
+                code: 2,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "当前签名没有授予 App Group，共享画面无法传回会议。请改用签名完整的安装包，或先用网页版共享屏幕。"
+                ]
+            )
+            finishBroadcastWithError(error)
+            return
+        }
+
         // 每次广播都当作一次全新会话：重置节流与重入标记，防止上一次的残留状态吞掉首帧。
         lastFrameTime = 0
         lastHeartbeatTime = 0
