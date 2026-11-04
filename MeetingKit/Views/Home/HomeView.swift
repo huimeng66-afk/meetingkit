@@ -83,13 +83,19 @@ struct HomeView: View {
 
                 tabContent(insets: insets)
 
-                HomeDock(
+                HomeTabBar(
                     selection: $tab,
                     bottomInset: insets.bottom,
                     onReselect: { _ in
                         scrollTopToken += 1
                     }
                 )
+
+                // 发起会议的悬浮入口。与网页端 `.mobile-fab` 同位置、同尺寸：
+                // 只在会议页出现——通讯录/企业/设置页发起会议没有上下文，属于噪音。
+                if tab == .meetings {
+                    startMeetingFAB(bottomInset: insets.bottom)
+                }
 
                 toastLayer(bottomInset: insets.bottom)
 
@@ -98,6 +104,16 @@ struct HomeView: View {
                 }
 
                 sidebarLayer(insets: insets, width: drawerWidth)
+
+                // 登录页用窗口内浮层，不用 `.sheet`。
+                //
+                // 这里踩过一次坑：sheet 挂在 GeometryReader 内部的视图上时，
+                // 页面一旦因为键盘/状态刷新重建，presentation 会被静默丢掉，
+                // 表现就是"点登录没反应"。改成自己管理的浮层后，presentation
+                // 的生命周期与 HomeView 的 @State 完全一致，点一下必然出现。
+                if isLoginPresented {
+                    loginLayer
+                }
             }
             // 从左边缘向右滑打开抽屉。用 simultaneousGesture 而不是 gesture：
             // 抽屉内容本身是 ScrollView，独占手势会让竖直滚动被外层吞掉。
@@ -131,19 +147,6 @@ struct HomeView: View {
         .onChange(of: settings.defaultCameraOn) { value in
             isCameraOn = value
         }
-        .sheet(isPresented: $isLoginPresented, onDismiss: {
-            // 登录成功后 LoginView 会把昵称回填 guestName，这里同步账号态，
-            // 让右上角从「登录」切换成头像胶囊。
-            session = AuthStore.load()
-            if session != nil, !guestName.isEmpty {
-                router.updateProfile(
-                    displayName: guestName,
-                    avatarColorIndex: router.profile.avatarColorIndex
-                )
-            }
-        }) {
-            LoginView(displayName: $guestName)
-        }
         .onDisappear {
             toastWork?.cancel()
         }
@@ -173,13 +176,13 @@ struct HomeView: View {
                     }
                     .padding(.horizontal, pagePadding)
                     .padding(.top, insets.top + 8)
-                    // 悬浮 Dock 实际占位 50 + 10，再留 26 呼吸位，
-                    // 保证最后一行历史记录滚到底时不会被胶囊压住。
+                    // 底部占位 = 导航条 56 + 发起会议按钮 52 + 两段 16 间距。
+                    // 少算任何一截，最后一行历史都会被按钮压住。
                     //
                     // 首页有两个输入框，键盘弹起时必须能把「加入会议」顶上来：
                     // 根视图整棵忽略了键盘安全区（否则底栏会被顶到键盘上方），
                     // 所以这里手动把键盘高度补进滚动内容底部。
-                    .padding(.bottom, 96 + insets.bottom + keyboardHeight)
+                    .padding(.bottom, 140 + insets.bottom + keyboardHeight)
                     .id(Self.scrollTopID)
                 }
                 // 手动吃安全区：GeometryReader 里的子视图从屏幕原点开始，
@@ -369,7 +372,72 @@ struct HomeView: View {
 
     private func presentLogin() {
         Keyboard.dismiss()
-        isLoginPresented = true
+        Haptics.impact(.light)
+        withAnimation(Theme.Motion.sheet) {
+            isLoginPresented = true
+        }
+    }
+
+    private func dismissLogin() {
+        withAnimation(Theme.Motion.sheet) {
+            isLoginPresented = false
+        }
+
+        // 登录成功后 LoginView 会把昵称回填 guestName，这里同步账号态，
+        // 让右上角从「登录」切换成头像胶囊；未登录直接关掉时不会走到下面。
+        session = AuthStore.load()
+        if session != nil, !guestName.isEmpty {
+            router.updateProfile(
+                displayName: guestName,
+                avatarColorIndex: router.profile.avatarColorIndex
+            )
+        }
+    }
+
+    // MARK: - 登录浮层
+
+    /// 窗口内全屏浮层。层级必须高于侧边栏（30）与资料面板，
+    /// 否则从抽屉里点"登录"时，登录页会被抽屉的遮罩盖住一半。
+    private var loginLayer: some View {
+        LoginView(displayName: $guestName, onClose: { dismissLogin() })
+            .transition(.move(edge: .bottom))
+            .zIndex(40)
+    }
+
+    // MARK: - 发起会议悬浮入口
+
+    /// 对齐网页端 `.mobile-fab`：右下角 52pt 圆形，压在导航条上方 16pt。
+    /// 只在会议页出现——其它页面没有"在这里开会"的上下文。
+    private func startMeetingFAB(bottomInset: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: 0)
+
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+
+                Button {
+                    Haptics.impact(.medium)
+                    startMeetingFromHome()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(width: 52, height: 52)
+                        .background(
+                            Circle().fill(Theme.Palette.brandGradient)
+                        )
+                        .overlay(
+                            Circle().stroke(Color.white.opacity(0.16), lineWidth: 0.5)
+                        )
+                        .shadow(color: Color.black.opacity(0.38), radius: 14, x: 0, y: 6)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(BrandPressStyle())
+                .accessibilityLabel("发起会议")
+                .padding(.trailing, 18)
+            }
+            .padding(.bottom, 56 + bottomInset + 16)
+        }
     }
 
     /// toast 只有文案和样式，图标按语义给一个默认值。
@@ -394,39 +462,42 @@ struct HomeView: View {
     /// 右上角只留一个真正有去处的动作：登录，或已登录时的身份入口。
     private var topBar: some View {
         HStack(spacing: 10) {
-            // 品牌区就是侧边栏入口。
+            // 左侧汉堡菜单：网页端 `.mobile-menu-btn` 的同位置。
             //
-            // HIG 不推荐汉堡菜单，但抽屉仍然需要一个随时可达的打开方式；
-            // "点应用名 / Logo 打开导航"是系统里已有的心智（邮件、备忘录都是这样）。
-            // 右侧小箭头给出可点的暗示，否则它看起来只是一行标题。
+            // HIG 不推荐把汉堡当唯一导航，但这里侧边栏是「附加」入口，
+            // 底部通栏才是主路径；给它一个显式按钮，比上一版"点应用名才能开"
+            // 要好——后者没有任何可点的视觉暗示。
             Button {
                 openSidebar()
             } label: {
-                HStack(spacing: 10) {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Theme.Palette.brandGradient)
-                        .frame(width: 32, height: 32)
-                        .overlay(
-                            Image(systemName: SymbolCompat.name("video.fill", "video"))
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundColor(.white)
-                        )
-
-                    Text("天穹会议")
-                        .font(.system(size: 16, weight: .semibold))
-                        .kerning(-0.2)
-                        .foregroundColor(Theme.Palette.ink)
-
-                    Image(systemName: SymbolCompat.name("chevron.right", "chevron.forward"))
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(Theme.Palette.ink3)
-                        .padding(.leading, -3)
-                }
-                .frame(height: 44)
-                .contentShape(Rectangle())
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(Theme.Palette.ink)
+                    .frame(width: 36, height: 36)
+                    .background(
+                        Circle().fill(Color.white.opacity(0.06))
+                    )
+                    // 视觉 36、命中 44。
+                    .frame(width: 44, height: 44)
+                    .contentShape(Circle())
             }
             .buttonStyle(PlainButtonStyle())
             .accessibilityLabel("打开导航菜单")
+
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Theme.Palette.brandGradient)
+                .frame(width: 28, height: 28)
+                .overlay(
+                    Image(systemName: SymbolCompat.name("video.fill", "video"))
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.white)
+                )
+
+            Text("天穹会议")
+                .font(.system(size: 16, weight: .semibold))
+                .kerning(-0.2)
+                .foregroundColor(Theme.Palette.ink)
+                .lineLimit(1)
 
             Spacer(minLength: 8)
 
@@ -435,43 +506,36 @@ struct HomeView: View {
         .frame(height: 44)
     }
 
-    /// 右上角账号入口。游客态就是网页端那颗「登录」，已登录收敛成头像胶囊，
-    /// 点开仍是同一个资料面板，不额外造一个"账号中心"。
+    /// 右上角账号入口。
+    ///
+    /// 未登录是一颗实心强调色按钮（网页端 `btn-primary` 的形态）——上一版用
+    /// 透明玻璃胶囊，深色底上几乎和背景融在一起，用户根本看不出那里能点。
+    /// 已登录收敛成 32pt 圆头像，右侧留 44pt 命中区。
     @ViewBuilder
     private var accountEntry: some View {
         if session != nil {
             Button {
                 openProfileEditor()
             } label: {
-                HStack(spacing: 7) {
-                    AvatarView(user: profileUser, size: 24, showsSpeakingRing: false)
-
-                    Text(router.profile.displayName)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(Theme.Palette.ink)
-                        .lineLimit(1)
-                        .frame(maxWidth: 96, alignment: .leading)
-                }
-                .padding(.leading, 5)
-                .padding(.trailing, 12)
-                .frame(height: 34)
-                .liquidGlass(.clear, cornerStyle: .capsule, isInteractive: true, castsShadow: false)
-                .contentShape(Capsule())
+                AvatarView(user: profileUser, size: 32, showsSpeakingRing: false)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Circle())
             }
-            .buttonStyle(BrandPressStyle())
+            .buttonStyle(PlainButtonStyle())
             .accessibilityLabel("账号与个人资料")
         } else {
             Button {
-                Haptics.impact(.light)
-                Keyboard.dismiss()
-                isLoginPresented = true
+                presentLogin()
             } label: {
                 Text("登录")
                     .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(Theme.Palette.ink)
+                    .foregroundColor(.white)
                     .padding(.horizontal, 18)
                     .frame(height: 34)
-                    .liquidGlass(.clear, cornerStyle: .capsule, isInteractive: true, castsShadow: false)
+                    .background(
+                        Capsule().fill(Theme.Palette.accent)
+                    )
+                    .frame(height: 44)
                     .contentShape(Capsule())
             }
             .buttonStyle(BrandPressStyle())
@@ -1095,7 +1159,7 @@ struct HomeView: View {
                     // id 变化时重建，让连续两条提示都能重播进入动画。
                     .id(message.id)
                     .padding(.horizontal, pagePadding)
-                    .padding(.bottom, 96 + bottomInset)
+                    .padding(.bottom, 140 + bottomInset)
                     .transition(.opacity)
                     .allowsHitTesting(false)
             }

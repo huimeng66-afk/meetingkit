@@ -263,6 +263,50 @@ enum APIClient {
 
     // MARK: - 通用请求
 
+    /// 修改登录密码。
+    ///
+    /// 服务端改密后会作废该用户的所有旧令牌，并给当前设备换发一枚新的；
+    /// 因此这一步必须把新 token 写回 AuthStore，否则下一次请求就会 401，
+    /// 用户看到的是"改完密码就被踢下线"。
+    static func changePassword(
+        oldPassword: String,
+        newPassword: String,
+        token: String,
+        completion: @escaping (Result<AuthSession, Error>) -> Void
+    ) {
+        let url = TianqiongAPI.baseURL.appendingPathComponent("auth/password")
+
+        request(
+            url: url,
+            method: "POST",
+            token: token,
+            body: ["oldPassword": oldPassword, "newPassword": newPassword]
+        ) { result in
+            switch result {
+            case .failure(let error):
+                completion(.failure(error))
+
+            case .success(let json):
+                guard
+                    let freshToken = json["token"] as? String,
+                    let user = json["user"] as? [String: Any]
+                else {
+                    completion(.failure(APIError(message: "密码已修改，请重新登录")))
+                    return
+                }
+
+                let session = AuthSession(
+                    token: freshToken,
+                    name: (user["name"] as? String) ?? "",
+                    account: (user["account"] as? String) ?? "",
+                    role: (user["role"] as? String) ?? "user"
+                )
+                AuthStore.save(session)
+                completion(.success(session))
+            }
+        }
+    }
+
     /// 通用 JSON 请求。token 可空（访客接口不需要鉴权）。
     /// 统一处理：网络错误、非 2xx 的业务错误（取 body.error）、JSON 解析。
     /// 回调保证在主线程。

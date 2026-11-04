@@ -36,6 +36,20 @@ enum HomeTab: String, CaseIterable, Identifiable {
         }
     }
 
+    /// 底部导航条上的短标签。
+    ///
+    /// 只有设置不同名：侧边栏里它是"设置"（一个功能名），底部通栏里它是"我的"
+    /// （第一人称，和网页端 `.mobile-tabbar` 完全一致）。两个位置语境不同，
+    /// 强行统一反而会让其中一处别扭。
+    var tabBarTitle: String {
+        switch self {
+        case .settings:
+            return "我的"
+        default:
+            return title
+        }
+    }
+
     /// 未选中图标。都选了 iOS 15 就存在的基线符号，不依赖 SF Symbols 5。
     var symbol: String {
         switch self {

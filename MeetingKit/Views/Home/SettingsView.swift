@@ -47,6 +47,7 @@ struct SettingsView: View {
 
     @State private var pendingConfirm: ConfirmAction?
     @State private var presentedInfo: InfoKind?
+    @State private var isChangingPassword = false
 
     /// 与首页一致：设计稿页面边距 20，比会议室内部的 16 更接近 iOS 阅读习惯。
     private let pagePadding: CGFloat = 20
@@ -58,7 +59,11 @@ struct SettingsView: View {
                     header
 
                     accountCard
-                        .padding(.bottom, 22)
+                        .padding(.bottom, 24)
+
+                    if session != nil {
+                        securitySection
+                    }
 
                     meetingSection
                     shareSection
@@ -72,7 +77,7 @@ struct SettingsView: View {
                 .padding(.top, topInset + 8)
                 // 悬浮 Dock 实际占位 56 + 10，再留足呼吸位，
                 // 保证"恢复默认设置"滚到底时不会被胶囊压住。
-                .padding(.bottom, 110 + bottomInset)
+                .padding(.bottom, 150 + bottomInset)
             }
 
             if let action = pendingConfirm {
@@ -91,6 +96,27 @@ struct SettingsView: View {
                 infoOverlay(kind)
                     .transition(.opacity)
             }
+
+            if isChangingPassword {
+                PasswordChangeSheet(
+                    onClose: {
+                        withAnimation(Theme.Motion.sheet) {
+                            isChangingPassword = false
+                        }
+                    },
+                    onSuccess: { newSession in
+                        // 改密会作废旧令牌并换发新的，这里立刻把账号卡切到新会话，
+                        // 否则页面还显示着旧身份，用户会以为没改成功。
+                        session = newSession
+                        withAnimation(Theme.Motion.sheet) {
+                            isChangingPassword = false
+                        }
+                        onToast("密码已更新，其它设备需要重新登录", .success)
+                    }
+                )
+                .transition(.opacity)
+                .zIndex(20)
+            }
         }
         .onAppear {
             // 从登录页返回、或宿主重建本页时，账号可能已经变了。
@@ -104,12 +130,12 @@ struct SettingsView: View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("设置")
-                    .font(.system(size: 28, weight: .semibold))
+                    .font(.system(size: 26, weight: .semibold))
                     .kerning(-0.3)
                     .foregroundColor(Theme.Palette.ink)
 
                 Text("账号、会议与隐私")
-                    .font(.system(size: 13))
+                    .font(.system(size: 12.5))
                     .foregroundColor(Theme.Palette.ink2)
             }
             .accessibilityElement(children: .combine)
@@ -121,7 +147,7 @@ struct SettingsView: View {
                 SidebarMenuButton(action: onOpenSidebar)
             }
         }
-        .padding(.bottom, 22)
+        .padding(.bottom, 20)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -137,7 +163,7 @@ struct SettingsView: View {
                 signedOutRow
             }
         }
-        .liquidGlass(.regular, cornerStyle: .continuous(18), castsShadow: false)
+        .liquidGlass(.regular, cornerStyle: .continuous(20), castsShadow: false)
     }
 
     private func signedInRow(_ session: AuthSession) -> some View {
@@ -307,6 +333,28 @@ struct SettingsView: View {
         return head + String(repeating: "*", count: characters.count - 5) + tail
     }
 
+    // MARK: - 账号与安全
+
+    private var securitySection: some View {
+        section("账号与安全") {
+            actionRow(
+                symbol: SymbolCompat.name("key.fill", "lock.fill"),
+                title: "修改密码",
+                subtitle: "定期更换可以降低账号被盗风险"
+            ) {
+                withAnimation(Theme.Motion.sheet) {
+                    isChangingPassword = true
+                }
+            }
+
+            divider(leading: 56)
+
+            if let session = session {
+                valueRow(title: "登录账号", value: maskedAccount(session.account))
+            }
+        }
+    }
+
     // MARK: - 会议
 
     private var meetingSection: some View {
@@ -318,7 +366,7 @@ struct SettingsView: View {
                 isOn: boolBinding(\.defaultMicOn)
             )
 
-            divider(leading: 54)
+            divider(leading: 56)
 
             toggleRow(
                 symbol: SymbolCompat.name("video", "video.fill"),
@@ -327,7 +375,7 @@ struct SettingsView: View {
                 isOn: boolBinding(\.defaultCameraOn)
             )
 
-            divider(leading: 54)
+            divider(leading: 56)
 
             toggleRow(
                 symbol: SymbolCompat.name("mic.slash", "mic.slash.fill"),
@@ -344,7 +392,7 @@ struct SettingsView: View {
         section("屏幕共享") {
             qualityBlock
 
-            divider(leading: 54)
+            divider(leading: 56)
 
             toggleRow(
                 symbol: SymbolCompat.name("eye.slash", "eye.slash.fill"),
@@ -405,7 +453,7 @@ struct SettingsView: View {
                 isOn: boolBinding(\.hapticsEnabled)
             )
 
-            divider(leading: 54)
+            divider(leading: 56)
 
             actionRow(
                 symbol: SymbolCompat.name("accessibility", "person.crop.circle"),
@@ -416,7 +464,7 @@ struct SettingsView: View {
                 openSystemSettings()
             }
 
-            divider(leading: 54)
+            divider(leading: 56)
 
             destructiveRow(
                 symbol: SymbolCompat.name("trash", "trash.fill"),
@@ -439,7 +487,7 @@ struct SettingsView: View {
         section("关于") {
             valueRow(title: "版本", value: appVersion)
 
-            divider(leading: 54)
+            divider(leading: 56)
 
             actionRow(
                 symbol: SymbolCompat.name("lock.shield", "lock.fill"),
@@ -449,7 +497,7 @@ struct SettingsView: View {
                 setInfo(.privacy)
             }
 
-            divider(leading: 54)
+            divider(leading: 56)
 
             actionRow(
                 symbol: SymbolCompat.name("shippingbox", "cube.box"),
@@ -510,17 +558,18 @@ struct SettingsView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(title)
-                .font(.system(size: 11, weight: .medium))
+                .font(.system(size: 11.5, weight: .medium))
+                .kerning(0.2)
                 .foregroundColor(Theme.Palette.ink3)
                 .padding(.horizontal, 4)
-                .padding(.bottom, 6)
+                .padding(.bottom, 8)
 
             VStack(spacing: 0) {
                 content()
             }
-            .liquidGlass(.regular, cornerStyle: .continuous(18), castsShadow: false)
+            .liquidGlass(.regular, cornerStyle: .continuous(20), castsShadow: false)
         }
-        .padding(.bottom, 22)
+        .padding(.bottom, 24)
     }
 
     /// 发丝线。默认从图标右侧（54 = 14 内边距 + 30 图标 + 10 间距）起画，
@@ -557,7 +606,7 @@ struct SettingsView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.system(size: 14, weight: .medium))
+                    .font(.system(size: 15, weight: .medium))
                     .foregroundColor(Theme.Palette.ink)
 
                 Text(subtitle)
@@ -575,8 +624,8 @@ struct SettingsView: View {
                 .accessibilityLabel(title)
                 .accessibilityValue(isOn.wrappedValue ? "已开启" : "已关闭")
         }
-        .padding(.horizontal, 14)
-        .frame(minHeight: 56)
+        .padding(.horizontal, 16)
+        .frame(minHeight: 58)
         .contentShape(Rectangle())
     }
 
@@ -600,7 +649,7 @@ struct SettingsView: View {
                         .foregroundColor(Theme.Palette.ink)
 
                     Text(subtitle)
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundColor(Theme.Palette.ink3)
                         .lineLimit(1)
                 }
@@ -618,8 +667,8 @@ struct SettingsView: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(Theme.Palette.ink3)
             }
-            .padding(.horizontal, 14)
-            .frame(minHeight: 56)
+            .padding(.horizontal, 16)
+            .frame(minHeight: 58)
             .contentShape(Rectangle())
         }
         .buttonStyle(PlainButtonStyle())
@@ -662,8 +711,8 @@ struct SettingsView: View {
                     .foregroundColor(Theme.Palette.ink3)
                     .lineLimit(1)
             }
-            .padding(.horizontal, 14)
-            .frame(minHeight: 56)
+            .padding(.horizontal, 16)
+            .frame(minHeight: 58)
             .contentShape(Rectangle())
         }
         .buttonStyle(PlainButtonStyle())
@@ -676,7 +725,7 @@ struct SettingsView: View {
     private func valueRow(title: String, value: String) -> some View {
         HStack {
             Text(title)
-                .font(.system(size: 14))
+                .font(.system(size: 15))
                 .foregroundColor(Theme.Palette.ink)
 
             Spacer(minLength: 8)
@@ -686,8 +735,8 @@ struct SettingsView: View {
                 .foregroundColor(Theme.Palette.ink3)
                 .lineLimit(1)
         }
-        .padding(.horizontal, 14)
-        .frame(minHeight: 56)
+        .padding(.horizontal, 16)
+        .frame(minHeight: 58)
         .accessibilityElement(children: .combine)
     }
 
