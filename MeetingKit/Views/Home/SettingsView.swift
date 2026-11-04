@@ -135,7 +135,7 @@ struct SettingsView: View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("设置")
-                    .font(.system(size: 26, weight: .semibold))
+                    .font(.system(size: 28, weight: .semibold))
                     .kerning(-0.3)
                     .foregroundColor(Theme.Palette.ink)
 
