@@ -135,7 +135,7 @@ struct HomeSidebar: View {
 
             Text("天穹会议")
                 .font(.system(size: 16, weight: .semibold))
-                .tracking(-0.2)
+                .kerning(-0.2)
                 .foregroundColor(Theme.Palette.ink)
 
             Spacer(minLength: 8)

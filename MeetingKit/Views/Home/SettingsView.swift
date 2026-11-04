@@ -105,7 +105,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("设置")
                     .font(.system(size: 28, weight: .semibold))
-                    .tracking(-0.3)
+                    .kerning(-0.3)
                     .foregroundColor(Theme.Palette.ink)
 
                 Text("账号、会议与隐私")

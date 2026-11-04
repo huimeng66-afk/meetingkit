@@ -154,7 +154,7 @@ struct EnterpriseView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("企业空间")
                     .font(.system(size: 28, weight: .semibold))
-                    .tracking(-0.3)
+                    .kerning(-0.3)
                     .foregroundColor(Theme.Palette.ink)
 
                 Text("企业专属会议室，随时和同事开会。")
@@ -520,7 +520,7 @@ struct EnterpriseView: View {
     private func numberBlock(_ room: EnterpriseRoom) -> some View {
         Text(JoinInfo.groupDigits(room.no))
             .font(.system(size: 28, weight: .semibold).monospacedDigit())
-            .tracking(1.5)
+            .kerning(1.5)
             .foregroundColor(Theme.Palette.ink)
             .lineLimit(1)
             .minimumScaleFactor(0.7)

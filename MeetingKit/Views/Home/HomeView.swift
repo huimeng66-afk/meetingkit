@@ -414,7 +414,7 @@ struct HomeView: View {
 
                     Text("天穹会议")
                         .font(.system(size: 16, weight: .semibold))
-                        .tracking(-0.2)
+                        .kerning(-0.2)
                         .foregroundColor(Theme.Palette.ink)
 
                     Image(systemName: SymbolCompat.name("chevron.right", "chevron.forward"))
@@ -509,7 +509,7 @@ struct HomeView: View {
                     .foregroundColor(Theme.Palette.accent)
             }
             .font(.system(size: 28, weight: .semibold))
-            .tracking(-0.3)
+            .kerning(-0.3)
             .lineLimit(1)
             .minimumScaleFactor(0.8)
 
@@ -593,7 +593,7 @@ struct HomeView: View {
                 .keyboardType(.numberPad)
                 .font(.system(size: 18, weight: .medium, design: .rounded))
                 .foregroundColor(Theme.Palette.ink)
-                .tracking(1.2)
+                .kerning(1.2)
                 // 会议号只可能是数字：输入法粘贴进来的连字符、空格直接剔掉，
                 // 长度按 9 位截断（服务端最多 9 位，留一位余量比截断成 7 位更安全）。
                 .onChange(of: meetingNumber) { value in

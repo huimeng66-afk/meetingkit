@@ -461,10 +461,10 @@ final class ZoomingScrollView: UIScrollView, UIScrollViewDelegate {
 
     func applyContentMode(fill: Bool) {
         guard let mtl = mediaView as? RTCMTLVideoView else { return }
-        let target: RTCVideoContentMode = fill ? .scaleAspectFill : .scaleAspectFit
-        if mtl.videoContentMode != target {
-            mtl.videoContentMode = target
-        }
+        // 不显式写类型名：不同 WebRTC 发行版里 videoContentMode 的类型可能是
+        // RTCVideoContentMode，也可能是 UIView.ContentMode（M140 就没有导出前者）。
+        // 用赋值表达式让编译器自己推断，换一个 WebRTC 版本也不会再断在类型名上。
+        mtl.videoContentMode = fill ? .scaleAspectFill : .scaleAspectFit
     }
 
     // MARK: 布局
