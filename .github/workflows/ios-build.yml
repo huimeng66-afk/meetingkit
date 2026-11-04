@@ -45,23 +45,16 @@ permissions:
 jobs:
   build:
     name: Build MeetingKit (unsigned)
-    # macos-15 runner 预装 Xcode 16（含 iOS 18 SDK），满足 project.yml 的 iOS 14.0 部署目标
+    # macos-26 runner 默认就是 Xcode 26（Swift 6.2 + iOS 26 SDK）。
     #
-    # ⚠️ iOS 26 原生玻璃（LiquidGlass.swift 里 `#if compiler(>=6.2)` 那段）
-    #    需要 **Xcode 26 / Swift 6.2** 才会被编译进去。
-    #    macos-15 默认的 Xcode 16（Swift 6.0/6.1）编译器版本号不到 6.2，
-    #    `#if compiler(>=6.2)` 整段会被预处理器直接跳过 —— 构建不会失败，
-    #    产物只是退回自绘玻璃（`.ultraThinMaterial` / 渐变描边），行为与观感都正确，
-    #    所以这里刻意保持 macos-15，避免 runner 镜像不存在把 CI 变红。
+    # 为什么必须换掉 macos-15：LiquidGlass.swift 里的原生玻璃整段包在
+    # `#if compiler(>=6.2)` 里。macos-15 的 Xcode 16 是 Swift 6.0/6.1，
+    # 编译器版本号不到 6.2 —— 预处理器会把整段跳过，构建不报错，
+    # 但产物里根本没有 `glassEffect`，只剩自绘玻璃。
+    # 这就是「明明写了原生液态玻璃、装上却还是塑料片」的根因。
     #
-    #    需要验证 iOS 26 原生玻璃时，二选一（默认不启用）：
-    #      a) 换 runner：把下一行改成 `runs-on: macos-26`（镜像上线后再切）；
-    #      b) 留在 macos-15，在 "Show Xcode version" 之前插一步指定 Xcode 26：
-    #           - name: Select Xcode 26
-    #             run: sudo xcode-select -s /Applications/Xcode_26.app
-    #         并在该 step 前加 `if: ${{ vars.USE_XCODE_26 == 'true' }}`，
-    #         这样默认构建仍然用 runner 自带的 Xcode 16。
-    runs-on: macos-15
+    # 同时 Xcode 26 的部署下限是 iOS 15，project.yml 已同步从 14 抬到 15。
+    runs-on: macos-26
     timeout-minutes: 30
 
     steps:

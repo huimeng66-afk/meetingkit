@@ -18,8 +18,12 @@ packages:
 
 options:
   bundleIdPrefix: com.tianqiong
+  # Xcode 26 的部署目标下限就是 iOS 15（Apple 支持表：iOS 15~26）。
+  # 原来写 14.0 在 Xcode 16 上只是 warning，换到 Xcode 26 会直接报
+  # "range of supported deployment target versions is 15.0 to 26.x"。
+  # 本项目真机只有 iOS 27，抬到 15 不损失任何用户。
   deploymentTarget:
-    iOS: "14.0"
+    iOS: "15.0"
   createIntermediateGroups: true
   groupSortPosition: top
   minimumXcodeGenVersion: "2.35.0"
@@ -31,7 +35,7 @@ settings:
     # 让同一份工程在 Xcode 14~16 上都能编过（baseline 已降到 iOS 14.0，
     # 所有 15+ 的便利 API 都在 CompatKit / LiquidGlass 里给了 13/14 的等价写法）。
     SWIFT_VERSION: "5.0"
-    IPHONEOS_DEPLOYMENT_TARGET: "14.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
     TARGETED_DEVICE_FAMILY: "1,2"
     # 两个 Info.plist 都是手写的，禁止 Xcode 再自动生成一份覆盖它。
     GENERATE_INFOPLIST_FILE: "NO"
