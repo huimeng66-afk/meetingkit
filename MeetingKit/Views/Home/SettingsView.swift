@@ -122,6 +122,11 @@ struct SettingsView: View {
             // 从登录页返回、或宿主重建本页时，账号可能已经变了。
             session = AuthStore.load()
         }
+        // 登录浮层与"退出登录"都会改 AuthStore，但设置页的 onAppear
+        // 在浮层关闭时不会重跑，必须监听通知才能立刻切换账号卡。
+        .onReceive(NotificationCenter.default.publisher(for: AuthStore.didChangeNotification)) { _ in
+            session = AuthStore.load()
+        }
     }
 
     // MARK: - 页头

@@ -44,6 +44,11 @@ struct HomeTabBar: View {
                 .fill(Theme.Palette.hairline)
                 .frame(height: 0.5)
         }
+        // 通栏导航必须一直铺到屏幕底边。只加 padding(.bottom, inset) 的话，
+        // 导航条会被安全区截住，home indicator 下方露出 34pt 的页面底色，
+        // 看起来像"条没贴底"。忽略安全区后，内部那段 padding 仍然把内容
+        // 顶在指示条上方，背景则铺满整条。
+        .ignoresSafeArea(edges: .bottom)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("主导航")
     }

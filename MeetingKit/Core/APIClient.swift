@@ -46,6 +46,13 @@ struct AuthSession: Equatable {
 /// 登录态持久化。load() 必须是同步的：登录页首帧就要判断"是否已登录"。
 enum AuthStore {
 
+    /// 登录态变化通知。
+    ///
+    /// 设置页退出登录、登录页登录成功都会改 AuthStore，但首页是常驻视图，
+    /// 不切 tab 就不会重新走 onAppear——不广播的话会出现"设置里退出了，
+    /// 回会议页还挂着头像"。谁改谁发，谁显示谁听，比让每个页面自己去轮询干净。
+    static let didChangeNotification = Notification.Name("tianqiong.auth.didChange")
+
     private static let tokenKey = "tianqiong.auth.token"
     private static let nameKey = "tianqiong.auth.name"
     private static let accountKey = "tianqiong.auth.account"
@@ -57,6 +64,7 @@ enum AuthStore {
         defaults.set(session.name, forKey: nameKey)
         defaults.set(session.account, forKey: accountKey)
         defaults.set(session.role, forKey: roleKey)
+        NotificationCenter.default.post(name: didChangeNotification, object: nil)
     }
 
     static func load() -> AuthSession? {
@@ -76,6 +84,7 @@ enum AuthStore {
         defaults.removeObject(forKey: nameKey)
         defaults.removeObject(forKey: accountKey)
         defaults.removeObject(forKey: roleKey)
+        NotificationCenter.default.post(name: didChangeNotification, object: nil)
     }
 }
 

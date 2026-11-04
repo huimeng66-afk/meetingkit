@@ -94,7 +94,7 @@ struct HomeView: View {
                 // 发起会议的悬浮入口。与网页端 `.mobile-fab` 同位置、同尺寸：
                 // 只在会议页出现——通讯录/企业/设置页发起会议没有上下文，属于噪音。
                 if tab == .meetings {
-                    startMeetingFAB(bottomInset: insets.bottom)
+                    startMeetingFAB()
                 }
 
                 toastLayer(bottomInset: insets.bottom)
@@ -137,6 +137,11 @@ struct HomeView: View {
         }
         .onAppear {
             // 从会议室返回、或刚从登录页回来时，账号可能变了。
+            session = AuthStore.load()
+        }
+        // 登录 / 退出可能发生在设置页或登录浮层里，首页是常驻视图，
+        // 必须靠通知才能在同一帧把右上角切过来。
+        .onReceive(NotificationCenter.default.publisher(for: AuthStore.didChangeNotification)) { _ in
             session = AuthStore.load()
         }
         // 设置页改了默认音视频后同步到入会卡：两处都叫"麦克风"，
@@ -408,7 +413,7 @@ struct HomeView: View {
 
     /// 对齐网页端 `.mobile-fab`：右下角 52pt 圆形，压在导航条上方 16pt。
     /// 只在会议页出现——其它页面没有"在这里开会"的上下文。
-    private func startMeetingFAB(bottomInset: CGFloat) -> some View {
+    private func startMeetingFAB() -> some View {
         VStack(spacing: 0) {
             Spacer(minLength: 0)
 
@@ -436,7 +441,7 @@ struct HomeView: View {
                 .accessibilityLabel("发起会议")
                 .padding(.trailing, 18)
             }
-            .padding(.bottom, 56 + bottomInset + 16)
+            .padding(.bottom, 72)
         }
     }
 
