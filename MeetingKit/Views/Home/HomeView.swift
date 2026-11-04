@@ -101,7 +101,7 @@ struct HomeView: View {
             }
             // 从左边缘向右滑打开抽屉。用 simultaneousGesture 而不是 gesture：
             // 抽屉内容本身是 ScrollView，独占手势会让竖直滚动被外层吞掉。
-            .simultaneousGesture(edgeOpenGesture(width: drawerWidth))
+            .simultaneousGesture(edgeOpenGesture())
         }
         // 整个首页屏蔽键盘安全区：否则底栏会被顶到键盘上方，
         // 而资料卡又会被再抬一次。键盘只影响资料卡的显式 offset。
@@ -122,6 +122,14 @@ struct HomeView: View {
         .onAppear {
             // 从会议室返回、或刚从登录页回来时，账号可能变了。
             session = AuthStore.load()
+        }
+        // 设置页改了默认音视频后同步到入会卡：两处都叫"麦克风"，
+        // 如果设置里关了、首页还亮着，用户没有理由相信任何一处。
+        .onChange(of: settings.defaultMicOn) { value in
+            isMicOn = value
+        }
+        .onChange(of: settings.defaultCameraOn) { value in
+            isCameraOn = value
         }
         .sheet(isPresented: $isLoginPresented, onDismiss: {
             // 登录成功后 LoginView 会把昵称回填 guestName，这里同步账号态，
@@ -322,7 +330,7 @@ struct HomeView: View {
             }
     }
 
-    private func edgeOpenGesture(width: CGFloat) -> some Gesture {
+    private func edgeOpenGesture() -> some Gesture {
         DragGesture(minimumDistance: 24)
             .onEnded { value in
                 guard !isSidebarOpen else { return }
@@ -846,6 +854,12 @@ struct HomeView: View {
                 title: "会议 \(trimmed)",
                 displayName: name,
                 isHost: false,
+                avatarColorIndex: router.profile.avatarColorIndex,
+                // 首页的两个开关必须一路带到入会页与会议室。
+                // 之前这里用的是 JoinInfo 的默认值，导致"在首页关了麦，进会还是开着"——
+                // 用户唯一能做的入会前检查，结果完全没生效。
+                micOn: isMicOn,
+                cameraOn: isCameraOn,
                 token: AuthStore.load()?.token ?? ""
             )
         )
@@ -1127,6 +1141,9 @@ struct HomeView: View {
                         title: meeting.title,
                         displayName: name,
                         isHost: true,
+                        avatarColorIndex: self.router.profile.avatarColorIndex,
+                        micOn: self.isMicOn,
+                        cameraOn: self.isCameraOn,
                         token: AuthStore.load()?.token ?? ""
                     )
                 )
