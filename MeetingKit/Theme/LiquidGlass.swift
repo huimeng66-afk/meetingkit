@@ -316,17 +316,21 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
 
     /// 层 2：底色。作用是锁死对比度——会议画面可能是白底 PPT，
     /// 纯模糊会让白字糊掉，必须先压一层。
+    ///
+    /// 系数从 0.28 / 0.12 收到 0.16 / 0.05：品牌底现在有四团流动光斑，
+    /// 压太厚会把光斑全部吃掉，玻璃就退回"灰色圆角块"。收薄之后仍然
+    /// 保留一层暗底兜住对比度，但能看见下面的颜色在透。
     private var baseTintColor: Color {
         if let tintOverride = tintOverride {
             return tintOverride
         }
         switch variant {
         case .regular:
-            return colorScheme == .dark ? Color.black.opacity(0.28) : Color.white.opacity(0.55)
+            return colorScheme == .dark ? Color.black.opacity(0.16) : Color.white.opacity(0.50)
         case .clear:
-            return colorScheme == .dark ? Color.black.opacity(0.12) : Color.white.opacity(0.30)
+            return colorScheme == .dark ? Color.black.opacity(0.05) : Color.white.opacity(0.26)
         case .tinted(let color):
-            return color.opacity(0.35)
+            return color.opacity(0.32)
         }
     }
 

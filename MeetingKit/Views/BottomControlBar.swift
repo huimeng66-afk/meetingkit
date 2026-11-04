@@ -2,15 +2,19 @@
 //  BottomControlBar.swift
 //  MeetingKit
 //
-//  会议室底栏：7 键等宽 + 玻璃通栏 + 顶部 1px 描边。
+//  会议室底栏：7 键 + 悬浮玻璃 Dock。
 //
-//  为什么从"浮起的圆角胶囊"改成通栏：
-//  设计规范 3.3 要求 7 个等宽键 + 64pt 内容高度，浮起胶囊在 375pt 宽度下
-//  7 个 56pt 圆钮已经贴边，再加左右留白会把标签压到 9pt 以下。
-//  通栏之后每键 53pt 宽，48pt 圆盘与 10pt 标签都还有呼吸空间。
+//  ── 为什么从"通栏"改成"悬浮胶囊" ─────────────────────────────────
+//  通栏贴底是 Web / Android 的做法，玻璃只能铺成一条横带，看不出厚度。
+//  改成悬浮胶囊后：左右各留 12pt、离安全区 8pt，视频画面从胶囊四周透出来，
+//  模糊层才有内容可折射，7 个按键也不再被压到屏幕上缘。
+//
+//  宽度约束：iPhone 14 Pro 逻辑宽 393，减掉 12×2 边距与 2×2 内边距，
+//  每键约 52pt，48pt 圆盘 + 10pt 标签仍有余量；SE（375）上每键约 49.6pt，
+//  圆盘不变、标签靠 minimumScaleFactor 收缩，不会换行。
 //
 //  安全区由房间层注入 bottomInset：本视图所在层 ignoresSafeArea，
-//  底栏自己把 home indicator 的高度垫在玻璃里面，玻璃才能一直铺到屏幕底。
+//  底栏自己把 home indicator 的高度垫在胶囊外面，胶囊才真正浮起来。
 //
 
 import SwiftUI
@@ -33,18 +37,16 @@ struct BottomControlBar: View {
             moreButton
         }
         .frame(height: 64)
-        .padding(.bottom, bottomInset)
-        .frame(maxWidth: .infinity)
-        .liquidGlass(.regular, in: Rectangle())
-        .overlay(topHairline, alignment: .top)
-    }
-
-    // MARK: - 顶边
-
-    private var topHairline: some View {
-        Rectangle()
-            .fill(Theme.Palette.glassStroke)
-            .frame(height: 1)
+        .padding(.horizontal, 2)
+        .liquidGlass(
+            .regular,
+            cornerStyle: .continuous(34),
+            castsShadow: true
+        )
+        .padding(.horizontal, 12)
+        // +8 是胶囊与 home indicator 之间的呼吸位；没有这一档，
+        // 胶囊会紧贴手势条，滑动返回时容易误触到「更多」。
+        .padding(.bottom, bottomInset + 8)
     }
 
     // MARK: - 七个键

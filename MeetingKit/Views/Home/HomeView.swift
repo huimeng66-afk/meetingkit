@@ -51,8 +51,9 @@ struct HomeView: View {
                     }
                     .padding(.horizontal, pagePadding)
                     .padding(.top, insets.top + 8)
-                    // 56 的 Tab 内容 + 安全区 + 一点呼吸位，保证最后一行不被 Tab 盖住。
-                    .padding(.bottom, 56 + insets.bottom + 24)
+                    // 悬浮 Dock 实际占位 56 + 10，再留 20 呼吸位，
+                    // 保证最后一行历史记录滚到底时不会被胶囊压住。
+                    .padding(.bottom, 86 + insets.bottom)
                 }
                 // 手动吃安全区：GeometryReader 里的子视图从屏幕原点开始，
                 // 不加这一行，滚动内容会钻到刘海下面，而顶部留白已经显式给过了。
@@ -135,41 +136,27 @@ struct HomeView: View {
 
     private var meetingsBody: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
                 Text("天穹会议")
-                    .font(.system(size: 28, weight: .bold))
+                    // 34pt + 收紧字距：这是 iOS 大标题的标准观感，
+                    // 28pt bold 在 6.1 寸屏上会显得"没长开"。
+                    .font(.system(size: 34, weight: .bold))
+                    .tracking(-0.6)
                     .foregroundColor(Theme.Palette.ink)
 
                 Text("高效稳定的企业级视频会议")
                     .font(.system(size: 13))
                     .foregroundColor(Theme.Palette.ink2)
             }
-            .padding(.top, 24)
+            .padding(.top, 22)
 
-            HStack(spacing: 12) {
-                HomeActionCard(
-                    title: "发起会议",
-                    subtitle: "快速开启会议",
-                    symbol: "video.fill",
-                    gradient: Theme.Palette.brandGradient
-                ) {
+            VStack(spacing: 12) {
+                PrimaryMeetingCard {
                     Haptics.impact(.light)
                     startMeetingFromHome()
                 }
 
-                HomeActionCard(
-                    title: "加入会议",
-                    subtitle: "输入会议号加入",
-                    symbol: "plus",
-                    gradient: LinearGradient(
-                        gradient: Gradient(colors: [
-                            Theme.Palette.accent2,
-                            Theme.Palette.success
-                        ]),
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                ) {
+                SecondaryMeetingCard {
                     Haptics.impact(.light)
                     router.openPreJoin(
                         JoinInfo(
@@ -181,10 +168,10 @@ struct HomeView: View {
                     )
                 }
             }
-            .padding(.top, 20)
+            .padding(.top, 22)
 
             historySection
-                .padding(.top, 28)
+                .padding(.top, 26)
         }
     }
 
@@ -397,28 +384,25 @@ struct HomeView: View {
         }
     }
 
-    // MARK: - 底部 Tab
+    // MARK: - 底部 Dock
 
+    /// 悬浮胶囊 Dock。
+    ///
+    /// 从"通栏 + 1px 顶边"改成悬浮胶囊，是这次视觉重做里改动最小、感知最强的一处：
+    /// 通栏在观感上属于 Android / Web，悬浮胶囊才是 iOS 26 之后的原生语言，
+    /// 而且胶囊四周留出的背景能让玻璃真的"浮"在极光上。
     private func tabBar(bottomInset: CGFloat) -> some View {
-        VStack(spacing: 0) {
-            // 玻璃顶边：1px 品牌描边，明确 Tab 与内容的层级。
-            Rectangle()
-                .fill(Theme.Palette.glassStroke)
-                .frame(height: 1)
-
-            HStack(spacing: 0) {
-                tabButton(.meetings)
-                tabButton(.contacts)
-            }
-            .frame(height: 56)
+        HStack(spacing: 4) {
+            tabButton(.meetings)
+            tabButton(.contacts)
         }
-        .padding(.bottom, bottomInset)
-        .background(
-            ZStack {
-                VisualEffectBlur(effectStyle: .systemUltraThinMaterialDark)
-                Theme.Palette.background.opacity(0.74)
-            }
+        .padding(6)
+        .liquidGlass(
+            .regular,
+            cornerStyle: .continuous(30),
+            castsShadow: true
         )
+        .padding(.bottom, bottomInset + 10)
     }
 
     private func tabButton(_ item: HomeTab) -> some View {
@@ -431,20 +415,34 @@ struct HomeView: View {
                 tab = item
             }
         } label: {
-            VStack(spacing: 4) {
+            HStack(spacing: 7) {
                 Image(systemName: isSelected ? item.selectedSymbol : item.symbol)
-                    .font(.system(size: 18, weight: .medium))
+                    .font(.system(size: 16, weight: .semibold))
 
                 Text(item.title)
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.system(size: 13, weight: .semibold))
             }
-            .foregroundColor(isSelected ? Theme.Palette.accent : Theme.Palette.ink3)
-            .frame(maxWidth: .infinity)
-            .frame(height: 56)
-            .contentShape(Rectangle())
+            .foregroundColor(isSelected ? Theme.Palette.ink : Theme.Palette.ink3)
+            // 选中态是一层很薄的着色胶囊，不是实心块：
+            // 实心块会把玻璃的折射全挡住，Dock 立刻变成"两个按钮"。
+            .background(
+                Capsule()
+                    .fill(isSelected ? Theme.Palette.accent.opacity(0.20) : Color.clear)
+            )
+            .overlay(
+                Capsule()
+                    .stroke(
+                        isSelected ? Theme.Palette.accent.opacity(0.34) : Color.clear,
+                        lineWidth: 1
+                    )
+            )
+            .padding(.horizontal, 18)
+            .frame(height: 44)
+            .contentShape(Capsule())
         }
         .buttonStyle(PlainButtonStyle())
         .accessibilityLabel(item.title)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
     // MARK: - Toast
@@ -458,7 +456,7 @@ struct HomeView: View {
                     // id 变化时重建，让连续两条提示都能重播进入动画。
                     .id(message.id)
                     .padding(.horizontal, pagePadding)
-                    .padding(.bottom, 56 + bottomInset + 12)
+                    .padding(.bottom, 86 + bottomInset)
                     .transition(.opacity)
                     .allowsHitTesting(false)
             }
@@ -766,52 +764,136 @@ private struct HomeIconButton: View {
     }
 }
 
-// MARK: - 双卡
+// MARK: - 主操作卡
 
-private struct HomeActionCard: View {
-
-    let title: String
-    let subtitle: String
-    let symbol: String
-    let gradient: LinearGradient
+/// 「发起会议」。首页唯一的主动作，所以给它整行宽度、渐变底光和实心渐变圆。
+///
+/// 为什么不做成两张并排的方块：并排卡在视觉上是"两个入口"，权重相同；
+/// 而会议类产品的真实心智是"开一场会"是主路径、"输号加入"是次路径。
+/// 拆成一主一次之后，首屏有了明确的视觉落点。
+private struct PrimaryMeetingCard: View {
 
     let action: () -> Void
 
     var body: some View {
-        Button {
-            action()
-        } label: {
-            VStack(spacing: 8) {
-                ZStack {
-                    Circle()
-                        .fill(gradient)
-                        .frame(width: 44, height: 44)
+        Button(action: action) {
+            ZStack {
+                // 渐变底光：叠在玻璃下面的色层，让这张卡比周围亮一档。
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .fill(Theme.Palette.brandGradient)
+                    .opacity(0.20)
 
-                    Image(systemName: SymbolCompat.name(symbol, "plus"))
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundColor(.white)
+                // 左上角高光，模拟光线从屏幕外打进玻璃边缘。
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            stops: [
+                                .init(color: Color.white.opacity(0.14), location: 0.0),
+                                .init(color: Color.clear, location: 0.55)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+
+                HStack(spacing: 16) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("发起会议")
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(Theme.Palette.ink)
+
+                        Text("立即开始一场即时会议")
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.Palette.ink2)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    ZStack {
+                        // 图标后面的光晕：比图标大一圈的模糊圆，
+                        // 让渐变圆盘看起来在发光，而不是贴上去的一块色。
+                        Circle()
+                            .fill(Theme.Palette.accent)
+                            .frame(width: 44, height: 44)
+                            .blur(radius: 16)
+                            .opacity(0.75)
+
+                        Circle()
+                            .fill(Theme.Palette.brandGradient)
+                            .frame(width: 52, height: 52)
+                            .overlay(
+                                Circle().stroke(Color.white.opacity(0.22), lineWidth: 1)
+                            )
+
+                        Image(systemName: SymbolCompat.name("video.fill", "video"))
+                            .font(.system(size: 21, weight: .semibold))
+                            .foregroundColor(.white)
+                    }
                 }
-                .padding(.bottom, 4)
-
-                Text(title)
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundColor(Theme.Palette.ink)
-
-                Text(subtitle)
-                    .font(.system(size: 11))
-                    .foregroundColor(Theme.Palette.ink3)
+                .padding(.horizontal, 20)
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: 132)
-            .contentShape(RoundedRectangle(cornerRadius: Theme.Metrics.cardRadius, style: .continuous))
+            .frame(height: 100)
+            .contentShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
             .liquidGlass(
                 .regular,
-                cornerStyle: .continuous(Theme.Metrics.cardRadius),
+                cornerStyle: .continuous(24),
                 castsShadow: true
             )
         }
         .buttonStyle(BrandPressStyle())
-        .accessibilityLabel(title)
+        .accessibilityLabel("发起会议")
+    }
+}
+
+// MARK: - 次操作卡
+
+/// 「加入会议」。刻意压低存在感：小圆、无渐变、无光晕，
+/// 只保留一条 chevron 暗示可进入。
+private struct SecondaryMeetingCard: View {
+
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 14) {
+                ZStack {
+                    Circle()
+                        .fill(Color.white.opacity(0.08))
+                        .frame(width: 40, height: 40)
+                        .overlay(Circle().stroke(Theme.Palette.glassStroke, lineWidth: 1))
+
+                    Image(systemName: SymbolCompat.name("plus", "plus.circle"))
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundColor(Theme.Palette.ink)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("加入会议")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(Theme.Palette.ink)
+
+                    Text("输入会议号加入")
+                        .font(.system(size: 11))
+                        .foregroundColor(Theme.Palette.ink3)
+                }
+
+                Spacer(minLength: 8)
+
+                Image(systemName: SymbolCompat.name("chevron.right", "chevron.right"))
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(Theme.Palette.ink3)
+            }
+            .padding(.horizontal, 16)
+            .frame(height: 76)
+            .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .liquidGlass(
+                .regular,
+                cornerStyle: .continuous(22),
+                castsShadow: false
+            )
+        }
+        .buttonStyle(BrandPressStyle())
+        .accessibilityLabel("加入会议")
     }
 }
 
