@@ -2,29 +2,24 @@
 //  BrandBackground.swift
 //  MeetingKit
 //
-//  天穹品牌底：深空蓝 + 四团缓慢漂移的极光。
+//  页面底：深空黑 + 两处极弱的品牌冷光。
 //
-//  ── 为什么必须"动" ────────────────────────────────────────────────
-//  玻璃质感成立的前提是**下面有东西可折射**。之前的实现是三层静态径向渐变，
-//  在纯深色底上几乎看不出层次，盖在上面的玻璃只能糊成一块灰——这就是
-//  "卡片像灰块、跟网页端不是一个级别"的根因。
+//  ── 为什么删掉了"极光" ──────────────────────────────────────────────
+//  上一版是四团 26 秒漂移的光斑（蓝 / 紫 / 青 / 靛）。它的出发点是"玻璃下面
+//  得有东西可折射"，但做出来的观感是典型的 AI 生成式界面：高饱和、彩色烟雾、
+//  处处发光。真实的高端 App 底色几乎都是**安静的**——光只用来交代一个方向感，
+//  不参与抢注意力。
 //
-//  现在改成四团大半径光斑做极慢漂移（18~26 秒一个来回，肉眼几乎察觉不到在动，
-//  但每次扫视时折射角度都不一样），玻璃才有了"活"的底色。
+//  现在只留两个静态光源：左上一点冷蓝，右上一点靛紫，透明度都压到 0.10 附近，
+//  中间大面积保持接近纯黑。玻璃盖上去时，边缘会折射出一点点颜色变化，足够了；
+//  剩下的层次交给玻璃自己的边缘高光，而不是靠背景硬撑。
 //
-//  性能取舍：不用 TimelineView / Canvas 逐帧重绘，只让 4 个已光栅化的圆做
-//  位移动画——走的是 Core Animation 合成层，不触发 SwiftUI body 重算。
-//  降低动态效果（accessibilityReduceMotion）时全部停在初始位，不做位移。
+//  性能上也不再需要任何动画：整块背景是一次性的渐变合成，不占帧。
 //
 
 import SwiftUI
 
 struct BrandBackground: View {
-
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    /// 单一相位驱动四团光斑，避免四套独立动画各自计时导致画面"打架"。
-    @State private var phase: CGFloat = 0
 
     var body: some View {
         GeometryReader { geo in
@@ -34,112 +29,56 @@ struct BrandBackground: View {
             ZStack {
                 Theme.Palette.background
 
-                // 左上：品牌蓝，最大最亮，负责定调。
-                orb(
-                    color: Theme.Palette.accent,
-                    opacity: 0.30,
-                    diameter: width * 1.55
-                )
-                .position(
-                    x: width * 0.10 + phase * 26,
-                    y: height * 0.06 - phase * 18
-                )
-
-                // 右上：紫，与蓝色拉开色相，制造"极光交界"。
-                orb(
-                    color: Theme.Palette.violet,
-                    opacity: 0.24,
-                    diameter: width * 1.30
-                )
-                .position(
-                    x: width * 0.96 - phase * 20,
-                    y: height * 0.18 + phase * 30
+                // 左上冷光：方向感来源。半径给到 0.9 屏宽，衰减极缓，
+                // 这样它不会形成"一个圆"，而是像房间角落的一盏灯。
+                RadialGradient(
+                    gradient: Gradient(stops: [
+                        .init(color: Theme.Palette.accent.opacity(0.16), location: 0.0),
+                        .init(color: Theme.Palette.accent.opacity(0.05), location: 0.45),
+                        .init(color: Color.clear, location: 1.0)
+                    ]),
+                    center: UnitPoint(x: 0.12, y: -0.06),
+                    startRadius: 0,
+                    endRadius: width * 0.95
                 )
 
-                // 底部中：青，托住底栏区域，让悬浮 Dock 下面有冷暖对比。
-                orb(
-                    color: Theme.Palette.accent2,
-                    opacity: 0.16,
-                    diameter: width * 1.70
-                )
-                .position(
-                    x: width * 0.46 + phase * 14,
-                    y: height * 1.02 - phase * 22
-                )
-
-                // 中部偏右：一圈很淡的靛蓝，填掉中间容易发死黑的部分。
-                orb(
-                    color: Color(hex: 0x3B82F6),
-                    opacity: 0.12,
-                    diameter: width * 0.95
-                )
-                .position(
-                    x: width * 0.72 + phase * 18,
-                    y: height * 0.56 - phase * 14
+                // 右上冷紫：与左上的蓝拉开一点色相，避免整屏只有一种蓝。
+                RadialGradient(
+                    gradient: Gradient(stops: [
+                        .init(color: Theme.Palette.violet.opacity(0.10), location: 0.0),
+                        .init(color: Color.clear, location: 1.0)
+                    ]),
+                    center: UnitPoint(x: 1.02, y: 0.28),
+                    startRadius: 0,
+                    endRadius: width * 0.75
                 )
 
-                // 顶部压暗：让状态栏、大标题始终有足够对比度。
+                // 底部压暗：悬浮 Dock 底下的亮度必须低于内容区，
+                // 否则玻璃会跟着变亮、白字对比度掉下去。
                 LinearGradient(
                     stops: [
-                        .init(color: Color.black.opacity(0.28), location: 0.0),
-                        .init(color: Color.clear, location: 0.28)
+                        .init(color: Color.clear, location: 0.52),
+                        .init(color: Color.black.opacity(0.36), location: 1.0)
                     ],
                     startPoint: .top,
                     endPoint: .bottom
                 )
 
-                // 底部压暗：悬浮 Dock 底下如果还是亮光斑，玻璃会发灰、白字会飘。
+                // 顶部压暗：状态栏与大标题区域需要稳定的对比度底。
                 LinearGradient(
                     stops: [
-                        .init(color: Color.clear, location: 0.60),
-                        .init(color: Color.black.opacity(0.42), location: 1.0)
+                        .init(color: Color.black.opacity(0.22), location: 0.0),
+                        .init(color: Color.clear, location: 0.22)
                     ],
                     startPoint: .top,
                     endPoint: .bottom
                 )
             }
-            .frame(width: geo.size.width, height: geo.size.height)
+            .frame(width: width, height: height)
         }
         .ignoresSafeArea()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
-        .onAppear(perform: startDrifting)
-    }
-
-    /// 26 秒一个来回的 easeInOut。用极长的周期是因为要"看起来是静态的、但会呼吸"，
-    /// 周期短于 10 秒就会明显抢注意力，反而廉价。
-    private func startDrifting() {
-        guard !reduceMotion else { return }
-        // 已经在动就不要重复叠加，否则多次 onAppear 会把动画推回起点。
-        guard phase == 0 else { return }
-        withAnimation(.easeInOut(duration: 26).repeatForever(autoreverses: true)) {
-            phase = 1
-        }
-    }
-}
-
-// MARK: - 光斑
-
-private extension BrandBackground {
-
-    /// 一团柔光。`RadialGradient` 中心到边缘线性衰减，再叠一层大半径模糊，
-    /// 抹掉圆形轮廓——不模糊的话两团光相交处会出现一条清晰的圆弧边。
-    func orb(color: Color, opacity: Double, diameter: CGFloat) -> some View {
-        Circle()
-            .fill(
-                RadialGradient(
-                    gradient: Gradient(stops: [
-                        .init(color: color.opacity(opacity), location: 0.0),
-                        .init(color: color.opacity(opacity * 0.55), location: 0.45),
-                        .init(color: color.opacity(0.0), location: 1.0)
-                    ]),
-                    center: .center,
-                    startRadius: 0,
-                    endRadius: diameter * 0.5
-                )
-            )
-            .frame(width: diameter, height: diameter)
-            .blur(radius: diameter * 0.06)
     }
 }
 
@@ -151,8 +90,8 @@ struct BrandPressStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
-            .opacity(configuration.isPressed ? 0.92 : 1.0)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1.0)
+            .opacity(configuration.isPressed ? 0.9 : 1.0)
             .animationCompat(Theme.Motion.standard, value: configuration.isPressed)
     }
 }

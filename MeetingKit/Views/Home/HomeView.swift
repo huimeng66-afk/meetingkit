@@ -141,7 +141,6 @@ struct HomeView: View {
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundColor(.white)
                 )
-                .shadow(color: Theme.Palette.accent.opacity(0.5), radius: 10, y: 4)
 
             Text("天穹会议")
                 .font(.system(size: 16, weight: .semibold))
@@ -216,55 +215,45 @@ struct HomeView: View {
     // MARK: 标题
 
     private var hero: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 1) {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text("一个会议号，")
                     .foregroundColor(Theme.Palette.ink)
 
-                // 渐变只作用于这一行：整段渐变会稀释强调，网页端也只强调后半句。
-                gradientText("把会开在屏幕里。")
+                // 第二行用实色强调，不做渐变。
+                //
+                // 渐变文字是"AI 生成感"最重的一处：它没有品牌含义，只是为了让画面
+                // 显得热闹，而且在小字号下会让笔画发灰。苹果自己的大标题从来是单色。
+                Text("把会开在屏幕里。")
+                    .foregroundColor(Theme.Palette.accent)
             }
-            // 30pt 是 375pt 宽度下 9 个汉字不折行的上限；SE 上再缩到 0.82，
-            // 宁可整体略小，也不要出现「把会开在屏幕 / 里。」这种断句。
-            // lineLimit 写在每个 Text 上而不是 VStack 上：环境值虽然会下发，
-            // 但 VStack 自身也吃到 lineLimit 时，SwiftUI 会按单行去量它的高度。
-            .font(.system(size: 30, weight: .bold))
-            .tracking(-0.8)
+            .font(.system(size: 28, weight: .semibold))
+            .tracking(-0.3)
             .lineLimit(1)
-            .minimumScaleFactor(0.82)
+            .minimumScaleFactor(0.8)
 
-            Text("不用装客户端，输个号码就能入会。高清音视频、屏幕共享，手机竖屏也顺手。")
-                .font(.system(size: 13.5))
+            Text("不用装客户端。输入会议号就能进。")
+                .font(.system(size: 13))
                 .foregroundColor(Theme.Palette.ink2)
-                .lineSpacing(3)
-                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.top, 26)
-    }
-
-    /// iOS 14 没有 `foregroundStyle(Gradient)`，用遮罩实现同样的渐变文字。
-    private func gradientText(_ text: String) -> some View {
-        Text(text)
-            .foregroundColor(.white)
-            .overlay(
-                LinearGradient(
-                    colors: [
-                        Color(hex: 0x8FB6FF),
-                        Theme.Palette.accent,
-                        Color(hex: 0xA98BFF)
-                    ],
-                    startPoint: .leading,
-                    endPoint: .trailing
-                )
-                .mask(Text(text))
-            )
+        .padding(.top, 24)
     }
 
     // MARK: 入会卡
 
+    /// 入会卡：原生玻璃面板 + 系统分段控件。
+    ///
+    /// 之前的分段是自绘的（两层圆角 + 两道描边 + 选中填充），叠起来之后边缘发亮，
+    /// 正是"塑料感"的来源之一。这里直接用系统 `Picker(.segmented)`：
+    /// iOS 26 上它本身就是玻璃材质，选中态由系统做液态过渡，和卡片是同一套材质语言。
     private var joinCard: some View {
-        VStack(spacing: 0) {
-            modeSwitcher
+        VStack(spacing: 16) {
+            Picker("入会方式", selection: $joinMode) {
+                Text("加入会议").tag(HomeJoinMode.join)
+                Text("发起会议").tag(HomeJoinMode.start)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
 
             Group {
                 if joinMode == .join {
@@ -273,110 +262,57 @@ struct HomeView: View {
                     startPanel
                 }
             }
-            .padding(.top, 18)
         }
-        .padding(18)
-        .liquidGlass(.regular, cornerStyle: .continuous(26), castsShadow: true)
-    }
-
-    private var modeSwitcher: some View {
-        HStack(spacing: 4) {
-            modeButton(.join, title: "加入会议")
-            modeButton(.start, title: "发起会议")
-        }
-        .padding(4)
-        .background(
-            RoundedRectangle(cornerRadius: 15, style: .continuous)
-                .fill(Color.white.opacity(0.05))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 15, style: .continuous)
-                .stroke(Color.white.opacity(0.07), lineWidth: 1)
-        )
-    }
-
-    private func modeButton(_ mode: HomeJoinMode, title: String) -> some View {
-        let isSelected = joinMode == mode
-
-        return Button {
-            guard joinMode != mode else { return }
-            Haptics.selection()
-            Keyboard.dismiss()
-            withAnimation(Theme.Motion.standard) {
-                joinMode = mode
-            }
-        } label: {
-            Text(title)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundColor(isSelected ? Theme.Palette.ink : Theme.Palette.ink3)
-                .frame(maxWidth: .infinity)
-                .frame(height: 38)
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(isSelected ? Color.white.opacity(0.11) : Color.clear)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(isSelected ? Color.white.opacity(0.14) : Color.clear, lineWidth: 1)
-                )
-                .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        }
-        .buttonStyle(PlainButtonStyle())
-        .accessibilityLabel(title)
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .padding(16)
+        .liquidGlass(.regular, cornerStyle: .continuous(24), castsShadow: false)
+        .animationCompat(Theme.Motion.standard, value: joinMode)
     }
 
     // MARK: 加入面板
 
     private var joinPanel: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            fieldLabel("会议号")
-            numberField
-
-            fieldLabel("你的名称", optional: true)
-            nameField
-
+        VStack(spacing: 14) {
+            fieldGroup
             deviceRow
-
             joinButton
-
             privacyNote
         }
     }
 
-    private func fieldLabel(_ text: String, optional: Bool = false) -> some View {
-        HStack(spacing: 6) {
-            Text(text)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(Theme.Palette.ink2)
+    /// 两个输入框合成一组，中间一条 1px 分隔线。
+    ///
+    /// 原来的写法是"每个输入框各自一个圆角块 + 各自一圈描边"，两个块并排时
+    /// 会出现四条平行亮边，看起来像塑料拼装件。系统设置的做法是**一组**：
+    /// 一个浅底容器，行与行之间一条发丝线，容器本身没有边框。
+    private var fieldGroup: some View {
+        VStack(spacing: 0) {
+            numberRow
 
-            if optional {
-                Text("选填")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Theme.Palette.ink3)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(
-                        Capsule().fill(Color.white.opacity(0.06))
-                    )
-            }
+            Rectangle()
+                .fill(Theme.Palette.hairline)
+                .frame(height: 1)
+                .padding(.leading, 46)
 
-            Spacer(minLength: 0)
+            nameRow
         }
-        .padding(.bottom, -6)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.white.opacity(0.05))
+        )
     }
 
-    private var numberField: some View {
+    private var numberRow: some View {
         HStack(spacing: 10) {
             Image(systemName: SymbolCompat.name("number", "number"))
-                .font(.system(size: 15, weight: .semibold))
+                .font(.system(size: 15, weight: .medium))
                 .foregroundColor(meetingNumber.isEmpty ? Theme.Palette.ink3 : Theme.Palette.accent)
+                .frame(width: 22)
 
-            TextField("输入 7 位会议号", text: $meetingNumber)
+            TextField("会议号", text: $meetingNumber)
                 .keyboardType(.numberPad)
-                .font(.system(size: 19, weight: .semibold, design: .rounded))
+                .font(.system(size: 18, weight: .medium, design: .rounded))
                 .foregroundColor(Theme.Palette.ink)
-                .tracking(1.5)
+                .tracking(1.2)
                 // 会议号只可能是数字：输入法粘贴进来的连字符、空格直接剔掉，
                 // 长度按 9 位截断（服务端最多 9 位，留一位余量比截断成 7 位更安全）。
                 .onChange(of: meetingNumber) { value in
@@ -385,6 +321,7 @@ struct HomeView: View {
                         meetingNumber = digits
                     }
                 }
+                .accessibilityLabel("会议号")
 
             if !meetingNumber.isEmpty {
                 Button {
@@ -402,29 +339,17 @@ struct HomeView: View {
             }
         }
         .padding(.horizontal, 14)
-        .frame(height: 54)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.white.opacity(0.06))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(
-                    meetingNumber.isEmpty
-                        ? Color.white.opacity(0.10)
-                        : Theme.Palette.accent.opacity(0.55),
-                    lineWidth: 1
-                )
-        )
+        .frame(height: 56)
     }
 
-    private var nameField: some View {
+    private var nameRow: some View {
         HStack(spacing: 10) {
             Image(systemName: SymbolCompat.name("person", "person.fill"))
                 .font(.system(size: 14, weight: .medium))
                 .foregroundColor(Theme.Palette.ink3)
+                .frame(width: 22)
 
-            TextField("不填写将以「访客」身份入会", text: $guestName)
+            TextField("你的名称（选填）", text: $guestName)
                 .font(.system(size: 15))
                 .foregroundColor(Theme.Palette.ink)
                 .autocapitalization(.none)
@@ -434,17 +359,25 @@ struct HomeView: View {
                         guestName = String(value.prefix(24))
                     }
                 }
+                .accessibilityLabel("你的名称，选填")
+
+            if !guestName.isEmpty {
+                Button {
+                    Haptics.selection()
+                    guestName = ""
+                } label: {
+                    Image(systemName: SymbolCompat.name("xmark.circle.fill", "xmark.circle"))
+                        .font(.system(size: 15))
+                        .foregroundColor(Theme.Palette.ink3)
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PlainButtonStyle())
+                .accessibilityLabel("清空名称")
+            }
         }
         .padding(.horizontal, 14)
-        .frame(height: 50)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.white.opacity(0.06))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.white.opacity(0.10), lineWidth: 1)
-        )
+        .frame(height: 52)
     }
 
     /// 麦克风 / 摄像头预置。和网页端一样只做「入会前最后一次检查」，
@@ -470,14 +403,11 @@ struct HomeView: View {
             }
 
             Spacer(minLength: 0)
-
-            Text("入会后可调整")
-                .font(.system(size: 10.5))
-                .foregroundColor(Theme.Palette.ink3)
         }
-        .padding(.top, 2)
     }
 
+    /// 胶囊玻璃芯片：常态是系统玻璃，关闭态是红色染色玻璃。
+    /// 不再自己画底色 + 描边——两圈边叠在一起就是塑料感的来源。
     private func deviceChip(
         isOn: Bool,
         onSymbol: String,
@@ -496,28 +426,18 @@ struct HomeView: View {
                 Text(title)
                     .font(.system(size: 12, weight: .medium))
             }
-            // 关闭态用红：与会议室底栏同一套语义，颜色之外还有斜杠图标兜底。
-            .foregroundColor(isOn ? Theme.Palette.ink2 : Theme.Palette.danger)
+            .foregroundColor(isOn ? Theme.Palette.ink2 : Color(hex: 0xFCA5A5))
             .padding(.horizontal, 12)
             .frame(height: 34)
-            .background(
-                Capsule().fill(
-                    isOn
-                        ? Color.white.opacity(0.06)
-                        : Theme.Palette.danger.opacity(0.14)
-                )
-            )
-            .overlay(
-                Capsule().stroke(
-                    isOn
-                        ? Color.white.opacity(0.08)
-                        : Theme.Palette.danger.opacity(0.34),
-                    lineWidth: 1
-                )
+            .liquidGlass(
+                isOn ? .regular : .tinted(Theme.Palette.danger),
+                cornerStyle: .capsule,
+                isInteractive: true,
+                castsShadow: false
             )
             .contentShape(Capsule())
         }
-        .buttonStyle(BrandPressStyle())
+        .buttonStyle(PlainButtonStyle())
         .accessibilityLabel(isOn ? "关闭\(title)" : "开启\(title)")
         .accessibilityValue(isOn ? "已开启" : "已关闭")
     }
@@ -534,23 +454,20 @@ struct HomeView: View {
             Text("加入会议")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundColor(.white)
-                // 染色玻璃会把 accent 稀释一层，纯白字直接压上去在亮处偏薄，
-                // 一点暗投影把字从折射里拎出来。
-                .shadow(color: Color.black.opacity(0.28), radius: 6, y: 1)
                 .frame(maxWidth: .infinity)
-                .frame(height: 52)
-                .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .frame(height: 50)
+                .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .buttonStyle(PlainButtonStyle())
-        // 主 CTA 走原生染色玻璃：iOS 26 上是系统 `.tint` 玻璃（自带你按下时的
-        // 形变与高光），14~25 退回同色系的着色合成，两条路径同一个调用点。
+        // 染色玻璃 + 白字，就是系统 `.glassProminent` 的成色。
+        // 之前给文字加暗投影是多余的一层：投影会压在玻璃折射之上，字看着发脏。
         .liquidGlass(
             .tinted(Theme.Palette.accent),
-            cornerStyle: .continuous(16),
+            cornerStyle: .continuous(14),
             isInteractive: true,
-            castsShadow: true
+            castsShadow: false
         )
-        .opacity(canJoin ? 1.0 : 0.52)
+        .opacity(canJoin ? 1.0 : 0.5)
         .disabled(!canJoin)
         .accessibilityLabel("加入会议")
     }
@@ -571,38 +488,20 @@ struct HomeView: View {
     // MARK: 发起面板
 
     private var startPanel: some View {
-        VStack(spacing: 12) {
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Theme.Palette.accent.opacity(0.28),
-                            Theme.Palette.violet.opacity(0.20)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .frame(height: 96)
-                .overlay(
-                    Image(systemName: SymbolCompat.name("video.badge.plus", "video.fill"))
-                        .font(.system(size: 30, weight: .semibold))
-                        .foregroundColor(.white)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                )
+        VStack(spacing: 14) {
+            VStack(spacing: 6) {
+                Text("立即发起一场会议")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundColor(Theme.Palette.ink)
 
-            Text("立即发起一场会议")
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundColor(Theme.Palette.ink)
-
-            Text("系统会分配一个会议号，把链接发给同事即可入会。")
-                .font(.system(size: 12.5))
-                .foregroundColor(Theme.Palette.ink2)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
+                Text("系统会分配一个会议号，把号码发给同事即可入会。")
+                    .font(.system(size: 12.5))
+                    .foregroundColor(Theme.Palette.ink2)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
 
             Button {
                 Haptics.impact(.medium)
@@ -611,19 +510,17 @@ struct HomeView: View {
                 Text("发起即时会议")
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundColor(.white)
-                    .shadow(color: Color.black.opacity(0.28), radius: 6, y: 1)
                     .frame(maxWidth: .infinity)
-                    .frame(height: 52)
-                    .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .frame(height: 50)
+                    .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
             .buttonStyle(PlainButtonStyle())
             .liquidGlass(
                 .tinted(Theme.Palette.accent),
-                cornerStyle: .continuous(16),
+                cornerStyle: .continuous(14),
                 isInteractive: true,
-                castsShadow: true
+                castsShadow: false
             )
-            .padding(.top, 4)
             .accessibilityLabel("发起即时会议")
 
             VStack(alignment: .leading, spacing: 7) {
@@ -711,11 +608,22 @@ struct HomeView: View {
                 historyEmptyState
                     .padding(.top, 8)
             } else {
-                VStack(spacing: 12) {
-                    ForEach(router.history) { item in
+                // 历史记录合成一张玻璃卡，行间用发丝线分隔。
+                // 每条记录单独包一层玻璃的做法，会让 5 条记录变成 5 块各自反光的
+                // 卡片，视觉噪音大，也不像系统列表。
+                VStack(spacing: 0) {
+                    ForEach(Array(router.history.enumerated()), id: \.element.id) { index, item in
                         historyRow(item)
+
+                        if index < router.history.count - 1 {
+                            Rectangle()
+                                .fill(Theme.Palette.hairline)
+                                .frame(height: 1)
+                                .padding(.leading, 68)
+                        }
                     }
                 }
+                .liquidGlass(.regular, cornerStyle: .continuous(18), castsShadow: false)
                 .padding(.top, 10)
             }
         }
@@ -780,17 +688,10 @@ struct HomeView: View {
                     .foregroundColor(Theme.Palette.ink2)
                     .lineLimit(1)
             }
-            .padding(.horizontal, 12)
-            .frame(height: 68)
+            .padding(.horizontal, 14)
+            .frame(height: 64)
             .frame(maxWidth: .infinity)
-            .contentShape(RoundedRectangle(cornerRadius: Theme.Metrics.cardRadius, style: .continuous))
-            // 玻璃画在 label 内部：按下时 BrandPressStyle 的 0.96 才能带着玻璃一起缩，
-            // 否则会出现"内容缩了、卡片没缩"的割裂感。
-            .liquidGlass(
-                .regular,
-                cornerStyle: .continuous(Theme.Metrics.cardRadius),
-                castsShadow: false
-            )
+            .contentShape(Rectangle())
         }
         .buttonStyle(BrandPressStyle())
         // 长按删除。iOS 14 的 Button 没有 role 参数，用普通 Button + 红色图标表达危险语义。
@@ -835,7 +736,7 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
                 Text("联系人")
-                    .font(.system(size: 28, weight: .bold))
+                    .font(.system(size: 28, weight: .semibold))
                     .foregroundColor(Theme.Palette.ink)
 
                 Text("邀请同事加入你的会议")
@@ -864,17 +765,18 @@ struct HomeView: View {
                 } label: {
                     Text("邀请参会人")
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(Theme.Palette.accent)
+                        .foregroundColor(Theme.Palette.ink)
                         .padding(.horizontal, 22)
                         .frame(height: 44)
-                        .background(
-                            Capsule().fill(Theme.Palette.accent.opacity(0.12))
+                        .liquidGlass(
+                            .regular,
+                            cornerStyle: .capsule,
+                            isInteractive: true,
+                            castsShadow: false
                         )
-                        .overlay(
-                            Capsule().stroke(Theme.Palette.accent.opacity(0.32), lineWidth: 1)
-                        )
+                        .contentShape(Capsule())
                 }
-                .buttonStyle(BrandPressStyle())
+                .buttonStyle(PlainButtonStyle())
                 .padding(.top, 6)
                 .accessibilityLabel("邀请参会人")
             }
@@ -899,8 +801,8 @@ struct HomeView: View {
     /// Liquid Glass 与自绘模糊最本质的差别，用一整块玻璃包住两颗按钮是做不出来的。
     /// 14~25 上容器退化为普通 HStack，视觉仍是两颗胶囊，布局完全一致。
     private func tabBar(bottomInset: CGFloat) -> some View {
-        LiquidGlassContainer(spacing: 12) {
-            HStack(spacing: 8) {
+        LiquidGlassContainer(spacing: 6) {
+            HStack(spacing: 6) {
                 tabButton(.meetings)
                 tabButton(.contacts)
             }
@@ -927,7 +829,7 @@ struct HomeView: View {
             }
             .foregroundColor(isSelected ? .white : Theme.Palette.ink2)
             .padding(.horizontal, 20)
-            .frame(height: 48)
+            .frame(height: 46)
             .contentShape(Capsule())
         }
         .buttonStyle(PlainButtonStyle())
@@ -937,7 +839,7 @@ struct HomeView: View {
             isSelected ? .tinted(Theme.Palette.accent) : .regular,
             cornerStyle: .capsule,
             isInteractive: true,
-            castsShadow: true
+            castsShadow: false
         )
         // 同一个 namespace 下的玻璃才会互相吸附；去掉这行就退回两团独立模糊。
         .liquidGlassID(item.title, in: dockNamespace)
@@ -1260,7 +1162,7 @@ private enum HomeTab {
 ///
 /// 单独一个类型而不是 Bool，是为了后续加「预约会议」时不至于变成
 /// `isJoin / !isJoin` 的二态泥潭；case 名字直接对应网页端的两枚 tab。
-enum HomeJoinMode: Equatable {
+enum HomeJoinMode: Hashable {
     case join
     case start
 }

@@ -172,13 +172,16 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
 
     #if compiler(>=6.2)
 
-    /// 系统液态玻璃自带折射与高光，这里只补一条 1px 描边 + 投影，
-    /// 保持与降级路径的边界感受一致（否则面板在 26 上会比 25 上"飘"一点）。
+    /// 原生玻璃已经在系统层做了三件事：背景折射、边缘镜面、以及和相邻玻璃的融合。
+    ///
+    /// 这里**不再补描边**。之前那圈 1px 渐变白边是我自己画的，它和系统自带的边缘
+    /// 高光叠在一起，会在圆角处形成一道死白，整块玻璃立刻从"玻璃"变成"塑料片"。
+    /// 投影只在浮在视频上时才给，且压到很轻——苹果自己的浮层几乎不用阴影，
+    /// 靠的是玻璃边缘的明暗差，加厚投影会让它看起来像贴纸。
     @available(iOS 26.0, *)
     private func nativeGlass(_ content: Content) -> some View {
         content
             .glassEffect(nativeEffect, in: shape)
-            .overlay(shape.stroke(strokeStyle, lineWidth: 1))
             .shadow(
                 color: castsShadow ? Color.black.opacity(shadowOpacity) : Color.clear,
                 radius: castsShadow ? resolvedShadowRadius : 0,
@@ -223,7 +226,11 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
             )
     }
 
-    /// 层 1~3：模糊、底色、镜面高光。
+    /// 层 1~2：模糊 + 底色。
+    ///
+    /// 这里原本还有一层 135° 的白色镜面渐变。它在静态截图里看着"有质感"，
+    /// 一旦页面滚动、或者压在视频上，就会跟着内容一起晃，观感非常廉价——
+    /// 真正的玻璃高光只发生在边缘，不会铺满整个面。删掉后玻璃反而更像玻璃。
     private var backgroundLayers: some View {
         ZStack {
             if usesBlur {
@@ -234,20 +241,6 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
             }
 
             baseTintColor
-
-            // 镜面高光：白 0.22 → 白 0.02 → 透明，135°（左上 → 右下）。
-            // 只有上半部可见，模拟玻璃边缘对光源的一次折光。
-            LinearGradient(
-                stops: [
-                    .init(color: Color.white.opacity(specularTopOpacity), location: 0.0),
-                    .init(color: Color.white.opacity(0.02), location: 0.5),
-                    .init(color: Color.clear, location: 1.0)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            // 按下时高光整体左移，制造"玻璃被压得反光角度变了"的错觉。
-            .offset(x: isPressedOffsetX, y: isPressedOffsetY)
         }
     }
 
@@ -339,10 +332,6 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
         colorScheme == .dark ? Theme.Palette.surface : Theme.Palette.surfaceLight
     }
 
-    private var specularTopOpacity: Double {
-        colorScheme == .dark ? 0.22 : 0.45
-    }
-
     /// 层 4：描边。左上亮 → 中段暗 → 右下稍亮，这就是"上亮下暗的 1px 边"。
     /// 降低透明度时整体加亮，弥补没有模糊层后的边界模糊。
     private var strokeStyle: LinearGradient {
@@ -365,24 +354,17 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
 
     /// 层 5：投影。深色背景上黑色投影几乎看不见，浅色下要收着来，否则像脏污。
     private var shadowOpacity: Double {
-        colorScheme == .dark ? 0.35 : 0.18
+        colorScheme == .dark ? 0.22 : 0.14
     }
 
     private var resolvedShadowRadius: CGFloat {
-        compactShadow ? 6 : 18
+        compactShadow ? 5 : 10
     }
 
     private var resolvedShadowOffsetY: CGFloat {
-        compactShadow ? 3 : 8
+        compactShadow ? 2 : 4
     }
 
-    private var isPressedOffsetX: CGFloat {
-        isInteractive && isPressed ? -6 : 0
-    }
-
-    private var isPressedOffsetY: CGFloat {
-        isInteractive && isPressed ? -2 : 0
-    }
 }
 
 // MARK: - 调用入口
@@ -517,10 +499,11 @@ struct LiquidGlassContainer<Content: View>: View {
 
 // MARK: - 按钮样式
 
-/// 玻璃按钮：按下缩到 0.96 + 一道高光从左扫到右。
+/// 玻璃按钮：只保留 0.98 的按压反馈。
 ///
-/// iOS 26 上 `liquidGlass` 内部走系统 `.interactive()` 玻璃（形变由系统给），
-/// 这里的 scale/扫光仍保留，保证 14~25 和 26 的手感一致。
+/// 之前这里有一道从左扫到右的白色高光带——那是 Web 2.0 的写法，放在系统玻璃上
+/// 会盖掉玻璃本身的折射，看起来像贴了一层塑料膜。系统 `.interactive()` 已经给了
+/// 按下时的形变与亮度变化，这里再做任何叠加都是减分。
 struct LiquidGlassButtonStyle: ButtonStyle {
 
     var prominent: Bool = false
@@ -533,28 +516,8 @@ struct LiquidGlassButtonStyle: ButtonStyle {
                 isInteractive: true,
                 castsShadow: false
             )
-            .overlay(sheen(isPressed: configuration.isPressed))
-            .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1.0)
             .animationCompat(Theme.Motion.standard, value: configuration.isPressed)
-    }
-
-    /// 斜向白色高光带：未按下时停在左侧外面（不可见），按下时扫过整个按钮。
-    private func sheen(isPressed: Bool) -> some View {
-        GeometryReader { proxy in
-            LinearGradient(
-                colors: [Color.clear, Color.white.opacity(0.30), Color.clear],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-            .frame(width: max(1, proxy.size.width * 0.42))
-            .offset(x: isPressed ? proxy.size.width : -proxy.size.width * 0.42)
-            .opacity(isPressed ? 1.0 : 0.0)
-        }
-        .allowsHitTesting(false)
-        // 只让高光出现在圆角内部，否则方形光带会在四角露出来。
-        .mask(
-            RoundedRectangle(cornerRadius: Theme.Metrics.buttonRadius, style: .continuous)
-        )
     }
 }
 

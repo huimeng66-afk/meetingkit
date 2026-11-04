@@ -2,15 +2,17 @@
 //  ControlButton.swift
 //  MeetingKit
 //
-//  底栏单键：48pt 圆形容器 + 10pt 标签 + 右上角角标。
+//  会议室底栏单键：一颗纯图标玻璃圆钮 + 右上角角标。
 //
-//  三套外观集中在这里，避免底栏调用点各写一套填充/描边：
-//    · neutral   —— 白 6% 玻璃圆盘（白 6% 填充 + 玻璃描边）
-//    · off       —— 麦克风/摄像头关闭：danger 16% 填充 + danger 32% 描边 + #FCA5A5
-//    · broadcast —— 屏幕共享中：danger 实心 + 白字 + 红色光晕
+//  ── 为什么去掉 10pt 文字标签 ────────────────────────────────────────
+//  7 个键挤在 393pt 宽度里，每键只有 52pt。图标下面再塞一行 10pt 中文，
+//  既压不出留白，也让整条底栏看起来像"工具栏"而不是系统控件。
+//  iOS 26 之后苹果自己的通话界面（FaceTime / 电话）都是纯图标 + 无障碍标签，
+//  语义交给 VoiceOver，视觉交给 SF Symbols —— 这才是原生观感。
 //
-//  命中区：整颗按钮（圆盘 + 标签）都用 contentShape(Rectangle()) 包住，
-//  实际可点面积 ≥ 48×56，满足设计规范对触控目标的硬要求。
+//  外观只剩两种：常态玻璃、警示着色玻璃（麦克风关闭 / 共享中）。
+//  全部走 `liquidGlass`，在 iOS 26 上是系统 `glassEffect`，
+//  和底栏容器的其它玻璃会自然融合。
 //
 
 import SwiftUI
@@ -33,6 +35,9 @@ struct ControlButton: View {
 
     var appearance: ControlButtonAppearance = .neutral
 
+    /// 圆钮直径。底栏默认 46：7 颗 × 46 + 6 段间距刚好落在 375pt 的安全区内。
+    var size: CGFloat = 46
+
     /// 数字角标（成员人数）。传 nil 不显示。
     var badgeText: String? = nil
     /// SF Symbol 角标（举手 hand.raised.fill）。传 nil 不显示。
@@ -50,66 +55,39 @@ struct ControlButton: View {
             Haptics.impact(.light)
             action()
         } label: {
-            VStack(spacing: 2) {
-                ZStack(alignment: .topTrailing) {
-                    iconDisc
-                    badgeLayer
-                }
+            ZStack(alignment: .topTrailing) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundColor(iconColor)
+                    .frame(width: size, height: size)
+                    .liquidGlass(
+                        glassVariant,
+                        cornerStyle: .circle,
+                        isInteractive: true,
+                        castsShadow: false
+                    )
+                    .contentShape(Circle())
 
-                Text(title)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(labelColor)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
+                badgeLayer
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: 62)
-            .contentShape(Rectangle())
+            .frame(width: size, height: size)
         }
         .buttonStyle(ControlButtonPressStyle())
         .accessibilityLabel(accessibilityText ?? title)
     }
 
-    // MARK: - 圆盘
+    // MARK: - 着色
 
-    private var iconDisc: some View {
-        ZStack {
-            Circle()
-                .fill(discFill)
-                .overlay(Circle().stroke(discStroke, lineWidth: 1))
-
-            Image(systemName: systemImage)
-                .font(.system(size: 20, weight: .medium))
-                .foregroundColor(iconColor)
-        }
-        .frame(width: 48, height: 48)
-        .shadow(
-            color: appearance == .broadcast ? Theme.Palette.danger.opacity(0.55) : Color.clear,
-            radius: appearance == .broadcast ? 8 : 0,
-            x: 0,
-            y: 0
-        )
-    }
-
-    private var discFill: Color {
+    /// 只保留"常态 / 警示"两档语义，颜色差异全部交给玻璃的 tint，
+    /// 不再自己画填充 + 描边（那是塑料感的来源）。
+    private var glassVariant: LiquidGlassVariant {
         switch appearance {
         case .neutral:
-            return Color.white.opacity(0.06)
+            return .regular
         case .off:
-            return Theme.Palette.danger.opacity(0.16)
+            return .tinted(Theme.Palette.danger)
         case .broadcast:
-            return Theme.Palette.danger
-        }
-    }
-
-    private var discStroke: Color {
-        switch appearance {
-        case .neutral:
-            return Theme.Palette.glassStroke
-        case .off:
-            return Theme.Palette.danger.opacity(0.32)
-        case .broadcast:
-            return Color.white.opacity(0.18)
+            return .tinted(Theme.Palette.danger)
         }
     }
 
@@ -124,38 +102,26 @@ struct ControlButton: View {
         }
     }
 
-    private var labelColor: Color {
-        switch appearance {
-        case .neutral:
-            return Theme.Palette.textSecondary
-        case .off:
-            return Color(hex: 0xFCA5A5)
-        case .broadcast:
-            return .white
-        }
-    }
-
     // MARK: - 角标
 
     @ViewBuilder
     private var badgeLayer: some View {
         if let badgeText = badgeText {
             Text(badgeText)
-                .font(.system(size: 12, weight: .bold))
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(.white)
                 .padding(.horizontal, 5)
-                .frame(minWidth: 18, minHeight: 18)
-                .background(Capsule().fill(Color(hex: 0x4F8CFF)))
-                // 描边用页面底色：角标压在圆盘上时能"浮"起来，不糊成一团。
+                .frame(minWidth: 17, minHeight: 17)
+                .background(Capsule().fill(Theme.Palette.accent))
+                // 描边用页面底色：角标压在圆钮上时能"浮"起来，不糊成一团。
                 .overlay(Capsule().stroke(Theme.Palette.background, lineWidth: 1.5))
-                .offset(x: 4, y: -2)
+                .offset(x: 3, y: -2)
         } else if let symbol = badgeSymbol {
             Image(systemName: symbol)
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(Theme.Palette.accent)
                 .padding(3)
                 .background(Circle().fill(Theme.Palette.background.opacity(0.9)))
-                .overlay(Circle().stroke(Theme.Palette.glassStroke, lineWidth: 1))
                 .offset(x: 3, y: -2)
         } else if badgeDot {
             Circle()
@@ -184,7 +150,7 @@ struct ControlButton_Previews: PreviewProvider {
     static var previews: some View {
         ZStack {
             Theme.Palette.background
-            HStack(spacing: 0) {
+            HStack(spacing: 8) {
                 ControlButton(
                     systemImage: SymbolCompat.name("mic.slash.fill", "mic.slash"),
                     title: "取消静音",
