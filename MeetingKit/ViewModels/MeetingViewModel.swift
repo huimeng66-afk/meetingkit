@@ -24,6 +24,8 @@ final class MeetingViewModel: ObservableObject {
     // MARK: - 会议
 
     @Published private(set) var roomTitle: String = ""
+    /// 会议品牌（企业专属会议室时带企业名与号模式），入会快照下发后更新。
+    @Published private(set) var meetingBrand = MeetingBrand()
     /// 纯数字存储，展示时统一走 `formattedMeetingNumber`。
     /// 存格式化后的字符串会让"复制邀请链接 / 拨号入会"这类场景各自再去做一次清洗。
     @Published private(set) var meetingNumber: String = ""
@@ -668,6 +670,10 @@ final class MeetingViewModel: ObservableObject {
 // MARK: - RTCClientDelegate
 
 extension MeetingViewModel: RTCClientDelegate {
+
+    func rtcDidUpdateMeetingBrand(_ brand: MeetingBrand) {
+        meetingBrand = brand
+    }
 
     func rtcDidUpdateParticipants(_ participants: [MeetingUser]) {
         // 合并规则：先按 removedUserIDs 剔除已被移出的人，再对 mutedUserIDs 里的人

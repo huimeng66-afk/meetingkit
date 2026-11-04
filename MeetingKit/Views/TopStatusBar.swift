@@ -174,6 +174,22 @@ struct TopStatusBar: View {
                         .foregroundColor(Theme.Palette.warning)
                         .accessibilityLabel("会议已锁定")
                 }
+
+                // 企业专属会议室：标题后挂一个企业名小胶囊。
+                // 普通会议 meetingBrand.isEnterprise 为 false，这里完全不占位。
+                if viewModel.meetingBrand.isEnterprise,
+                   !viewModel.meetingBrand.enterpriseName.isEmpty {
+                    Text(viewModel.meetingBrand.enterpriseName)
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(Theme.Palette.accent)
+                        .lineLimit(1)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(
+                            Capsule().fill(Theme.Palette.accent.opacity(0.16))
+                        )
+                        .accessibilityLabel("企业会议室：\(viewModel.meetingBrand.enterpriseName)")
+                }
             }
             .lineLimit(1)
 
@@ -191,7 +207,9 @@ struct TopStatusBar: View {
                 HStack(spacing: 3) {
                     Image(systemName: SymbolCompat.name("number", "number.circle"))
                         .font(.system(size: 8, weight: .semibold))
-                    Text(viewModel.formattedMeetingNumber)
+                    Text(viewModel.meetingBrand.isEnterprise
+                         ? "\(viewModel.formattedMeetingNumber) · \(viewModel.meetingBrand.modeText)"
+                         : viewModel.formattedMeetingNumber)
                         .font(.system(size: 10).monospacedDigit())
                 }
                 .foregroundColor(Theme.Palette.textTertiary)

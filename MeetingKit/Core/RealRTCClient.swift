@@ -646,6 +646,17 @@ final class RealRTCClient: NSObject, RTCClient {
 
     // MARK: - 内部：快照应用
 
+    /// 把服务端下发的品牌字段翻成 UI 可直接用的模型。
+    /// 企业会议室才会带 enterpriseName，普通会议保持默认值（界面不显示标识）。
+    private func publishBrand(from meeting: [String: Any]) {
+        let brand = MeetingBrand(
+            isEnterprise: (meeting["kind"] as? String) == "enterprise",
+            enterpriseName: meeting["enterpriseName"] as? String ?? "",
+            roomMode: meeting["roomMode"] as? String ?? "fixed"
+        )
+        delegate?.rtcDidUpdateMeetingBrand(brand)
+    }
+
     private func applyJoinSnapshot(_ snapshot: JoinSnapshot) {
         selfPeerID = snapshot.selfPeerID
         selfUserID = snapshot.selfInfo["userId"] as? Int
@@ -653,6 +664,7 @@ final class RealRTCClient: NSObject, RTCClient {
         selfName = snapshot.selfInfo["name"] as? String ?? ""
         selfAvatarColor = snapshot.selfInfo["avatarColor"] as? String ?? ""
         meetingInfo = snapshot.meeting
+        publishBrand(from: snapshot.meeting)
 
         // 远端 peer：为每个建立 PeerSession。
         var newPeers: [String: RemotePeer] = [:]
@@ -726,6 +738,7 @@ final class RealRTCClient: NSObject, RTCClient {
         selfName = snapshot.selfInfo["name"] as? String ?? selfName
         selfAvatarColor = snapshot.selfInfo["avatarColor"] as? String ?? selfAvatarColor
         meetingInfo = snapshot.meeting
+        publishBrand(from: snapshot.meeting)
 
         // 全部关闭重建。
         for (peerID, peer) in remotePeers {

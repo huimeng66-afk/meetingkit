@@ -87,6 +87,19 @@ struct RTCJoinError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+// MARK: - 品牌信息
+
+/// 会议的品牌上下文。企业专属会议室会带企业名与号模式，
+/// 普通会议 isEnterprise = false，界面不显示任何企业标识。
+struct MeetingBrand: Equatable {
+    var isEnterprise: Bool = false
+    var enterpriseName: String = ""
+    /// "fixed" = 固定会议号；"random" = 每场结束自动换号。
+    var roomMode: String = "fixed"
+
+    var modeText: String { roomMode == "random" ? "随机号" : "固定号" }
+}
+
 // MARK: - 事件回调
 
 /// 全部回调保证在主线程（协议与实现方都隔离到 @MainActor）。
@@ -110,6 +123,10 @@ protocol RTCClientDelegate: AnyObject {
 
     /// 收到一条聊天消息（包括其他参会者的消息与系统消息）。
     func rtcDidReceiveMessage(_ message: ChatMessage)
+
+    /// 会议品牌变化（企业专属会议室 / 号模式）。
+    /// 默认实现为空，Mock 与旧实现不需要改动。
+    func rtcDidUpdateMeetingBrand(_ brand: MeetingBrand)
 
     /// 远端摄像头视频渲染视图可用（RTCMTLVideoView）。
     /// UI 侧拿到 UIView 后用 UIViewRepresentable 放进对应宫格。
@@ -225,4 +242,11 @@ protocol RTCClient: AnyObject {
 /// 避免在 SwiftUI 里持有 RTC 对象。
 struct RemoteMediaKey: Hashable {
     let userID: String
+}
+
+
+// 默认实现：不关心品牌信息的实现方（Mock / 测试）无需重写。
+@MainActor
+extension RTCClientDelegate {
+    func rtcDidUpdateMeetingBrand(_ brand: MeetingBrand) {}
 }
