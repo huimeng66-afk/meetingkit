@@ -226,6 +226,8 @@ struct HomeView: View {
             }
             // 30pt 是 375pt 宽度下 9 个汉字不折行的上限；SE 上再缩到 0.82，
             // 宁可整体略小，也不要出现「把会开在屏幕 / 里。」这种断句。
+            // lineLimit 写在每个 Text 上而不是 VStack 上：环境值虽然会下发，
+            // 但 VStack 自身也吃到 lineLimit 时，SwiftUI 会按单行去量它的高度。
             .font(.system(size: 30, weight: .bold))
             .tracking(-0.8)
             .lineLimit(1)
