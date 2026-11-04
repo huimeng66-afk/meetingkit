@@ -41,6 +41,14 @@ struct AuthSession: Equatable {
     var name: String
     var account: String
     var role: String
+
+    /// 本次登录所用的设备。由服务端在登录响应里回传，设置页用它展示
+    /// 「设备与登录」——名称、系统、登录时间与设备号。
+    /// 老版本会话没有这些字段，因此给默认值，保证解码路径不会崩。
+    var deviceName: String = ""
+    var devicePlatform: String = ""
+    var deviceLoginAt: String = ""
+    var deviceId: String = ""
 }
 
 /// 登录态持久化。load() 必须是同步的：登录页首帧就要判断"是否已登录"。
@@ -53,10 +61,19 @@ enum AuthStore {
     /// 回会议页还挂着头像"。谁改谁发，谁显示谁听，比让每个页面自己去轮询干净。
     static let didChangeNotification = Notification.Name("tianqiong.auth.didChange")
 
+    /// 账号在别的设备登录、本机被服务端踢下线。
+    /// 与 didChange 分开：didChange 只表示"登录态变了"，这个通知多带一条原因，
+    /// 首页收到后要弹一次明确的说明，而不是让用户莫名其妙回到入会页。
+    static let deviceKickedNotification = Notification.Name("tianqiong.auth.deviceKicked")
+
     private static let tokenKey = "tianqiong.auth.token"
     private static let nameKey = "tianqiong.auth.name"
     private static let accountKey = "tianqiong.auth.account"
     private static let roleKey = "tianqiong.auth.role"
+    private static let deviceNameKey = "tianqiong.auth.device.name"
+    private static let devicePlatformKey = "tianqiong.auth.device.platform"
+    private static let deviceLoginAtKey = "tianqiong.auth.device.loginAt"
+    private static let deviceIdKey = "tianqiong.auth.device.id"
 
     static func save(_ session: AuthSession) {
         let defaults = UserDefaults.standard
@@ -64,6 +81,10 @@ enum AuthStore {
         defaults.set(session.name, forKey: nameKey)
         defaults.set(session.account, forKey: accountKey)
         defaults.set(session.role, forKey: roleKey)
+        defaults.set(session.deviceName, forKey: deviceNameKey)
+        defaults.set(session.devicePlatform, forKey: devicePlatformKey)
+        defaults.set(session.deviceLoginAt, forKey: deviceLoginAtKey)
+        defaults.set(session.deviceId, forKey: deviceIdKey)
         NotificationCenter.default.post(name: didChangeNotification, object: nil)
     }
 
@@ -74,7 +95,11 @@ enum AuthStore {
             token: token,
             name: defaults.string(forKey: nameKey) ?? "",
             account: defaults.string(forKey: accountKey) ?? "",
-            role: defaults.string(forKey: roleKey) ?? "user"
+            role: defaults.string(forKey: roleKey) ?? "user",
+            deviceName: defaults.string(forKey: deviceNameKey) ?? "",
+            devicePlatform: defaults.string(forKey: devicePlatformKey) ?? "",
+            deviceLoginAt: defaults.string(forKey: deviceLoginAtKey) ?? "",
+            deviceId: defaults.string(forKey: deviceIdKey) ?? ""
         )
     }
 
@@ -84,7 +109,31 @@ enum AuthStore {
         defaults.removeObject(forKey: nameKey)
         defaults.removeObject(forKey: accountKey)
         defaults.removeObject(forKey: roleKey)
+        defaults.removeObject(forKey: deviceNameKey)
+        defaults.removeObject(forKey: devicePlatformKey)
+        defaults.removeObject(forKey: deviceLoginAtKey)
+        defaults.removeObject(forKey: deviceIdKey)
         NotificationCenter.default.post(name: didChangeNotification, object: nil)
+    }
+
+    /// 处理服务端的 DEVICE_KICKED。
+    ///
+    /// 关键点在 `token` 比较：首页可能同时有几个请求在飞，用户被踢后立刻重新登录，
+    /// 旧请求的 401 会晚到。如果不加判断，它会把刚建立的新会话也清掉，
+    /// 表现就是"重新登录后又被踢一次"。
+    static func handleDeviceKicked(message: String, token: String?) {
+        guard let current = load() else { return }
+        if let token = token, !token.isEmpty, token != current.token {
+            return
+        }
+
+        let text = message.isEmpty ? "账号已在其他设备登录，本机已退出" : message
+        clear()
+        NotificationCenter.default.post(
+            name: deviceKickedNotification,
+            object: nil,
+            userInfo: ["message": text]
+        )
     }
 }
 
@@ -113,7 +162,15 @@ enum APIClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.httpBody = try? JSONSerialization.data(
-            withJSONObject: ["account": account, "password": password]
+            withJSONObject: [
+                "account": account,
+                "password": password,
+                // 单设备登录：服务端用这两个字段认设备。
+                // 新设备登录会把旧设备的令牌顶掉，旧设备下一次请求收到 DEVICE_KICKED。
+                "deviceId": DeviceIdentity.id,
+                "deviceName": DeviceIdentity.name,
+                "platform": DeviceIdentity.platform,
+            ]
         )
 
         URLSession.shared.dataTask(with: request) { data, response, error in
@@ -146,7 +203,14 @@ enum APIClient {
                     token: token,
                     name: name,
                     account: (user["account"] as? String) ?? account,
-                    role: (user["role"] as? String) ?? "user"
+                    role: (user["role"] as? String) ?? "user",
+                    deviceName: (json["device"] as? [String: Any])?["name"] as? String
+                        ?? DeviceIdentity.name,
+                    devicePlatform: (json["device"] as? [String: Any])?["platform"] as? String
+                        ?? DeviceIdentity.platform,
+                    deviceLoginAt: (json["device"] as? [String: Any])?["loginAt"] as? String ?? "",
+                    deviceId: (json["device"] as? [String: Any])?["id"] as? String
+                        ?? DeviceIdentity.id
                 )
                 completion(.success(session))
             }
@@ -308,10 +372,35 @@ enum APIClient {
                     token: freshToken,
                     name: (user["name"] as? String) ?? "",
                     account: (user["account"] as? String) ?? "",
-                    role: (user["role"] as? String) ?? "user"
+                    role: (user["role"] as? String) ?? "user",
+                    deviceName: (json["device"] as? [String: Any])?["name"] as? String
+                        ?? AuthStore.load()?.deviceName ?? DeviceIdentity.name,
+                    devicePlatform: (json["device"] as? [String: Any])?["platform"] as? String
+                        ?? DeviceIdentity.platform,
+                    deviceLoginAt: (json["device"] as? [String: Any])?["loginAt"] as? String
+                        ?? AuthStore.load()?.deviceLoginAt ?? "",
+                    deviceId: (json["device"] as? [String: Any])?["id"] as? String
+                        ?? DeviceIdentity.id
                 )
                 AuthStore.save(session)
                 completion(.success(session))
+            }
+        }
+    }
+
+    /// 静默校验当前令牌还能不能用。
+    ///
+    /// 单设备登录上线后，本地存在 token 不等于还在线：账号可能在别处登录过。
+    /// 首页每次出现时探一次 `/auth/me`，被踢就由 request 统一清会话并广播，
+    /// 用户会直接回到入会页，而不是点「发起会议」才发现所有接口都 401。
+    static func validateSession(token: String, completion: ((Bool) -> Void)? = nil) {
+        let url = TianqiongAPI.baseURL.appendingPathComponent("auth/me")
+        request(url: url, method: "GET", token: token) { result in
+            switch result {
+            case .success:
+                completion?(true)
+            case .failure:
+                completion?(false)
             }
         }
     }
@@ -355,7 +444,14 @@ enum APIClient {
                     completion(.failure(APIError(message: "服务响应异常，请稍后再试")))
                     return
                 }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if let message = json["error"] as? String {
+                    // 单设备登录：服务端把旧设备的请求判为 DEVICE_KICKED。
+                    // 这里必须顺手清掉本地会话，否则界面还挂着头像，
+                    // 但每个接口都在 401——用户只会觉得"软件坏了"。
+                    if statusCode == 401, (json["code"] as? String) == "DEVICE_KICKED" {
+                        AuthStore.handleDeviceKicked(message: message, token: token)
+                    }
                     completion(.failure(APIError(message: message)))
                     return
                 }

@@ -63,6 +63,7 @@ struct SettingsView: View {
 
                     if session != nil {
                         securitySection
+                        deviceSection
                     }
 
                     meetingSection
@@ -358,6 +359,109 @@ struct SettingsView: View {
                 valueRow(title: "登录账号", value: maskedAccount(session.account))
             }
         }
+    }
+
+    // MARK: - 设备与登录
+
+    /// 单设备登录的可见证据。
+    ///
+    /// 只写一句"一个账号限一台设备"用户是感受不到的：
+    /// 他需要看到这台设备叫什么、什么时候登的、编号是多少。
+    /// 换设备被踢之后，回到这里就能确认是不是自己。
+    private var deviceSection: some View {
+        section("设备与登录") {
+            currentDeviceRow
+
+            divider(leading: 56)
+
+            valueRow(title: "系统版本", value: DeviceIdentity.systemVersion)
+
+            divider(leading: 56)
+
+            valueRow(title: "登录时间", value: loginTimeText)
+
+            divider(leading: 56)
+
+            valueRow(title: "设备编号", value: deviceNumberText)
+
+            divider(leading: 56)
+
+            singleDeviceNote
+        }
+    }
+
+    private var currentDeviceRow: some View {
+        HStack(spacing: 10) {
+            iconBlock(SymbolCompat.name("iphone", "iphone.gen3"))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("当前设备")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(Theme.Palette.ink)
+
+                Text(DeviceIdentity.name)
+                    .font(.system(size: 11))
+                    .foregroundColor(Theme.Palette.ink3)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            Text("唯一在线")
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundColor(Theme.Palette.accent)
+                .padding(.horizontal, 9)
+                .frame(height: 24)
+                .background(Capsule().fill(Theme.Palette.accent.opacity(0.12)))
+        }
+        .padding(.horizontal, 16)
+        .frame(minHeight: 58)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("当前设备 \(DeviceIdentity.name)，唯一在线")
+    }
+
+    private var singleDeviceNote: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: SymbolCompat.name("checkmark.shield", "lock.shield"))
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(Theme.Palette.accent)
+                .padding(.top, 1)
+
+            Text("一个账号同时只允许一台设备在线。在其它设备登录后，本机会立即退出，需要重新登录。")
+                .font(.system(size: 11.5))
+                .foregroundColor(Theme.Palette.ink3)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    /// 登录时间来自服务端 ISO 时间戳。解析失败就原样显示，
+    /// 不为了一个格式化吞掉服务端已经给出的信息。
+    private var loginTimeText: String {
+        guard let raw = session?.deviceLoginAt, !raw.isEmpty else { return "本次登录" }
+
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        var date = withFraction.date(from: raw)
+        if date == nil {
+            date = ISO8601DateFormatter().date(from: raw)
+        }
+        guard let parsed = date else { return raw }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "MM月dd日 HH:mm"
+        return formatter.string(from: parsed)
+    }
+
+    private var deviceNumberText: String {
+        let raw = session?.deviceId ?? ""
+        let identifier = raw.isEmpty ? DeviceIdentity.shortId : String(raw.suffix(8)).uppercased()
+        return identifier
     }
 
     // MARK: - 会议

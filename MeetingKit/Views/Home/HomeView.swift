@@ -53,6 +53,9 @@ struct HomeView: View {
     @State private var toast: ToastMessage?
     @State private var toastWork: DispatchWorkItem?
 
+    /// 被服务端踢下线时的原因。非 nil 就弹一次系统 alert。
+    @State private var kickedMessage: String?
+
     /// GeometryReader 不会为键盘自动上移，资料卡的昵称输入需要自己抬起来。
     @State private var keyboardHeight: CGFloat = 0
 
@@ -81,26 +84,40 @@ struct HomeView: View {
             ZStack(alignment: .bottom) {
                 BrandBackground()
 
-                tabContent(insets: insets)
+                if session == nil {
+                    // 未登录 = 只给一个入会页。
+                    //
+                    // 上一版把四个 tab、通讯录、企业空间、设置全摆在一个访客面前，
+                    // 点进去不是要登录就是空列表——用户第一眼看到的是一堆"点了没反应"。
+                    // 现在未登录只保留真正能用的那一件事：输入会议号进会。
+                    // 发起会议、历史记录、通讯录都随登录一起出现。
+                    guestLanding(insets: insets)
+                        .transition(.opacity)
+                } else {
+                    tabContent(insets: insets)
 
-                HomeTabBar(
-                    selection: $tab,
-                    bottomInset: insets.bottom,
-                    onReselect: { _ in
-                        scrollTopToken += 1
-                    },
-                    onStartMeeting: {
-                        startMeetingFromHome()
+                    HomeTabBar(
+                        selection: $tab,
+                        bottomInset: insets.bottom,
+                        onReselect: { _ in
+                            scrollTopToken += 1
+                        },
+                        onStartMeeting: {
+                            startMeetingFromHome()
+                        }
+                    )
+
+                    if isEditingProfile {
+                        profileEditor(bottomInset: insets.bottom)
                     }
-                )
 
-                toastLayer(bottomInset: insets.bottom)
-
-                if isEditingProfile {
-                    profileEditor(bottomInset: insets.bottom)
+                    sidebarLayer(insets: insets, width: drawerWidth)
                 }
 
-                sidebarLayer(insets: insets, width: drawerWidth)
+                toastLayer(
+                    bottomInset: insets.bottom,
+                    extraBottom: session == nil ? 24 : 140
+                )
 
                 // 登录页用窗口内浮层，不用 `.sheet`。
                 //
@@ -114,7 +131,12 @@ struct HomeView: View {
             }
             // 从左边缘向右滑打开抽屉。用 simultaneousGesture 而不是 gesture：
             // 抽屉内容本身是 ScrollView，独占手势会让竖直滚动被外层吞掉。
-            .simultaneousGesture(edgeOpenGesture())
+            // 未登录页没有抽屉，禁用这个手势，避免横滑时误触。
+            .simultaneousGesture(
+                edgeOpenGesture(),
+                including: session == nil ? .none : .all
+            )
+            .animationCompat(Theme.Motion.standard, value: session?.token)
         }
         // 整个首页屏蔽键盘安全区：否则底栏会被顶到键盘上方，
         // 而资料卡又会被再抬一次。键盘只影响资料卡的显式 offset。
@@ -135,11 +157,55 @@ struct HomeView: View {
         .onAppear {
             // 从会议室返回、或刚从登录页回来时，账号可能变了。
             session = AuthStore.load()
+
+            // 顺带确认这枚令牌还有效。账号在别的设备登录过的话，
+            // 服务端会在这里返回 DEVICE_KICKED，页面随即退回访客入会页。
+            if let token = session?.token {
+                APIClient.validateSession(token: token)
+            }
         }
         // 登录 / 退出可能发生在设置页或登录浮层里，首页是常驻视图，
         // 必须靠通知才能在同一帧把右上角切过来。
         .onReceive(NotificationCenter.default.publisher(for: AuthStore.didChangeNotification)) { _ in
-            session = AuthStore.load()
+            let latest = AuthStore.load()
+            session = latest
+
+            if latest == nil {
+                // 退出或被踢：把只属于登录态的浮层全部收掉。
+                // 否则回到访客页时侧边栏还开着，后面是一张空背景。
+                isSidebarOpen = false
+                isEditingProfile = false
+                tab = .meetings
+            }
+        }
+        // 账号在别的设备登录：服务端已拒绝本机令牌，这里给出一次明确说明。
+        // 不做静默退出——用户需要知道"不是软件坏了，是账号在别处登了"。
+        .onReceive(NotificationCenter.default.publisher(for: AuthStore.deviceKickedNotification)) { note in
+            kickedMessage = (note.userInfo?["message"] as? String)
+                ?? "账号已在其他设备登录，本机已退出"
+        }
+        .alert(
+            "登录状态已失效",
+            isPresented: Binding(
+                get: { kickedMessage != nil },
+                set: { presented in
+                    if !presented { kickedMessage = nil }
+                }
+            )
+        ) {
+            Button("重新登录") {
+                kickedMessage = nil
+                // 等 alert 的消失动画走完再弹登录浮层，
+                // 两个 presentation 抢同一帧会有一个被系统丢掉。
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    presentLogin()
+                }
+            }
+            Button("稍后", role: .cancel) {
+                kickedMessage = nil
+            }
+        } message: {
+            Text(kickedMessage ?? "")
         }
         // 设置页改了默认音视频后同步到入会卡：两处都叫"麦克风"，
         // 如果设置里关了、首页还亮着，用户没有理由相信任何一处。
@@ -152,6 +218,158 @@ struct HomeView: View {
         .onDisappear {
             toastWork?.cancel()
         }
+    }
+
+    // MARK: - 未登录首页
+
+    /// 未登录时唯一的页面：输入会议号就能入会。
+    ///
+    /// 这不是"阉割版首页"，而是刻意的单一任务页：
+    /// 访客能做的事只有一件，就不该给他四个 tab、一个发起会议按钮和一张空通讯录。
+    /// 登录后整页会被完整首页替换（见 body 的 session 分支），不存在两套导航并存。
+    private func guestLanding(insets: EdgeInsets) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 0) {
+                guestTopBar
+                    .padding(.top, 8)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("输入会议号，")
+                        .foregroundColor(Theme.Palette.ink)
+
+                    Text("直接进会。")
+                        .foregroundColor(Theme.Palette.accent)
+                }
+                .font(.system(size: 30, weight: .semibold))
+                .kerning(-0.5)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .padding(.top, 44)
+
+                Text("无需注册。登录后可发起会议、查看会议记录。")
+                    .font(.system(size: 13))
+                    .foregroundColor(Theme.Palette.ink2)
+                    .padding(.top, 10)
+
+                guestJoinCard
+                    .padding(.top, 26)
+
+                guestLoginHint
+                    .padding(.top, 16)
+            }
+            .padding(.horizontal, pagePadding)
+            .padding(.top, insets.top + 8)
+            // 未登录页没有底栏，底部只留安全区 + 呼吸位；
+            // 键盘弹起时额外补高度，保证「加入会议」能被滚到键盘上方。
+            .padding(.bottom, insets.bottom + 40 + keyboardHeight)
+        }
+        .ignoresSafeArea()
+    }
+
+    private var guestTopBar: some View {
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Theme.Palette.brandGradient)
+                .frame(width: 28, height: 28)
+                .overlay(
+                    Image(systemName: SymbolCompat.name("video.fill", "video"))
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.white)
+                )
+
+            Text("天穹会议")
+                .font(.system(size: 16, weight: .semibold))
+                .kerning(-0.2)
+                .foregroundColor(Theme.Palette.ink)
+                .lineLimit(1)
+
+            Spacer(minLength: 8)
+
+            Button {
+                presentLogin()
+            } label: {
+                Text("登录")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 18)
+                    .frame(height: 34)
+                    .background(Capsule().fill(Theme.Palette.accent))
+                    .frame(height: 44)
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(BrandPressStyle())
+            .accessibilityLabel("登录账号")
+        }
+        .frame(height: 44)
+    }
+
+    private var guestJoinCard: some View {
+        VStack(spacing: 16) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("加入会议")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundColor(Theme.Palette.ink)
+
+                Text("输入主持人给你的会议号")
+                    .font(.system(size: 11.5))
+                    .foregroundColor(Theme.Palette.ink3)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            fieldGroup
+            deviceRow
+            joinButton
+            privacyNote
+        }
+        .padding(16)
+        .liquidGlass(.regular, cornerStyle: .continuous(24), castsShadow: false)
+    }
+
+    private var guestLoginHint: some View {
+        Button {
+            presentLogin()
+        } label: {
+            HStack(spacing: 11) {
+                ZStack {
+                    Circle().fill(Theme.Palette.accent.opacity(0.12))
+
+                    Image(systemName: SymbolCompat.name("person.badge.key", "person.crop.circle"))
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundColor(Theme.Palette.accent)
+                }
+                .frame(width: 34, height: 34)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("登录后可发起会议")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(Theme.Palette.ink)
+
+                    Text("会议记录、通讯录与企业会议室会跟着账号走")
+                        .font(.system(size: 11))
+                        .foregroundColor(Theme.Palette.ink3)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 6)
+
+                Image(systemName: SymbolCompat.name("chevron.right"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Theme.Palette.ink3)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 64)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color.white.opacity(0.04))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(PlainButtonStyle())
+        .accessibilityLabel("登录，登录后可发起会议")
     }
 
     // MARK: - 页面容器
@@ -388,9 +606,12 @@ struct HomeView: View {
         // 登录成功后 LoginView 会把昵称回填 guestName，这里同步账号态，
         // 让右上角从「登录」切换成头像胶囊；未登录直接关掉时不会走到下面。
         session = AuthStore.load()
-        if session != nil, !guestName.isEmpty {
+        if let latest = session {
+            // 首页填了名称就用首页的（他正在用这个名字入会），
+            // 没填就退回账号昵称——否则设置页会一直显示"访客"。
+            let typed = guestName.trimmingCharacters(in: .whitespacesAndNewlines)
             router.updateProfile(
-                displayName: guestName,
+                displayName: typed.isEmpty ? latest.name : typed,
                 avatarColorIndex: router.profile.avatarColorIndex
             )
         }
@@ -1265,7 +1486,7 @@ struct HomeView: View {
 
     // MARK: - Toast
 
-    private func toastLayer(bottomInset: CGFloat) -> some View {
+    private func toastLayer(bottomInset: CGFloat, extraBottom: CGFloat = 140) -> some View {
         VStack {
             Spacer(minLength: 0)
 
@@ -1274,7 +1495,7 @@ struct HomeView: View {
                     // id 变化时重建，让连续两条提示都能重播进入动画。
                     .id(message.id)
                     .padding(.horizontal, pagePadding)
-                    .padding(.bottom, 140 + bottomInset)
+                    .padding(.bottom, extraBottom + bottomInset)
                     .transition(.opacity)
                     .allowsHitTesting(false)
             }

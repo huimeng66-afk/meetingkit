@@ -61,6 +61,7 @@ struct LoginView: View {
                     form
                     loginButton
                     registerHint
+                    devicePolicyNote
                     guestNote
                 }
                 .padding(.horizontal, 20)
@@ -335,6 +336,24 @@ struct LoginView: View {
         }
         .buttonStyle(PlainButtonStyle())
         .accessibilityLabel("还没有账号，去网页端注册")
+    }
+
+    private var devicePolicyNote: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: SymbolCompat.name("iphone", "iphone.gen3"))
+                .font(.system(size: 11))
+                .foregroundColor(Theme.Palette.ink3)
+                .padding(.top, 1)
+
+            Text("同一账号仅限一台设备登录，在其它设备登录后本机会自动退出。")
+                .font(.system(size: 11.5))
+                .foregroundColor(Theme.Palette.ink3)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var guestNote: some View {
