@@ -26,8 +26,7 @@ struct ScreenShareStage: View {
 
     @ObservedObject var viewModel: MeetingViewModel
 
-    /// 根视图安全区。顶栏/底栏隐藏时信息条要贴着安全区，展开时要让开它们。
-    var topInset: CGFloat = 0
+    /// 根视图安全区底部。工具条要贴在 home indicator 上方。
     var bottomInset: CGFloat = 0
 
     /// 适应 / 填充。默认适应：共享 PPT 时"少裁一点"永远比"多裁一点"安全。
@@ -249,73 +248,25 @@ struct ScreenShareStage: View {
 
     // MARK: - 浮层
 
+    /// 共享舞台只保留一条底部工具条。
+    ///
+    /// 顶栏已经有一条红色共享条（含共享者、时长、停止入口），舞台里再放一个
+    /// "某某正在共享"的玻璃胶囊就是同一句话写两遍。控件隐藏时顶栏和工具条
+    /// 一起淡出，才是真正的沉浸观看——这也是"共享优先"的应有之义。
     @ViewBuilder
     private var overlayChrome: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                shareInfoPill
+        if !isSelfSharing {
+            VStack(spacing: 0) {
                 Spacer(minLength: 0)
-            }
-            .padding(.leading, 12)
-            .padding(.trailing, 12)
-            .padding(.top, topInset + (viewModel.isChromeVisible ? 60 : 10))
 
-            Spacer(minLength: 0)
-
-            if !isSelfSharing {
                 shareToolbar
+                    // 顶栏可见时让开底栏（64 + 安全区 + 呼吸位），隐藏时贴近底部。
                     .padding(.bottom, bottomInset + (viewModel.isChromeVisible ? 82 : 14))
             }
+            .opacity(viewModel.isChromeVisible ? 1 : 0)
+            .allowsHitTesting(viewModel.isChromeVisible)
+            .animationCompat(Theme.Motion.standard, value: viewModel.isChromeVisible)
         }
-        .opacity(viewModel.isChromeVisible ? 1 : 0)
-        .allowsHitTesting(viewModel.isChromeVisible)
-        .animationCompat(Theme.Motion.standard, value: viewModel.isChromeVisible)
-    }
-
-    /// 共享条：谁在共享 + 多久。远端共享时它是唯一的"来源"信息。
-    private var shareInfoPill: some View {
-        HStack(spacing: 7) {
-            Circle()
-                .fill(Theme.Palette.success)
-                .frame(width: 6, height: 6)
-                .opacity(0.9)
-
-            Text(viewModel.shareBannerText)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(Theme.Palette.textPrimary)
-                .lineLimit(1)
-
-            Text(viewModel.shareBannerDurationText)
-                .font(.system(size: 11, weight: .semibold).monospacedDigit())
-                .foregroundColor(Theme.Palette.textSecondary)
-
-            if isSelfSharing {
-                Rectangle()
-                    .fill(Color.white.opacity(0.18))
-                    .frame(width: 1, height: 12)
-
-                Button {
-                    Haptics.impact(.light)
-                    viewModel.stopScreenShare()
-                } label: {
-                    Text("停止")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(Theme.Palette.danger)
-                        .padding(.horizontal, 2)
-                        .frame(height: 26)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(PlainButtonStyle())
-                .accessibilityLabel("停止共享屏幕")
-            }
-        }
-        .padding(.horizontal, 12)
-        .frame(height: 32)
-        .liquidGlass(.clear, cornerStyle: .capsule, castsShadow: false)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            "\(viewModel.shareBannerText)，已共享 \(viewModel.shareBannerDurationText)"
-        )
     }
 
     /// 观看者工具条。共享者本人没有这条：他没有画面可缩放。
