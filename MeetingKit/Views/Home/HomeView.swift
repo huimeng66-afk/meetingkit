@@ -505,7 +505,7 @@ struct HomeView: View {
             .lineLimit(1)
             .minimumScaleFactor(0.8)
 
-            Text("不用装客户端。输入会议号就能进。")
+            Text("输入会议号即可入会，支持屏幕共享与实时字幕。")
                 .font(.system(size: 13))
                 .foregroundColor(Theme.Palette.ink2)
         }

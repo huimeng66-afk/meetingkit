@@ -78,6 +78,9 @@ struct VideoCanvasView: View {
             // 之前把共享画面塞进 contentTop/contentBottom 之间，等于让 PPT 给顶栏
             // 和底栏让位——共享时最该被让位的恰恰是控件。
             ScreenShareStage(viewModel: viewModel, bottomInset: bottomInset)
+                // 共享是大面积画面切换，硬切会像"闪屏"；0.34s 的淡入足以掩盖
+                // 从宫格到共享画面的跳变，又不会让用户觉得响应慢。
+                .transition(.opacity)
         } else if viewModel.participants.isEmpty {
             // 连接中（.connecting / .reconnecting）且还没拿到参会者：统一走连接占位。
             // 不能交给下面的布局分发：宫格模式对空数组只会画出一片纯黑，像卡死。

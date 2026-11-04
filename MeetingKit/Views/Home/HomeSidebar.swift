@@ -68,7 +68,7 @@ struct HomeSidebar: View {
                         title: "帮助与反馈"
                     ) {
                         Haptics.impact(.light)
-                        onToast("遇到问题可在网页端「帮助」里提交", .info)
+                        onToast("如需帮助，请联系会议主持人或企业管理员", .info)
                     }
 
                     plainRow(
@@ -338,7 +338,7 @@ struct HomeSidebar: View {
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundColor(Theme.Palette.ink)
 
-                        Text("同步会议记录与企业空间")
+                        Text("发起会议、进入企业空间")
                             .font(.system(size: 11))
                             .foregroundColor(Theme.Palette.ink3)
                             .lineLimit(1)
