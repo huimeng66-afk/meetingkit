@@ -1,0 +1,29 @@
+# ---- Xcode ----
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+*.xccheckout
+*.xcscmblueprint
+
+# ---- 工程文件 ----
+# 本项目的工程结构由 project.yml 描述（XcodeGen），project.pbxproj 属于生成物，
+# 不纳入版本控制，避免多人改工程设置时产生无法 review 的二进制式冲突。
+# 重新生成：在仓库根目录执行 `xcodegen generate`。
+*.xcodeproj/
+*.xcworkspace/
+
+# ---- Swift Package Manager ----
+.build/
+.swiftpm/
+
+# ---- macOS ----
+.DS_Store
+
+# ---- 其他 ----
+*.log

@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>天穹会议</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<!-- 邀请链接 / 二维码的落地 scheme：tianqiong://join/<7 位会议号>。 -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.example.MeetingKit</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>tianqiong</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<!-- 生产服务端根地址（「会议.shop」的 punycode 形式）。
+	     放在 Info.plist 而不是硬编码，便于测试环境用 xcconfig 覆盖同一份源码。 -->
+	<key>TQServerOrigin</key>
+	<string>https://xn--6oqu09l.shop</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>开启摄像头后，参会人可以看见你的画面</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>开会时需要麦克风采集你的声音</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>用于发现并连接同一网络下的会议服务</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>选择相册中的图片并在会议中共享</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<!-- 只保留 audio：Xcode 的 "Audio, AirPlay, and Picture in Picture" 能力写的就是 audio，
+		     它同时覆盖 AirPlay 与画中画；picture-in-picture 不是合法的 UIBackgroundModes 取值。
+		     本项目没有任何 PushKit / CallKit 实现，声明 voip 会在提审时被问询，
+		     因此等真正接入 VoIP 推送后再启用 voip。 -->
+		<string>audio</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+</dict>
+</plist>
