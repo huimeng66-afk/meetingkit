@@ -116,8 +116,11 @@ struct VideoCanvasView: View {
 
     @ViewBuilder
     private var shareContent: some View {
-        // 真实链路优先：远端共享画面（RTCMTLVideoView）。
-        if let peerID = viewModel.remoteScreenPeerID,
+        if viewModel.isScreenSharing, viewModel.remoteScreenPeerID == nil {
+            // 自己共享时不再回显自己的画面：一块屏幕上看自己正在共享的屏幕没有意义，
+            // 还会让人误以为画面卡住。这里只给状态与"停止共享"入口（与网页端一致）。
+            selfShareCard
+        } else if let peerID = viewModel.remoteScreenPeerID,
            let screenView = viewModel.remoteScreenViews[peerID] {
             RemoteVideoViewRepresentable(view: screenView)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -144,6 +147,49 @@ struct VideoCanvasView: View {
             .padding(.top, contentTop)
             .padding(.bottom, contentBottom)
         }
+    }
+
+    /// 本机共享时的状态卡。停止动作走 ViewModel → ScreenShareBridge，
+    /// 真正的"停止"由扩展进程确认后再回写 isScreenSharing。
+    private var selfShareCard: some View {
+        VStack(spacing: 16) {
+            ZStack {
+                Circle()
+                    .fill(Theme.Palette.accent.opacity(0.14))
+                    .frame(width: 68, height: 68)
+
+                Image(systemName: SymbolCompat.name("rectangle.on.rectangle", "rectangle.on.rectangle"))
+                    .font(.system(size: 25, weight: .medium))
+                    .foregroundColor(Theme.Palette.accent)
+            }
+
+            VStack(spacing: 6) {
+                Text("正在共享屏幕中")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(Theme.Palette.textPrimary)
+
+                Text("参会成员可以看到你的屏幕")
+                    .font(Theme.Typography.bodySmall)
+                    .foregroundColor(Theme.Palette.textSecondary)
+            }
+
+            Button {
+                Haptics.impact(.light)
+                viewModel.stopScreenShare()
+            } label: {
+                Text("停止共享")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 24)
+                    .frame(height: 40)
+                    .background(Capsule().fill(Theme.Palette.danger))
+            }
+            .buttonStyle(PlainButtonStyle())
+            .accessibilityLabel("停止共享屏幕")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.top, contentTop)
+        .padding(.bottom, contentBottom)
     }
 
     private var sharingBadge: some View {
