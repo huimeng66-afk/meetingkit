@@ -5,10 +5,13 @@ packages:
   SocketIO:
     url: https://github.com/socketio/socket.io-client-swift
     from: 16.1.1
-  # WebRTC 官方框架的 SPM 二进制镜像（GoogleWebRTC 的 community 分发）
+  # WebRTC 官方框架的 SPM 二进制镜像（GoogleWebRTC 的 community 分发）。
+  # 注意：这里必须用 stasel 仓库自己的版本号（141.0.0 这类），
+  # 不能写 Google 上游的 124.6367.3 —— 本仓库没有那个 tag，SPM 会直接解析失败。
+  # 用 exactVersion 锁定，避免 from: 把 141 解析到 156 后引入 API 变更。
   WebRTC:
     url: https://github.com/stasel/WebRTC
-    from: 124.6367.3
+    exactVersion: 141.0.0
 
 options:
   bundleIdPrefix: com.example
