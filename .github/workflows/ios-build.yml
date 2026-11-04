@@ -45,26 +45,49 @@ permissions:
 jobs:
   build:
     name: Build MeetingKit (unsigned)
-    # macos-26 runner 默认就是 Xcode 26（Swift 6.2 + iOS 26 SDK）。
+    # 为什么不再用 macos-26：该标签的 arm64 机器长期排队，
+    # 上一次 run（41912347929）在队列里等了 15 分钟后直接以
+    # "The job was not acquired by Runner of type hosted" 失败，代码一行没编。
     #
-    # 为什么必须换掉 macos-15：LiquidGlass.swift 里的原生玻璃整段包在
-    # `#if compiler(>=6.2)` 里。macos-15 的 Xcode 16 是 Swift 6.0/6.1，
-    # 编译器版本号不到 6.2 —— 预处理器会把整段跳过，构建不报错，
-    # 但产物里根本没有 `glassEffect`，只剩自绘玻璃。
-    # 这就是「明明写了原生液态玻璃、装上却还是塑料片」的根因。
-    #
-    # 同时 Xcode 26 的部署下限是 iOS 15，project.yml 已同步从 14 抬到 15。
-    runs-on: macos-26
-    timeout-minutes: 30
+    # macos-15 镜像同样预装了 Xcode 26（26.0.1 / 26.1.1 / 26.2 / 26.3），
+    # 只是默认指向 Xcode 16.4，需要显式 xcode-select 切过去。
+    # LiquidGlass.swift 的原生玻璃整段包在 `#if compiler(>=6.2)` 里：
+    # Swift 6.0/6.1 会把整段跳过，构建仍然成功、产物却没有 glassEffect。
+    # 所以下面除了切换，还会硬性校验 Swift 版本——宁可构建失败，
+    # 也不要再产出一个"看起来绿了、装上却是塑料片"的包。
+    runs-on: macos-15
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Select Xcode 26
+        run: |
+          set -euo pipefail
+          # 取版本号最大的 Xcode 26（sort -V 会把 26.9 排在 26.10 前面，
+          # 这里用 sort -V 已经足够：同一大版本内官方只会存在个位数小版本）。
+          CANDIDATE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$CANDIDATE" ]; then
+            echo "::error::该 runner 没有安装 Xcode 26，无法编译原生 Liquid Glass"
+            exit 1
+          fi
+          sudo xcode-select -s "$CANDIDATE"
+          echo "Selected: $CANDIDATE"
+
       - name: Show Xcode version
         run: |
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
+          xcrun swift --version
+
+      - name: Require Swift 6.2+
+        run: |
+          set -euo pipefail
+          SWIFT_VERSION="$(xcrun swift --version | head -1 | sed -E 's/.*version ([0-9]+\.[0-9]+).*/\1/')"
+          echo "Swift $SWIFT_VERSION"
+          awk -v v="$SWIFT_VERSION" 'BEGIN { exit (v >= 6.2 ? 0 : 1) }' \
+            || { echo "::error::需要 Swift 6.2+（当前 $SWIFT_VERSION），否则 glassEffect 会被整段跳过"; exit 1; }
 
       - name: Install XcodeGen
         run: |
