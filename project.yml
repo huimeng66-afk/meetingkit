@@ -8,10 +8,13 @@ packages:
   # WebRTC 官方框架的 SPM 二进制镜像（GoogleWebRTC 的 community 分发）。
   # 注意：这里必须用 stasel 仓库自己的版本号（141.0.0 这类），
   # 不能写 Google 上游的 124.6367.3 —— 本仓库没有那个 tag，SPM 会直接解析失败。
-  # 用 exactVersion 锁定，避免 from: 把 141 解析到 156 后引入 API 变更。
+  # 用 exactVersion 锁定。注意不要用 141.x：M141 的 framework 头文件里写着
+  # `#import "sdk/objc/base/RTCMacros.h"`，但发布包里头文件是扁平存放的，
+  # 编译必然报 file not found（上游 issue 450130875，M143 才修）。
+  # M140 是最后一个头文件路径正常的版本。
   WebRTC:
     url: https://github.com/stasel/WebRTC
-    exactVersion: 141.0.0
+    exactVersion: 140.0.0
 
 options:
   bundleIdPrefix: com.example
