@@ -164,7 +164,10 @@ final class PeerSession: NSObject {
             }
         }
         // 共享文档时宁可掉帧也不降分辨率，否则 1080p 会被降成 720p 再放大，文字糊成一片。
-        params.degradationPreference = keepResolution ? .maintainResolution : .balanced
+        // 注意：RTCRtpParameters.degradationPreference 是 NSNumber（包 RTCDegradationPreference），
+        // 不是枚举本身，直接赋 .maintainResolution 编译不过。
+        let preference: RTCDegradationPreference = keepResolution ? .maintainResolution : .balanced
+        params.degradationPreference = NSNumber(value: preference.rawValue)
         sender.parameters = params
     }
 
