@@ -121,8 +121,6 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
 
-    /// 按压态。只由 `isInteractive` 的手势驱动，不读 ButtonStyle 的 isPressed。
-    @State private var isPressed: Bool = false
     /// 仅用于让总开关变化时触发一次重绘，值本身没有语义。
     @State private var settingsRevision: Int = 0
 
@@ -255,33 +253,17 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
 
     // MARK: 按压反馈
 
-    @ViewBuilder
+    /// 按压反馈**不再**由这里接管。
+    ///
+    /// 上一版给 `isInteractive` 的玻璃挂了一个 `DragGesture(minimumDistance: 0)`
+    /// 当按压探针。它虽然用了 `simultaneousGesture`，但零距离拖拽会在触摸按下的
+    /// 第一帧就进入识别，和 Button 自己的点击识别抢手势；表现就是部分按钮
+    /// "按下去有缩放、松手却没动作"，用户看到的就是"点了没反应"。
+    ///
+    /// iOS 26 的系统 `.interactive()` 已经自带按下形变，旧系统由调用方的
+    /// ButtonStyle 负责缩放。这里只把视图原样返回，把命中测试完整留给 Button。
     private func interactiveBody<V: View>(_ view: V) -> some View {
-        if isInteractive {
-            view
-                .scaleEffect(isPressed ? 0.97 : 1.0)
-                .simultaneousGesture(pressGesture)
-        } else {
-            view
-        }
-    }
-
-    /// minimumDistance 0 的拖拽 = 触摸按下/抬起的探针。
-    /// 用 `simultaneousGesture` 而不是 `gesture`：后者会抢走外层 Button 的点击，
-    /// 底栏圆钮就彻底点不动了。
-    private var pressGesture: some Gesture {
-        DragGesture(minimumDistance: 0)
-            .onChanged { _ in
-                guard !isPressed else { return }
-                withAnimation(Theme.Motion.standard) {
-                    isPressed = true
-                }
-            }
-            .onEnded { _ in
-                withAnimation(Theme.Motion.standard) {
-                    isPressed = false
-                }
-            }
+        view
     }
 
     // MARK: 渲染令牌

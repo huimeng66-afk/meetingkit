@@ -11,6 +11,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 struct SharePickerPanel: View {
 
@@ -18,16 +19,88 @@ struct SharePickerPanel: View {
 
     @State private var selectsScreenSource: Bool = true
 
+    /// 签名是否真的给了 App Group 能力。
+    ///
+    /// 只在这里求值一次：`containerURL` 是系统调用，放进 body 会在每次
+    /// 状态刷新时都跑一遍；而签名能力在一次进程生命周期内不会变。
+    @State private var isSystemShareAvailable: Bool = AppGroupConfig.isAvailable
+
     var body: some View {
         VStack(spacing: 0) {
             header
-            sourceCards
-            infoCard
+
+            if isSystemShareAvailable {
+                sourceCards
+                infoCard
+            } else {
+                // 不可用时不再摆两张点不动的来源卡：
+                // 用户点"共享屏幕"是来解决问题的，不是来看一个灰掉的界面。
+                compatibilityNotice
+                webSteps
+            }
 
             Spacer(minLength: Theme.Metrics.space3)
 
             primaryAction
         }
+    }
+
+    // MARK: - 签名能力提示
+
+    private var compatibilityNotice: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color(hex: 0xFBBF24))
+
+                Text("当前安装包无法回传共享画面")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(Theme.Palette.textPrimary)
+            }
+
+            Text("签名证书没有授予 App Group 权限。系统广播可以启动，但画面传不回这场会议。")
+                .font(Theme.Typography.caption)
+                .foregroundColor(Theme.Palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(Theme.Metrics.space3)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Metrics.cardRadius, style: .continuous)
+                .fill(Color(hex: 0xFBBF24).opacity(0.10))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.Metrics.cardRadius, style: .continuous)
+                .stroke(Color(hex: 0xFBBF24).opacity(0.28), lineWidth: 1)
+        )
+        .padding(.horizontal, Theme.Metrics.horizontal)
+    }
+
+    private var webSteps: some View {
+        VStack(alignment: .leading, spacing: Theme.Metrics.space2) {
+            HStack(spacing: 6) {
+                Image(systemName: SymbolCompat.name("safari.fill", "safari"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Theme.Palette.accent)
+
+                Text("用网页版共享屏幕")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Theme.Palette.textPrimary)
+            }
+
+            stepRow(index: 1, text: "复制下方的会议链接")
+            stepRow(index: 2, text: "在 Safari 或 Chrome 中打开")
+            stepRow(index: 3, text: "进入会议后点底部的「共享屏幕」")
+        }
+        .padding(Theme.Metrics.space3)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Metrics.cardRadius, style: .continuous)
+                .fill(Color.white.opacity(0.05))
+        )
+        .padding(.horizontal, Theme.Metrics.horizontal)
+        .padding(.top, Theme.Metrics.space3)
     }
 
     // MARK: - 头部
@@ -187,7 +260,32 @@ struct SharePickerPanel: View {
 
     @ViewBuilder
     private var primaryAction: some View {
-        if viewModel.isScreenSharing {
+        if !isSystemShareAvailable {
+            // 不可用时不摆一个注定打不开系统面板的"开始共享"。
+            // 主按钮直接就是唯一有结果的路径：复制链接去网页版。
+            Button {
+                copyWebLink()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: SymbolCompat.name("doc.on.doc.fill", "doc.on.doc"))
+                        .font(.system(size: 14, weight: .semibold))
+
+                    Text("复制链接，用网页版共享")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 50)
+                .background(
+                    RoundedRectangle(cornerRadius: Theme.Metrics.buttonRadius, style: .continuous)
+                        .fill(Theme.Palette.brandGradient)
+                )
+            }
+            .buttonStyle(ControlButtonPressStyle())
+            .padding(.horizontal, Theme.Metrics.horizontal)
+            .padding(.bottom, Theme.Metrics.space2)
+            .accessibilityLabel("复制链接，用网页版共享")
+        } else if viewModel.isScreenSharing {
             Button {
                 Haptics.impact(.light)
                 // H-2：只发停止请求，绝不在此处把 isScreenSharing 置 false。
@@ -237,24 +335,57 @@ struct SharePickerPanel: View {
         }
     }
 
-    // MARK: - 动作
+    // MARK: - 网页版兜底
 
-    private func startSharing() {
-        // 先弹系统面板再收自己的面板：系统的「屏幕录制」是独立 window，
-        // 但我们的抽屉如果还开着，用户会以为界面卡住没反应。
-        let didPresent = BroadcastPickerPresenter.present()
-        viewModel.closePanel()
-
-        guard didPresent else {
+    private func copyWebLink() {
+        let number = viewModel.meetingNumber
+        guard !number.isEmpty else {
             viewModel.showToast(
                 ToastMessage(
-                    text: "未找到屏幕共享扩展",
+                    text: "会议号还没准备好，请稍后再试",
                     systemImage: "exclamationmark.triangle.fill",
                     style: .warning
                 )
             )
             return
         }
+
+        let link = "\(TianqiongAPI.origin.absoluteString)/room?no=\(number)"
+        UIPasteboard.general.string = link
+        Haptics.impact(.light)
+        viewModel.showToast(
+            ToastMessage(
+                text: "链接已复制，在浏览器打开即可共享",
+                systemImage: "doc.on.doc.fill",
+                style: .success
+            )
+        )
+        viewModel.closePanel()
+    }
+
+    // MARK: - 动作
+
+    private func startSharing() {
+        // 先弹系统面板再收自己的面板：系统的「屏幕录制」是独立 window，
+        // 但我们的抽屉如果还开着，用户会以为界面卡住没反应。
+        let didPresent = BroadcastPickerPresenter.present()
+
+        guard didPresent else {
+            // 失败时**不要**关面板：关掉之后用户只剩一条转瞬即逝的 Toast，
+            // 体感就是"点了没反应"，还得重新点一次共享才能回到这里。
+            // 保留面板，用户可以直接改走下面的网页版链接。
+            viewModel.showToast(
+                ToastMessage(
+                    text: "系统共享面板未能打开，可改用网页版共享",
+                    systemImage: "exclamationmark.triangle.fill",
+                    style: .warning
+                )
+            )
+            return
+        }
+
+        // 只有系统面板真的弹出来了才收自己的抽屉，否则两层界面会互相抢焦点。
+        viewModel.closePanel()
 
         // 这里刻意什么都不做：真正的开始状态由 ScreenShareBridge 从 App Group 读回来，
         // 用户若在系统弹窗里点取消，界面不该留下"正在共享"的假状态。

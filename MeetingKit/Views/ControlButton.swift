@@ -2,17 +2,21 @@
 //  ControlButton.swift
 //  MeetingKit
 //
-//  会议室底栏单键：一颗纯图标玻璃圆钮 + 右上角角标。
+//  会议室底栏单键：玻璃圆钮 + 文字标签 + 右上角角标。
 //
-//  ── 为什么去掉 10pt 文字标签 ────────────────────────────────────────
-//  7 个键挤在 393pt 宽度里，每键只有 52pt。图标下面再塞一行 10pt 中文，
-//  既压不出留白，也让整条底栏看起来像"工具栏"而不是系统控件。
-//  iOS 26 之后苹果自己的通话界面（FaceTime / 电话）都是纯图标 + 无障碍标签，
-//  语义交给 VoiceOver，视觉交给 SF Symbols —— 这才是原生观感。
+//  ── 为什么加回文字标签 ──────────────────────────────────────────────
+//  上一版按"苹果通话界面都是纯图标"的判断去掉了文字，结果用户完全认不出
+//  7 颗一模一样的圆钮分别是什么，只能逐个点开试——这是可用性问题，不是审美问题。
+//  系统电话/FaceTime 的图标之所以能省文字，是因为它们只有 3~4 颗、且图标语义极强；
+//  7 颗里同时出现"安全/邀请/成员/共享/更多"时，没有任何用户能靠图标分辨。
+//  所以文字必须回来：9.5pt、单行、不参与玻璃，颜色跟随状态。
 //
-//  外观只剩两种：常态玻璃、警示着色玻璃（麦克风关闭 / 共享中）。
-//  全部走 `liquidGlass`，在 iOS 26 上是系统 `glassEffect`，
-//  和底栏容器的其它玻璃会自然融合。
+//  ── 视觉分级 ────────────────────────────────────────────────────────
+//  七个键不再共用一种外观：
+//    · 共享：常驻强调色玻璃（蓝色），是底栏唯一的主操作；
+//    · 麦克风/摄像头：关闭时红色染色玻璃，状态一眼可见；
+//    · 其余：中性玻璃。
+//  同一种玻璃重复七次，用户会以为整条底栏是一个控件。
 //
 
 import SwiftUI
@@ -34,9 +38,11 @@ struct ControlButton: View {
     let title: String
 
     var appearance: ControlButtonAppearance = .neutral
+    var isPrimary: Bool = false
 
-    /// 圆钮直径。底栏默认 46：7 颗 × 46 + 6 段间距刚好落在 375pt 的安全区内。
-    var size: CGFloat = 46
+    /// 圆钮直径。底栏 40：7 颗并排后每颗仍有约 51pt 的横向命中区，
+    /// 圆钮本身 40 也高于 40pt 的可用下限，手指不会点到隔壁。
+    var size: CGFloat = 40
 
     /// 数字角标（成员人数）。传 nil 不显示。
     var badgeText: String? = nil
@@ -44,6 +50,9 @@ struct ControlButton: View {
     var badgeSymbol: String? = nil
     /// 小红点（录制中）。
     var badgeDot: Bool = false
+
+    /// 是否显示圆钮下方的文字。默认显示：见文件头的可用性说明。
+    var showsTitle: Bool = true
 
     /// 朗读用的完整语义。nil 时回退到 title。
     var accessibilityText: String? = nil
@@ -55,22 +64,35 @@ struct ControlButton: View {
             Haptics.impact(.light)
             action()
         } label: {
-            ZStack(alignment: .topTrailing) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundColor(iconColor)
-                    .frame(width: size, height: size)
-                    .liquidGlass(
-                        glassVariant,
-                        cornerStyle: .circle,
-                        isInteractive: true,
-                        castsShadow: false
-                    )
-                    .contentShape(Circle())
+            VStack(spacing: 4) {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundColor(iconColor)
+                        .frame(width: size, height: size)
+                        .liquidGlass(
+                            glassVariant,
+                            cornerStyle: .circle,
+                            isInteractive: true,
+                            castsShadow: false
+                        )
+                        .contentShape(Circle())
 
-                badgeLayer
+                    badgeLayer
+                }
+                .frame(width: size, height: size)
+
+                if showsTitle {
+                    Text(title)
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundColor(titleColor)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .frame(maxWidth: .infinity)
+                }
             }
-            .frame(width: size, height: size)
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
         }
         .buttonStyle(ControlButtonPressStyle())
         .accessibilityLabel(accessibilityText ?? title)
@@ -78,12 +100,11 @@ struct ControlButton: View {
 
     // MARK: - 着色
 
-    /// 只保留"常态 / 警示"两档语义，颜色差异全部交给玻璃的 tint，
-    /// 不再自己画填充 + 描边（那是塑料感的来源）。
+    /// 只保留"常态 / 警示 / 主操作"三档语义，颜色差异全部交给玻璃的 tint。
     private var glassVariant: LiquidGlassVariant {
         switch appearance {
         case .neutral:
-            return .regular
+            return isPrimary ? .tinted(Theme.Palette.accent) : .regular
         case .off:
             return .tinted(Theme.Palette.danger)
         case .broadcast:
@@ -94,11 +115,22 @@ struct ControlButton: View {
     private var iconColor: Color {
         switch appearance {
         case .neutral:
-            return Theme.Palette.textPrimary
+            return isPrimary ? .white : Theme.Palette.textPrimary
         case .off:
             return Color(hex: 0xFCA5A5)
         case .broadcast:
             return .white
+        }
+    }
+
+    /// 文字压在页面底色上，不能沿用图标的白/粉：
+    /// 9.5pt 的白字在深背景上会散光，反而不如次级灰好读。
+    private var titleColor: Color {
+        switch appearance {
+        case .neutral:
+            return isPrimary ? Theme.Palette.accent : Theme.Palette.textSecondary
+        case .off, .broadcast:
+            return Color(hex: 0xFCA5A5)
         }
     }
 
@@ -150,7 +182,7 @@ struct ControlButton_Previews: PreviewProvider {
     static var previews: some View {
         ZStack {
             Theme.Palette.background
-            HStack(spacing: 8) {
+            HStack(spacing: 0) {
                 ControlButton(
                     systemImage: SymbolCompat.name("mic.slash.fill", "mic.slash"),
                     title: "取消静音",
@@ -162,8 +194,8 @@ struct ControlButton_Previews: PreviewProvider {
                         "rectangle.inset.filled.and.person.filled",
                         "rectangle.on.rectangle"
                     ),
-                    title: "停止共享",
-                    appearance: .broadcast
+                    title: "共享",
+                    isPrimary: true
                 ) {}
                 ControlButton(
                     systemImage: SymbolCompat.name("person.2.fill", "person.2"),
@@ -176,6 +208,7 @@ struct ControlButton_Previews: PreviewProvider {
                     badgeSymbol: "hand.raised.fill"
                 ) {}
             }
+            .padding(.horizontal, 8)
         }
         .preferredColorScheme(.dark)
     }

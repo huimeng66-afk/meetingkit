@@ -572,7 +572,20 @@ struct SettingsView: View {
             VStack(spacing: 0) {
                 content()
             }
-            .liquidGlass(.regular, cornerStyle: .continuous(20), castsShadow: false)
+            // 分组不再用玻璃。
+            //
+            // 设置页有 6 个分组，如果每块都是玻璃，一屏里会出现六层模糊叠加，
+            // 滚动时每块都在折射下方的光斑，文字对比度跟着起伏——
+            // 这也是"所有组件长得一样"的来源。这里退成实色分组底，
+            // 把玻璃只留给顶部那张账号卡（页面唯一需要强调的层级）。
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.white.opacity(0.055))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+            )
         }
         .padding(.bottom, 24)
     }

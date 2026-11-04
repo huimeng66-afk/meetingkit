@@ -34,20 +34,43 @@ struct MorePanel: View {
 
             LazyVGrid(columns: columns, spacing: Theme.Metrics.space4) {
                 MoreActionTile(
+                    title: "成员",
+                    systemImage: SymbolCompat.name("person.2.fill", "person.2"),
+                    isOn: nil
+                ) {
+                    viewModel.openPanel(.participants)
+                }
+
+                MoreActionTile(
+                    title: "邀请",
+                    systemImage: SymbolCompat.name(
+                        "person.badge.plus",
+                        "person.crop.circle.badge.plus",
+                        "person.fill"
+                    ),
+                    isOn: nil
+                ) {
+                    viewModel.openPanel(.invite)
+                }
+
+                MoreActionTile(
+                    title: "安全",
+                    systemImage: SymbolCompat.name(
+                        "checkmark.shield.fill",
+                        "checkmark.shield",
+                        "shield.fill"
+                    ),
+                    isOn: nil
+                ) {
+                    viewModel.openPanel(.safety)
+                }
+
+                MoreActionTile(
                     title: "举手",
                     systemImage: SymbolCompat.name("hand.raised.fill", "hand.raised"),
                     isOn: viewModel.isHandRaised
                 ) {
                     viewModel.toggleHandRaise()
-                }
-
-                MoreActionTile(
-                    title: "录制",
-                    systemImage: SymbolCompat.name("record.circle", "smallcircle.filled.circle"),
-                    isOn: viewModel.isRecording,
-                    isDisabled: true
-                ) {
-                    // 云录制尚未接入服务端，禁用并标注"即将上线"，避免假开关误导用户。
                 }
 
                 MoreActionTile(
@@ -83,23 +106,20 @@ struct MorePanel: View {
                 }
 
                 MoreActionTile(
-                    title: "邀请",
-                    systemImage: SymbolCompat.name(
-                        "person.badge.plus",
-                        "person.crop.circle.badge.plus",
-                        "person.fill"
-                    ),
-                    isOn: nil
-                ) {
-                    viewModel.openPanel(.invite)
-                }
-
-                MoreActionTile(
                     title: "设置",
                     systemImage: SymbolCompat.name("gearshape", "gear"),
                     isOn: nil
                 ) {
                     viewModel.openPanel(.settings)
+                }
+
+                MoreActionTile(
+                    title: "录制",
+                    systemImage: SymbolCompat.name("record.circle", "smallcircle.filled.circle"),
+                    isOn: viewModel.isRecording,
+                    isDisabled: true
+                ) {
+                    // 云录制尚未接入服务端，禁用并标注"即将上线"，避免假开关误导用户。
                 }
             }
             .padding(.horizontal, Theme.Metrics.horizontal)

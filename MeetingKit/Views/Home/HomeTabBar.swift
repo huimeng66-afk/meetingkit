@@ -2,18 +2,24 @@
 //  HomeTabBar.swift
 //  MeetingKit
 //
-//  首页底部导航条 —— 与网页端 `.mobile-tabbar` 同构。
+//  首页底部 Dock —— 对齐系统「电话」App 的悬浮玻璃胶囊。
 //
-//  ── 为什么从"悬浮玻璃胶囊"换成通栏 tab bar ──────────────────────────
-//  上一版是四块独立玻璃浮在内容之上，视觉上确实像 iOS 26 的 Dock，但它有三个
-//  实际问题：一，玻璃的折射与高光会随下层内容变化，深色页面上看起来是一团发灰
-//  的雾；二，四块胶囊之间只有 6pt 缝隙，误触率高；三，文字被压到 9.5pt，中文
-//  在这个尺寸下几乎糊成一团。网页端那条件条 —— 通栏、发丝线上边、20pt 图标
-//  加 10.5pt 文字、选中变蓝 —— 反而更清楚、更好点，这也是用户明确要的样子。
+//  ── 结构（按用户提供的系统截图复刻）────────────────────────────────
+//  左侧是一整块连续玻璃胶囊，四个目的地等分排在内部；
+//  选中项不是"变个颜色"，而是在胶囊内部浮起一枚更亮的子胶囊，
+//  图标与文字同时变蓝 —— 这样一眼能看出"我在哪"，也不需要额外的选中色块。
+//  右侧是独立的圆形按钮，承载"发起会议"这个主操作。
+//
+//  ── 为什么不是通栏 ──────────────────────────────────────────────────
+//  上一版做成了贴着屏幕底边的通栏 tab bar，理由是"和网页端一致"。
+//  但用户给的参考是 iOS 系统电话 App：悬浮、离底边有间距、内容从玻璃下面穿过。
+//  悬浮胶囊还有一个实际好处——它不吞掉底部 56pt 的整条区域，
+//  列表最后一行可以滚到胶囊下面，而不是被一条不透明横条永远挡住。
 //
 //  ── 尺寸 ────────────────────────────────────────────────────────────
-//  内容区 56pt（与网页端一致）+ 安全区。SE（375pt）上四项各 93.75pt，
-//  远超 44pt 触控下限；横屏时同样按四等分，不会出现某一项被挤成图标条。
+//  胶囊高 62（内容 52 + 上下 5），FAB 直径 60。
+//  iPhone 393pt：393 - 28(边距) - 10(间距) - 60(FAB) = 295，四等分每项 73pt，
+//  远高于 44pt 的触控下限；SE 375pt 上每项仍有 69pt。
 //
 
 import SwiftUI
@@ -22,46 +28,49 @@ struct HomeTabBar: View {
 
     @Binding var selection: HomeTab
 
-    /// 根视图安全区底部。导航条自己补这一段，才不会压在 home indicator 上。
+    /// 根视图安全区底部。Dock 自己补这一段，才能浮在 home indicator 上方。
     var bottomInset: CGFloat = 0
 
     /// 重复点击当前 tab：宿主用它把列表滚回顶部（系统 tab bar 的既定行为）。
     var onReselect: (HomeTab) -> Void = { _ in }
 
+    /// 右侧圆形主操作。
+    var onStartMeeting: () -> Void = {}
+
+    /// 选中子胶囊在四个位置之间滑动，而不是淡入淡出。
+    @Namespace private var selectionNamespace
+
     var body: some View {
+        HStack(spacing: 10) {
+            tabCluster
+            startMeetingButton
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, bottomInset + 10)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("主导航")
+    }
+
+    // MARK: - 胶囊
+
+    private var tabCluster: some View {
         HStack(spacing: 0) {
             ForEach(HomeTab.allCases) { tab in
                 item(tab)
             }
         }
-        .frame(height: 56)
-        .padding(.bottom, bottomInset)
-        .background(barBackground)
-        .overlay(alignment: .top) {
-            // 发丝线：网页端用 border-top，这里用 0.5pt 的高度画一条。
-            // 用 Rectangle 而不是 Divider，避免 Divider 在深色下自带缩进与更粗的灰。
-            Rectangle()
-                .fill(Theme.Palette.hairline)
-                .frame(height: 0.5)
-        }
-        // 通栏导航必须一直铺到屏幕底边。只加 padding(.bottom, inset) 的话，
-        // 导航条会被安全区截住，home indicator 下方露出 34pt 的页面底色，
-        // 看起来像"条没贴底"。忽略安全区后，内部那段 padding 仍然把内容
-        // 顶在指示条上方，背景则铺满整条。
-        .ignoresSafeArea(edges: .bottom)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("主导航")
+        .padding(5)
+        // 一整块玻璃，而不是四块各自带玻璃。
+        // 四块独立玻璃在深色底上会互相折射出一圈灰边，看起来像四个按钮贴在一起；
+        // 一整块才符合系统电话 App 的"一个容器 + 内部选中项"的层级。
+        .liquidGlass(.regular, cornerStyle: .capsule, castsShadow: true)
     }
-
-    // MARK: - 单项
 
     private func item(_ tab: HomeTab) -> some View {
         let isSelected = selection == tab
 
         return Button {
             if isSelected {
-                // 重选不切换页面，只把内容滚回顶部。给一次轻触觉，
-                // 否则用户点了一下"什么都没发生"，会以为导航条失灵。
                 onReselect(tab)
                 Haptics.impact(.light)
             } else {
@@ -73,19 +82,30 @@ struct HomeTabBar: View {
         } label: {
             VStack(spacing: 3) {
                 Image(systemName: isSelected ? tab.selectedSymbol : tab.symbol)
-                    .font(.system(size: 19, weight: isSelected ? .semibold : .regular))
-                    .frame(height: 22)
+                    .font(.system(size: 20, weight: isSelected ? .semibold : .regular))
+                    .frame(height: 23)
 
                 Text(tab.tabBarTitle)
                     .font(.system(size: 10.5, weight: isSelected ? .semibold : .medium))
                     .lineLimit(1)
-                    .minimumScaleFactor(0.85)
+                    .minimumScaleFactor(0.8)
             }
-            // 选中只改颜色和字重，不垫色块：网页端就是这么做的，
-            // 底部通栏里再出现一个圆角选中块，会立刻变回"四个按钮"。
-            .foregroundColor(isSelected ? Theme.Palette.accent : Theme.Palette.ink3)
+            .foregroundColor(isSelected ? Theme.Palette.accent : Theme.Palette.textSecondary)
             .frame(maxWidth: .infinity)
-            .frame(height: 56)
+            .frame(height: 52)
+            .background {
+                if isSelected {
+                    // 选中子胶囊。白色 0.14 在深色玻璃上刚好是"比周围亮一档"，
+                    // 再高会变成实心白块，再低则看不出边界。
+                    Capsule(style: .continuous)
+                        .fill(Color.white.opacity(0.14))
+                        .overlay(
+                            Capsule(style: .continuous)
+                                .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
+                        )
+                        .matchedGeometryEffect(id: "tab.selection", in: selectionNamespace)
+                }
+            }
             .contentShape(Rectangle())
         }
         .buttonStyle(PlainButtonStyle())
@@ -93,17 +113,24 @@ struct HomeTabBar: View {
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
-    // MARK: - 底
+    // MARK: - 主操作
 
-    /// 半透明材质 + 底色压暗。
-    ///
-    /// 只用 material 时，深空底透上来会偏灰；只用纯色又会挡住下方滚动的画面，
-    /// 失去"内容从底下穿过"的层次。两层叠加同时保住对比度与通透感。
-    private var barBackground: some View {
-        ZStack {
-            Rectangle().fill(.ultraThinMaterial)
-            Theme.Palette.background.opacity(0.72)
+    private var startMeetingButton: some View {
+        Button {
+            Haptics.impact(.medium)
+            onStartMeeting()
+        } label: {
+            Image(systemName: "video.badge.plus")
+                .font(.system(size: 21, weight: .semibold))
+                .foregroundColor(.white)
+                .frame(width: 60, height: 60)
+                .background(Circle().fill(Theme.Palette.brandGradient))
+                .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
+                .shadow(color: Color.black.opacity(0.34), radius: 12, x: 0, y: 6)
+                .contentShape(Circle())
         }
+        .buttonStyle(ControlButtonPressStyle())
+        .accessibilityLabel("发起会议")
     }
 }
 

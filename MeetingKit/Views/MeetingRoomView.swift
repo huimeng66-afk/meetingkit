@@ -75,8 +75,6 @@ struct MeetingRoomView: View {
 
                 chromeLayer(insets: insets)
 
-                quickChatLayer(insets: insets)
-
                 // topInset / bottomInset 必须传进去：小窗的上边界是"顶栏底部 + 8"，
                 // 下边界是"底栏顶部 - 12"，写死常量在刘海/无刘海机型上会盖住按钮或浪费行程（H-7）。
                 LocalVideoFloatingView(
@@ -145,64 +143,6 @@ struct MeetingRoomView: View {
         .allowsHitTesting(viewModel.isChromeVisible)
         .animationCompat(Theme.Motion.standard, value: viewModel.isChromeVisible)
         .zIndex(1)
-    }
-
-    // MARK: - 快捷聊天
-
-    /// 左下浮动聊天入口。
-    ///
-    /// 底栏按设计规范固定为 7 键，聊天不能占其中一个位置；但聊天面板又必须可达。
-    /// 网页参考里对应的是左侧浮动的快捷胶囊（`#rQuickChat`），这里保留同一结构，
-    /// 只做聊天一项——没有表情业务就不放一个点了没反应的假按钮。
-    private func quickChatLayer(insets: EdgeInsets) -> some View {
-        VStack(spacing: 0) {
-            Spacer(minLength: 0)
-
-            HStack(spacing: 0) {
-                Button {
-                    Haptics.impact(.light)
-                    if viewModel.activePanel == .chat {
-                        viewModel.closePanel()
-                    } else {
-                        viewModel.openPanel(.chat)
-                    }
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: SymbolCompat.name(
-                            "bubble.left.and.bubble.right.fill",
-                            "bubble.left.and.bubble.right"
-                        ))
-                            .font(.system(size: 14, weight: .medium))
-
-                        Text("聊天")
-                            .font(.system(size: 12, weight: .medium))
-
-                        if viewModel.unreadCount > 0 {
-                            Text(viewModel.unreadCount >= 100 ? "99+" : "\(viewModel.unreadCount)")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 5)
-                                .frame(minWidth: 16, minHeight: 16)
-                                .background(Capsule().fill(Theme.Palette.danger))
-                        }
-                    }
-                    .foregroundColor(Theme.Palette.textPrimary)
-                    .padding(.horizontal, 12)
-                    .frame(height: 36)
-                    .liquidGlass(.clear, cornerStyle: .capsule, isInteractive: true)
-                }
-                .buttonStyle(PlainButtonStyle())
-                .accessibilityLabel("打开聊天")
-
-                Spacer(minLength: 0)
-            }
-            .padding(.leading, 14)
-            .padding(.bottom, insets.bottom + 64 + 10)
-        }
-        .opacity(viewModel.isChromeVisible ? 1 : 0)
-        .allowsHitTesting(viewModel.isChromeVisible)
-        .animationCompat(Theme.Motion.standard, value: viewModel.isChromeVisible)
-        .zIndex(1.5)
     }
 
     // MARK: - Toast

@@ -2,17 +2,21 @@
 //  BottomControlBar.swift
 //  MeetingKit
 //
-//  会议室底栏：7 颗独立玻璃圆钮，装在一个 GlassEffectContainer 里。
+//  会议室底栏：5 颗玻璃圆钮 + 文字标签。
 //
-//  ── 为什么不是"一条玻璃胶囊里排 7 个图标" ─────────────────────────
-//  一整块玻璃包住所有按钮，是 Web 的 toolbar 思路：玻璃只有一层，
-//  按下去的时候除了按钮自己的缩放，整块玻璃没有任何反应，看起来就是贴图。
+//  ── 为什么是 5 个而不是 7 个 ────────────────────────────────────────
+//  7 个键并排时每颗只有 51pt，图标下面再放 10pt 中文，整条底栏会变成"工具栏"：
+//  密度过高、主次不明，用户必须逐个读字才能找到自己要做的事。
+//  这一版只保留会议中真正高频的 5 个动作：
+//    麦克风、摄像头、共享、消息、更多。
+//  安全 / 邀请 / 成员 / 设置 全部下沉到"更多"面板，底栏不再为低频功能付宽度。
 //
-//  iOS 26 的正确做法是每颗按钮各自持有玻璃，再把它们放进同一个容器：
-//  相邻玻璃会在间距内互相吸附、融合成一条，按下某一个时只有那一片液体形变。
-//  这就是系统相机 / 控制中心的质感来源，用一层大玻璃永远做不出来。
-//
-//  尺寸：7 × 44 + 6 × 5 = 338，加左右 12pt 边距共 362，SE（375）也放得下。
+//  ── 麦克风脉冲 ──────────────────────────────────────────────────────
+//  说话时圆钮外圈会向上扩散两圈声波。强度由 `isSpeaking` 决定：
+//    · 正在说话：1.05s 一圈、描边 2pt、从不透明度 0.55 衰减到 0；
+//    · 仅开麦：2.6s 一圈、描边 1pt、从 0.16 衰减，表示"正在采集"而不抢注意力；
+//    · 静音：完全不画。
+//  脉冲层 `allowsHitTesting(false)`，不会影响按钮命中。
 //
 
 import SwiftUI
@@ -24,40 +28,71 @@ struct BottomControlBar: View {
     /// 根视图 `GeometryReader.safeAreaInsets.bottom`。
     var bottomInset: CGFloat = 0
 
-    /// 圆钮直径。44 是触控目标下限，也是 7 颗并排时的上限。
+    /// 圆钮直径。5 个键时每颗有约 76pt 的横向空间，44 是系统触控标准。
     private let keySize: CGFloat = 44
+
+    /// 本地是否正在说话。
+    ///
+    /// 真实链路里服务端的 active speaker 事件会带上本机；Mock 里由假数据驱动。
+    /// 拿不到时退化成"仅开麦"的轻呼吸，不会误报成"正在说话"。
+    private var isLocalSpeaking: Bool {
+        guard viewModel.isMicOn, let me = viewModel.localUser else { return false }
+        return viewModel.activeSpeakerID == me.id
+    }
 
     var body: some View {
         LiquidGlassContainer(spacing: 8) {
-            HStack(spacing: 5) {
+            HStack(spacing: 0) {
                 micButton
                 cameraButton
-                safetyButton
-                inviteButton
-                membersButton
                 shareButton
+                chatButton
                 moreButton
             }
         }
-        .padding(.horizontal, 12)
-        // +8 是圆钮与 home indicator 之间的呼吸位；没有这一档，
-        // 按钮会紧贴手势条，滑动返回时容易误触到「更多」。
-        .padding(.bottom, bottomInset + 8)
+        .padding(.horizontal, 6)
+        .padding(.top, 8)
+        .padding(.bottom, bottomInset + 6)
+        .background(bottomScrim)
     }
 
-    // MARK: - 七个键
+    /// 自下而上的压暗层。顶部完全透明，只保证文字与图标有足够对比度。
+    private var bottomScrim: some View {
+        LinearGradient(
+            stops: [
+                .init(color: Color.black.opacity(0), location: 0),
+                .init(color: Color.black.opacity(0.26), location: 0.40),
+                .init(color: Color.black.opacity(0.60), location: 1)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        .padding(.top, -40)
+        .allowsHitTesting(false)
+    }
+
+    // MARK: - 五个键
 
     private var micButton: some View {
         ControlButton(
             systemImage: viewModel.isMicOn
                 ? SymbolCompat.name("mic.fill")
                 : SymbolCompat.name("mic.slash.fill", "mic.slash"),
-            title: viewModel.isMicOn ? "静音" : "取消静音",
+            title: viewModel.isMicOn ? "麦克风" : "已静音",
             appearance: viewModel.isMicOn ? .neutral : .off,
             size: keySize,
             accessibilityText: viewModel.isMicOn ? "静音" : "取消静音"
         ) {
             viewModel.toggleMic()
+        }
+        // 脉冲画在圆钮下方，不参与命中测试。
+        .overlay(alignment: .top) {
+            MicPulseRing(
+                isSpeaking: isLocalSpeaking,
+                isMicOn: viewModel.isMicOn,
+                diameter: keySize
+            )
+            .offset(y: 0)
         }
     }
 
@@ -66,58 +101,13 @@ struct BottomControlBar: View {
             systemImage: viewModel.isCameraOn
                 ? SymbolCompat.name("video.fill")
                 : SymbolCompat.name("video.slash.fill", "video.slash"),
-            title: viewModel.isCameraOn ? "摄像头" : "开启摄像头",
+            title: viewModel.isCameraOn ? "摄像头" : "已关闭",
             appearance: viewModel.isCameraOn ? .neutral : .off,
             size: keySize,
             accessibilityText: viewModel.isCameraOn ? "关闭摄像头" : "开启摄像头"
         ) {
             viewModel.toggleCamera()
         }
-    }
-
-    private var safetyButton: some View {
-        ControlButton(
-            systemImage: SymbolCompat.name("checkmark.shield.fill", "checkmark.shield", "shield.fill"),
-            title: "安全",
-            size: keySize,
-            accessibilityText: "安全设置"
-        ) {
-            togglePanel(.safety)
-        }
-    }
-
-    private var inviteButton: some View {
-        ControlButton(
-            systemImage: SymbolCompat.name(
-                "person.badge.plus",
-                "person.crop.circle.badge.plus",
-                "person.fill"
-            ),
-            title: "邀请",
-            size: keySize,
-            accessibilityText: "邀请参会人"
-        ) {
-            togglePanel(.invite)
-        }
-    }
-
-    private var membersButton: some View {
-        ControlButton(
-            systemImage: SymbolCompat.name("person.2.fill", "person.2"),
-            title: "成员",
-            size: keySize,
-            badgeText: memberBadgeText,
-            accessibilityText: "参会人，共 \(viewModel.participantCount) 人"
-        ) {
-            togglePanel(.participants)
-        }
-    }
-
-    /// ≥100 时显示 99+：角标只有 17pt，再多一位就会压到图标。
-    private var memberBadgeText: String? {
-        let count = viewModel.participantCount
-        guard count > 0 else { return nil }
-        return count >= 100 ? "99+" : "\(count)"
     }
 
     private var shareButton: some View {
@@ -129,6 +119,7 @@ struct BottomControlBar: View {
             ),
             title: viewModel.isScreenSharing ? "停止共享" : "共享",
             appearance: viewModel.isScreenSharing ? .broadcast : .neutral,
+            isPrimary: !viewModel.isScreenSharing,
             size: keySize,
             accessibilityText: viewModel.isScreenSharing ? "停止共享屏幕" : "共享屏幕"
         ) {
@@ -138,6 +129,31 @@ struct BottomControlBar: View {
                 viewModel.toggleScreenShare()
             }
         }
+    }
+
+    private var chatButton: some View {
+        ControlButton(
+            systemImage: SymbolCompat.name(
+                "bubble.left.and.bubble.right.fill",
+                "bubble.left.and.bubble.right"
+            ),
+            title: "消息",
+            size: keySize,
+            badgeText: chatBadgeText,
+            accessibilityText: viewModel.unreadCount > 0
+                ? "消息，\(viewModel.unreadCount) 条未读"
+                : "消息"
+        ) {
+            togglePanel(.chat)
+        }
+    }
+
+    /// 未读数角标。抽成属性而不是写在调用点里：
+    /// 三元表达式同时返回 String 与 nil 时，参数重载会让类型推断变慢，甚至报错。
+    private var chatBadgeText: String? {
+        let count = viewModel.unreadCount
+        guard count > 0 else { return nil }
+        return count >= 100 ? "99+" : "\(count)"
     }
 
     private var moreButton: some View {
@@ -160,6 +176,75 @@ struct BottomControlBar: View {
         } else {
             viewModel.openPanel(panel)
         }
+    }
+}
+
+// MARK: - 麦克风脉冲
+
+/// 两圈错开的声波，从圆钮边缘向上扩散并淡出。
+///
+/// 用两个独立 Circle 而不是一个：单圈的 repeatForever 在重启瞬间会从
+/// "透明的大圈"跳回"实的小圈"，看起来像闪了一下；两圈错开半拍后，
+/// 每一帧至少有一圈处于可见阶段，跳变被另一圈盖住。
+struct MicPulseRing: View {
+
+    var isSpeaking: Bool
+    var isMicOn: Bool
+    var diameter: CGFloat
+
+    @State private var expand: Bool = false
+
+    /// 说话时更亮、更快；仅开麦时只留一层几乎不可见的呼吸。
+    private var ringOpacity: Double {
+        isSpeaking ? 0.55 : 0.16
+    }
+
+    private var ringScale: CGFloat {
+        isSpeaking ? 1.75 : 1.22
+    }
+
+    private var duration: Double {
+        isSpeaking ? 1.05 : 2.6
+    }
+
+    var body: some View {
+        ZStack {
+            if isMicOn {
+                ring(delay: 0)
+                if isSpeaking {
+                    ring(delay: duration * 0.5)
+                }
+            }
+        }
+        .frame(width: diameter, height: diameter)
+        .allowsHitTesting(false)
+        // 说话状态一变就重建脉冲：duration / scale 都变了，
+        // 不重建的话 repeatForever 会沿用上一档的速度，直到当前圈跑完。
+        .id(isSpeaking ? "speaking" : "idle")
+        .onAppear {
+            expand = true
+        }
+    }
+
+    private func ring(delay: Double) -> some View {
+        Circle()
+            .stroke(
+                isSpeaking
+                    ? Theme.Palette.accent.opacity(ringOpacity)
+                    : Color.white.opacity(ringOpacity),
+                lineWidth: isSpeaking ? 2 : 1
+            )
+            .frame(width: diameter, height: diameter)
+            .scaleEffect(expand ? ringScale : 1.0)
+            // 向上偏移 8pt：用户要的是"往上冒"的声波，而不是以按钮为圆心的同心圆。
+            .offset(y: expand ? -8 : 0)
+            .opacity(expand ? 0 : ringOpacity)
+            .animation(
+                .easeOut(duration: duration)
+                    .repeatForever(autoreverses: false)
+                    .delay(delay),
+                value: expand
+            )
     }
 }
 

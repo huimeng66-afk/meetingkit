@@ -88,14 +88,11 @@ struct HomeView: View {
                     bottomInset: insets.bottom,
                     onReselect: { _ in
                         scrollTopToken += 1
+                    },
+                    onStartMeeting: {
+                        startMeetingFromHome()
                     }
                 )
-
-                // 发起会议的悬浮入口。与网页端 `.mobile-fab` 同位置、同尺寸：
-                // 只在会议页出现——通讯录/企业/设置页发起会议没有上下文，属于噪音。
-                if tab == .meetings {
-                    startMeetingFAB()
-                }
 
                 toastLayer(bottomInset: insets.bottom)
 
@@ -413,38 +410,6 @@ struct HomeView: View {
 
     /// 对齐网页端 `.mobile-fab`：右下角 52pt 圆形，压在导航条上方 16pt。
     /// 只在会议页出现——其它页面没有"在这里开会"的上下文。
-    private func startMeetingFAB() -> some View {
-        VStack(spacing: 0) {
-            Spacer(minLength: 0)
-
-            HStack(spacing: 0) {
-                Spacer(minLength: 0)
-
-                Button {
-                    Haptics.impact(.medium)
-                    startMeetingFromHome()
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundColor(.white)
-                        .frame(width: 52, height: 52)
-                        .background(
-                            Circle().fill(Theme.Palette.brandGradient)
-                        )
-                        .overlay(
-                            Circle().stroke(Color.white.opacity(0.16), lineWidth: 0.5)
-                        )
-                        .shadow(color: Color.black.opacity(0.38), radius: 14, x: 0, y: 6)
-                        .contentShape(Circle())
-                }
-                .buttonStyle(BrandPressStyle())
-                .accessibilityLabel("发起会议")
-                .padding(.trailing, 18)
-            }
-            .padding(.bottom, 72)
-        }
-    }
-
     /// toast 只有文案和样式，图标按语义给一个默认值。
     /// 让上层传图标会让每个调用点多一个必填参数，收益远小于噪音。
     private func toastIcon(for style: ToastStyle) -> String {
@@ -1100,57 +1065,202 @@ struct HomeView: View {
                     .font(.system(size: 28, weight: .semibold))
                     .foregroundColor(Theme.Palette.ink)
 
-                Text("邀请同事加入你的会议")
+                Text("把同事拉进同一场会议")
                     .font(.system(size: 13))
                     .foregroundColor(Theme.Palette.ink2)
             }
             .padding(.top, 24)
+            .padding(.bottom, 22)
 
-            VStack(spacing: 12) {
-                Image(systemName: SymbolCompat.name("person.2", "person.2.fill"))
-                    .font(.system(size: 34, weight: .light))
-                    .foregroundColor(Theme.Palette.ink3)
+            // 这一页刻意不用大玻璃空状态卡：
+            // 通讯录没有数据源时，"一张写着还没有参会人的卡片"占满半屏，
+            // 既没有信息量，也和首页入会卡、设置卡长得一模一样。
+            // 改成三组可执行的行——最近会议、邀请方式、组织入口——
+            // 每一行都能点出一个真实结果。
+            sectionLabel("最近会议")
 
-                Text("还没有参会人")
-                    .font(.system(size: 16, weight: .semibold))
+            groupedRows {
+                if let latest = router.history.first {
+                    contactRow(
+                        icon: SymbolCompat.name("clock.arrow.circlepath", "clock"),
+                        title: latest.title,
+                        subtitle: "会议号 \(latest.number)",
+                        actionTitle: "复制"
+                    ) {
+                        copyMeetingNumber(latest.number)
+                    }
+
+                    if router.history.count > 1 {
+                        rowDivider
+                        let second = router.history[1]
+                        contactRow(
+                            icon: SymbolCompat.name("clock.arrow.circlepath", "clock"),
+                            title: second.title,
+                            subtitle: "会议号 \(second.number)",
+                            actionTitle: "复制"
+                        ) {
+                            copyMeetingNumber(second.number)
+                        }
+                    }
+                } else {
+                    contactRow(
+                        icon: SymbolCompat.name("calendar.badge.plus", "calendar"),
+                        title: "还没有会议记录",
+                        subtitle: "发起一场会议后，最近开过的会会出现在这里",
+                        actionTitle: nil
+                    ) {}
+                }
+            }
+
+            sectionLabel("邀请方式")
+                .padding(.top, 22)
+
+            groupedRows {
+                contactRow(
+                    icon: SymbolCompat.name("link", "link.badge.plus"),
+                    title: "邀请链接",
+                    subtitle: "复制后发给同事，点开就能入会",
+                    actionTitle: "复制"
+                ) {
+                    copyInviteLink()
+                }
+
+                rowDivider
+
+                contactRow(
+                    icon: SymbolCompat.name("number", "number.circle"),
+                    title: "会议号",
+                    subtitle: "对方在首页输入会议号即可加入",
+                    actionTitle: "复制"
+                ) {
+                    copyLatestMeetingNumber()
+                }
+            }
+
+            sectionLabel("组织")
+                .padding(.top, 22)
+
+            groupedRows {
+                contactRow(
+                    icon: SymbolCompat.name("building.2", "building"),
+                    title: "企业成员",
+                    subtitle: "在企业空间查看成员与专属会议室",
+                    actionTitle: "查看"
+                ) {
+                    withAnimation(Theme.Motion.standard) {
+                        tab = .enterprise
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - 通讯录组件
+
+    private func sectionLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundColor(Theme.Palette.ink3)
+            .textCase(.uppercase)
+            .padding(.leading, 4)
+            .padding(.bottom, 8)
+    }
+
+    /// 分组列表底：半透明实色 + 发丝线，不叠模糊。
+    /// 通讯录是"读信息"的页面，玻璃在滚动时会不断折射下方内容，反而干扰阅读。
+    private func groupedRows<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(spacing: 0) {
+            content()
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(0.05))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.white.opacity(0.07), lineWidth: 0.5)
+        )
+    }
+
+    private var rowDivider: some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.06))
+            .frame(height: 0.5)
+            .padding(.leading, 60)
+    }
+
+    private func contactRow(
+        icon: String,
+        title: String,
+        subtitle: String,
+        actionTitle: String?,
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundColor(Theme.Palette.accent)
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(Theme.Palette.accent.opacity(0.12)))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 14.5, weight: .medium))
                     .foregroundColor(Theme.Palette.ink)
+                    .lineLimit(1)
 
-                Text("把会议号或邀请链接发给同事，对方打开就能入会")
-                    .font(.system(size: 12))
+                Text(subtitle)
+                    .font(.system(size: 11.5))
                     .foregroundColor(Theme.Palette.ink3)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(1)
+            }
 
+            Spacer(minLength: 8)
+
+            if let actionTitle = actionTitle {
                 Button {
-                    inviteFromContacts()
+                    Haptics.impact(.light)
+                    action()
                 } label: {
-                    Text("邀请参会人")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(Theme.Palette.ink)
-                        .padding(.horizontal, 22)
-                        .frame(height: 44)
-                        .liquidGlass(
-                            .regular,
-                            cornerStyle: .capsule,
-                            isInteractive: true,
-                            castsShadow: false
-                        )
+                    Text(actionTitle)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Theme.Palette.accent)
+                        .padding(.horizontal, 12)
+                        .frame(height: 30)
+                        .background(Capsule().fill(Theme.Palette.accent.opacity(0.12)))
                         .contentShape(Capsule())
                 }
                 .buttonStyle(PlainButtonStyle())
-                .padding(.top, 6)
-                .accessibilityLabel("邀请参会人")
             }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 36)
-            .padding(.horizontal, 20)
-            .liquidGlass(
-                .regular,
-                cornerStyle: .continuous(Theme.Metrics.cardRadius),
-                castsShadow: false
-            )
-            .padding(.top, 20)
         }
+        .padding(.horizontal, 14)
+        .frame(height: 62)
+        .contentShape(Rectangle())
+    }
+
+    private func copyMeetingNumber(_ number: String) {
+        UIPasteboard.general.string = number
+        showToast("会议号已复制", icon: "doc.on.doc.fill", style: .success)
+    }
+
+    private func copyLatestMeetingNumber() {
+        guard let latest = router.history.first else {
+            showToast("请先发起或加入一个会议", icon: "calendar")
+            return
+        }
+        copyMeetingNumber(latest.number)
+    }
+
+    private func copyInviteLink() {
+        guard let latest = router.history.first else {
+            showToast("请先发起或加入一个会议", icon: "calendar")
+            return
+        }
+        let link = "\(TianqiongAPI.origin.absoluteString)/room?no=\(latest.number)"
+        UIPasteboard.general.string = link
+        showToast("邀请链接已复制", icon: "link", style: .success)
     }
 
     // MARK: - Toast
@@ -1403,15 +1513,6 @@ struct HomeView: View {
         Haptics.impact(.medium)
         router.clearHistory()
         showToast("历史记录已清空", icon: "trash", style: .info)
-    }
-
-    private func inviteFromContacts() {
-        guard let latest = router.history.first else {
-            showToast("请先发起或加入一个会议", icon: "calendar")
-            return
-        }
-        UIPasteboard.general.string = latest.number
-        showToast("会议号已复制", icon: "doc.on.doc.fill", style: .success)
     }
 
     // MARK: - 派生
