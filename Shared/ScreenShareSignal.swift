@@ -18,14 +18,14 @@ import Foundation
 enum ScreenShareSignal {
 
     /// 共享状态发生变化（开始 / 暂停 / 恢复 / 结束）。
-    static let stateChanged = "com.example.meetingkit.screenshare.stateChanged"
+    static let stateChanged = "com.tianqiong.meetingkit.screenshare.stateChanged"
 
     /// 扩展写出了一帧新画面，主 App 可以去读文件了。
-    static let frameUpdated = "com.example.meetingkit.screenshare.frameUpdated"
+    static let frameUpdated = "com.tianqiong.meetingkit.screenshare.frameUpdated"
 
     /// 主 App 请求停止共享（方向：主 App → 扩展）。
     /// 主 App 无法直接结束扩展进程，只能发出请求由扩展自己调用 finishBroadcastWithError。
-    static let stopRequested = "com.example.meetingkit.screenshare.stopRequested"
+    static let stopRequested = "com.tianqiong.meetingkit.screenshare.stopRequested"
 }
 
 // MARK: - 共享状态

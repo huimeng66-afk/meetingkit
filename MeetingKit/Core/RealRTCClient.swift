@@ -1269,7 +1269,7 @@ final class ScreenFramePusher {
     /// 与扩展侧的 20fps 对齐：轮询比生产慢就会积压旧帧，比生产快则空转。
     private static let pollInterval: TimeInterval = 1.0 / 20.0
     private static let decodeQueue = DispatchQueue(
-        label: "com.example.meetingkit.screenpush",
+        label: "com.tianqiong.meetingkit.screenpush",
         qos: .userInitiated
     )
 

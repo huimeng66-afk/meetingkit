@@ -22,7 +22,7 @@ struct SharedFrameStore {
 
     /// 序列化写与删除。读操作不加锁（依赖 .atomic 写入的原子性）。
     private static let fileQueue = DispatchQueue(
-        label: "com.example.meetingkit.framestore",
+        label: "com.tianqiong.meetingkit.framestore",
         qos: .userInitiated
     )
 

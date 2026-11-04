@@ -17,7 +17,7 @@ packages:
     exactVersion: 140.0.0
 
 options:
-  bundleIdPrefix: com.example
+  bundleIdPrefix: com.tianqiong
   deploymentTarget:
     iOS: "14.0"
   createIntermediateGroups: true
@@ -59,7 +59,7 @@ targets:
     settings:
       base:
         PRODUCT_NAME: MeetingKit
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.MeetingKit
+        PRODUCT_BUNDLE_IDENTIFIER: com.tianqiong.meetingkit
         INFOPLIST_FILE: MeetingKit/Info.plist
         CODE_SIGN_ENTITLEMENTS: MeetingKit/MeetingKit.entitlements
         # 没有这一行，Assets 里的 AppIcon 不会被真正用上，提审时是"图标缺失"。
@@ -81,7 +81,7 @@ targets:
     settings:
       base:
         PRODUCT_NAME: MeetingBroadcast
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.MeetingKit.Broadcast
+        PRODUCT_BUNDLE_IDENTIFIER: com.tianqiong.meetingkit.Broadcast
         INFOPLIST_FILE: BroadcastExtension/Info.plist
         CODE_SIGN_ENTITLEMENTS: BroadcastExtension/MeetingBroadcast.entitlements
         # 扩展进程禁止调用 application-only 的 API，打开这个开关能让编译器提前拦住误用。

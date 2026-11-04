@@ -49,7 +49,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private static let jpegQuality: CGFloat = 0.7
 
     /// 自定义错误域，主 App 可据此区分"用户主动停止"与系统异常中断。
-    private static let stopErrorDomain = "com.example.meetingkit.broadcast"
+    private static let stopErrorDomain = "com.tianqiong.meetingkit.broadcast"
 
     // MARK: - 属性
 
@@ -59,7 +59,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     /// 编码专用串行队列：缩放、JPEG 编码、落盘全部在这里做，绝不占用采样回调。
     private let encodeQueue = DispatchQueue(
-        label: "com.example.meetingkit.broadcast.encode",
+        label: "com.tianqiong.meetingkit.broadcast.encode",
         qos: .userInitiated
     )
 
