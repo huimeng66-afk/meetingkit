@@ -163,7 +163,7 @@ enum DarwinNotifier {
     static func post(_ name: String) {
         CFNotificationCenterPostNotification(
             CFNotificationCenterGetDarwinNotifyCenter(),
-            name as CFString,
+            CFNotificationName(name as CFString),
             nil,
             nil,
             true
@@ -223,7 +223,7 @@ enum DarwinNotifier {
             CFNotificationCenterRemoveObserver(
                 CFNotificationCenterGetDarwinNotifyCenter(),
                 registryPointer,
-                observation.name as CFString,
+                CFNotificationName(observation.name as CFString),
                 nil
             )
         }
