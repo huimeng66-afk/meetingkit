@@ -356,11 +356,11 @@ struct HomeView: View {
                     .font(.system(size: 34, weight: .light))
                     .foregroundColor(Theme.Palette.ink3)
 
-                Text("通讯录未接入")
+                Text("还没有参会人")
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundColor(Theme.Palette.ink)
 
-                Text("企业通讯录接入后，可以直接勾选同事邀请入会")
+                Text("把会议号或邀请链接发给同事，对方打开就能入会")
                     .font(.system(size: 12))
                     .foregroundColor(Theme.Palette.ink3)
                     .multilineTextAlignment(.center)
