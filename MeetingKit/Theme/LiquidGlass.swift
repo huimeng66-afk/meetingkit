@@ -38,8 +38,15 @@ enum LiquidGlassVariant {
     /// 面积一大就发灰，所以不允许用于整块面板。
     case clear
 
-    /// 着色玻璃：共享中（红）、选中态（蓝）。
+    /// 着色玻璃：共享中（红）。
     case tinted(Color)
+
+    /// 强调玻璃：比 tinted 更实、更亮，用于"当前选中"这类必须一眼看出的元素。
+    ///
+    /// iOS 26 上映射为 `Glass.regular.tint(accent)`，也就是系统所说的
+    /// prominent glass；旧系统用手写玻璃把底色压到 0.55，
+    /// 让白字在蓝底上仍有足够的对比度。
+    case prominent
 }
 
 /// 圆角形态。`continuous` 用连续曲率，与 Theme.Metrics 里的圆角一一对应。
@@ -200,6 +207,10 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
             base = Glass.clear
         case .tinted(let color):
             base = Glass.regular.tint(tintOverride ?? color)
+        case .prominent:
+            // 只做 tint，`.interactive()` 统一由 isInteractive 追加，
+            // 避免同一条 Glass 上叠两次形变修饰。
+            base = Glass.regular.tint(Theme.Palette.accent)
         }
         return isInteractive ? base.interactive() : base
     }
@@ -306,6 +317,10 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
             return colorScheme == .dark ? Color.black.opacity(0.05) : Color.white.opacity(0.26)
         case .tinted(let color):
             return color.opacity(0.32)
+        case .prominent:
+            // 0.55 是白字在深色底上仍能稳定辨认的下限；
+            // 再淡一档，10pt 的 tab 文字压在视频或品牌光斑上就会糊掉。
+            return Theme.Palette.accent.opacity(0.55)
         }
     }
 
@@ -405,6 +420,61 @@ extension View {
                 )
             }
         }
+    }
+
+    /// 强调玻璃（prominent glass）。
+    ///
+    /// 语义只有一条：**这块玻璃代表"当前选中的那个"**。
+    /// iOS 26 上走 `Glass.regular.tint(accent)`，边缘会带系统自己的折射高光；
+    /// 旧系统把底色压到 0.55，保证白字仍然可读。不要拿它做普通卡片，
+    /// 满屏都是强调色时就没有"强调"了。
+    func prominentGlass(
+        cornerStyle: LiquidGlassCornerStyle = .capsule,
+        isInteractive: Bool = true,
+        castsShadow: Bool = true
+    ) -> some View {
+        Group {
+            switch cornerStyle {
+            case .continuous(let radius):
+                liquidGlass(
+                    .prominent,
+                    in: RoundedRectangle(cornerRadius: radius, style: .continuous),
+                    isInteractive: isInteractive,
+                    castsShadow: castsShadow,
+                    compactShadow: false
+                )
+            case .capsule:
+                liquidGlass(
+                    .prominent,
+                    in: Capsule(style: .continuous),
+                    isInteractive: isInteractive,
+                    castsShadow: castsShadow,
+                    compactShadow: true
+                )
+            case .circle:
+                liquidGlass(
+                    .prominent,
+                    in: Circle(),
+                    isInteractive: isInteractive,
+                    castsShadow: castsShadow,
+                    compactShadow: true
+                )
+            }
+        }
+    }
+
+    /// 自定义形状的强调玻璃。
+    func prominentGlass<S: Shape>(
+        in shape: S,
+        isInteractive: Bool = true,
+        castsShadow: Bool = true
+    ) -> some View {
+        liquidGlass(
+            .prominent,
+            in: shape,
+            isInteractive: isInteractive,
+            castsShadow: castsShadow
+        )
     }
 
     /// 内部重载：多一个 `compactShadow`，供上面的 cornerStyle 分发使用。
