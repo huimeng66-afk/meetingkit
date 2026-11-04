@@ -1,0 +1,43 @@
+{
+	"path": "/",
+	"root": "/tmp/tqsign.h7OL6B/src/Payload/MeetingKit.app",
+	"bundle_id": "com.tianqiong.meetingkit",
+	"bundle_version": "1",
+	"bundle_executable": "MeetingKit",
+	"sha1": "e/d+vgErYzJUcvfZx2BbXg/HSRg=",
+	"sha256": "2yH+uwXjbZkoRZlbzDhKlMRXSevqVueAE5nIJ9rGQkw=",
+	"name": "天穹会议",
+	"folders": [
+		{
+			"bundle_id": "com.tianqiong.meetingkit.Broadcast",
+			"bundle_version": "1",
+			"bundle_executable": "MeetingBroadcast",
+			"sha1": "ByEU7yVVMJ78ITCPdrrHQSze8nc=",
+			"sha256": "1BEihxOi2Ej4SSojTcjYaJI0IKDfCXnrbnPNfzuCRIQ=",
+			"path": "PlugIns/MeetingBroadcast.appex"
+		},
+		{
+			"bundle_id": "org.webrtc.WebRTC",
+			"bundle_version": "1.0",
+			"bundle_executable": "WebRTC",
+			"sha1": "kquyp9YesV2ZvSKf8eAKGgJCUGU=",
+			"sha256": "HFMEQXzJxgzAAuCTtwYRx4a9g8Ka4gendn4wHo4coR0=",
+			"path": "Frameworks/WebRTC.framework"
+		}
+	],
+	"files": [
+		"PlugIns/MeetingBroadcast.appex/MeetingBroadcast",
+		"MeetingKit",
+		"Frameworks/WebRTC.framework/WebRTC"
+	],
+	"changed": [
+		"PlugIns/MeetingBroadcast.appex/MeetingBroadcast",
+		"MeetingKit",
+		"Frameworks/WebRTC.framework/WebRTC",
+		"PlugIns/MeetingBroadcast.appex/_CodeSignature/CodeResources",
+		"PlugIns/MeetingBroadcast.appex/MeetingBroadcast",
+		"Frameworks/WebRTC.framework/_CodeSignature/CodeResources",
+		"Frameworks/WebRTC.framework/WebRTC",
+		"embedded.mobileprovision"
+	]
+}
