@@ -148,6 +148,26 @@ final class PeerSession: NSObject {
         sender.setTrack(track)
     }
 
+    /// 调整上行视频编码参数。屏幕共享是"文字优先"，需要比摄像头更高的码率上限，
+    /// 否则 1080p 画面会被 WebRTC 按摄像头模型压到 1~2Mbps，文字边缘发糊。
+    func setVideoEncoding(maxBitrateBps: Int?, maxFramerate: Int?, keepResolution: Bool = false) {
+        guard
+            let sender = peerConnection.senders.first(where: { $0.track?.kind == "video" }),
+            let params = sender.parameters
+        else { return }
+        for encoding in params.encodings {
+            if let bps = maxBitrateBps {
+                encoding.maxBitrateBps = NSNumber(value: bps)
+            }
+            if let fps = maxFramerate {
+                encoding.maxFramerate = NSNumber(value: fps)
+            }
+        }
+        // 共享文档时宁可掉帧也不降分辨率，否则 1080p 会被降成 720p 再放大，文字糊成一片。
+        params.degradationPreference = keepResolution ? .maintainResolution : .balanced
+        sender.parameters = params
+    }
+
     private func ensureSender(for track: RTCMediaStreamTrack, streamID: String) {
         // 同一 track 只挂一个 sender，重复 attach 不产生第二个上行流。
         if peerConnection.senders.contains(where: { $0.track?.trackId == track.trackId }) {
@@ -258,7 +278,11 @@ final class PeerSession: NSObject {
             return existing
         }
         let view = RTCMTLVideoView(frame: .zero)
-        view.videoContentMode = .aspectFit
+        // 等比显示：画面完整不裁切，比例不一致时两侧/上下留黑边（与网页端一致）。
+        // RTCMTLVideoView 的 videoContentMode 是 RTCVideoContentMode，取值 .scaleAspectFit / .scaleAspectFill。
+        view.videoContentMode = .scaleAspectFit
+        view.backgroundColor = .black
+        view.clipsToBounds = true
         remoteVideoView = view
         return view
     }

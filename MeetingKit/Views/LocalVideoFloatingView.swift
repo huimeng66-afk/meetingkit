@@ -163,6 +163,7 @@ struct LocalVideoFloatingView: View {
 
     private var preview: some View {
         ZStack {
+            Color.black
             // 真实链路：本地摄像头预览（RTCCameraPreviewView）。
             if let localView = viewModel.localPreviewView {
                 RemoteVideoViewRepresentable(view: localView)

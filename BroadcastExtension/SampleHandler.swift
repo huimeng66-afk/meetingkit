@@ -7,7 +7,7 @@
 //  ── 跨进程时序（全链路）────────────────────────────────────────────────
 //   1. 主 App 内点击 RPSystemBroadcastPickerView → 系统拉起本扩展（独立进程）
 //   2. 系统回调 broadcastStarted → 写 ScreenShareStore(.active) → post stateChanged
-//   3. 系统高频回调 processSampleBuffer → 节流到 4fps → 缩放 ≤800px 宽 → JPEG(0.5)
+//   3. 系统高频回调 processSampleBuffer → 节流到 20fps → 短边缩到 1080 → JPEG(0.7)
 //      → 写入 App Group 容器 → post frameUpdated
 //      注：无论这一帧是否被节流/编码重入丢弃，只要收到 .video 就按 2 秒一次刷新
 //      ScreenShareStore.heartbeat —— 主 App 靠心跳判活，不靠"有没有新帧"（H-1）
@@ -18,7 +18,7 @@
 //  ── 内存红线 ─────────────────────────────────────────────────────────
 //  广播扩展进程的常驻内存上限约 50MB，超限被系统 jetsam 杀掉时用户只会看到
 //  "共享中断"，没有任何日志。因此：CIContext 必须复用、每帧处理必须包
-//  autoreleasepool、输出图必须缩到 800px 宽、绝不缓存多帧。
+//  autoreleasepool、输出图短边控制在 1080、绝不缓存多帧。
 //
 
 import UIKit
@@ -31,20 +31,22 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     // MARK: - 常量
 
-    /// 目标 4fps。屏幕共享以"看清内容"为目标，4fps 足够；更高帧率只会挤占 RTC 的上行带宽。
-    private static let frameInterval: CFTimeInterval = 0.25
+    /// 目标 20fps。共享的是文档、代码、演示稿：20fps 滚动已跟手，
+    /// 再往上 JPEG 编码与跨进程落盘会先成为瓶颈（1080p 每帧约 250~320KB）。
+    private static let frameInterval: CFTimeInterval = 1.0 / 20.0
 
     /// 心跳最小写入间隔。UserDefaults 每次写入都要经 cfprefsd 做跨进程同步，
     /// 按采样频率（60Hz）写会把扩展的 CPU 与内存拖到 jetsam 边缘；
     /// 主 App 的心跳超时是 12 秒，2 秒一次留了 6 次容错，足够判活。
     private static let heartbeatInterval: CFTimeInterval = 2
 
-    /// 输出最大边长。短边超过这个值的帧按比例缩到短边 = 800：
-    /// 横屏（手机横放）宽 800，竖屏高 800，保证任何方向下主 App 的 720p 画布都不留大片黑边。
-    private static let maxPixelEdge: CGFloat = 800
+    /// 输出短边上限。短边缩到 1080 即等价 1080p：
+    /// 横屏（手机横放）输出 1920×1080，竖屏输出 1080×1920，文字边缘不再糊成一团。
+    private static let maxPixelEdge: CGFloat = 1080
 
-    /// 0.5 是清晰度与体积的经验平衡点：800px 宽下约 40~80KB。
-    private static let jpegQuality: CGFloat = 0.5
+    /// 0.7 是 1080p 下清晰度与体积的平衡点：文档类画面约 180~320KB/帧。
+    /// 再高（0.85+）体积接近翻倍，跨进程写入先成为瓶颈，观感提升却很有限。
+    private static let jpegQuality: CGFloat = 0.7
 
     /// 自定义错误域，主 App 可据此区分"用户主动停止"与系统异常中断。
     private static let stopErrorDomain = "com.example.meetingkit.broadcast"

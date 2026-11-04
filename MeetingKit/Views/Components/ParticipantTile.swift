@@ -63,12 +63,16 @@ struct ParticipantTile: View {
     @ViewBuilder
     private var videoLayer: some View {
         if let videoView = videoView {
-            // 本机前置摄像头画面镜像，符合"照镜子"直觉。
-            RemoteVideoViewRepresentable(view: videoView)
-                .rotation3DEffect(
-                    .degrees(user.isLocal ? 180 : 0),
-                    axis: (x: 0, y: 1, z: 0)
-                )
+            // 黑底 + 等比：竖屏画面放进横向格子时两侧是纯黑，而不是把画面裁掉。
+            ZStack {
+                Color.black
+                // 本机前置摄像头画面镜像，符合"照镜子"直觉。
+                RemoteVideoViewRepresentable(view: videoView)
+                    .rotation3DEffect(
+                        .degrees(user.isLocal ? 180 : 0),
+                        axis: (x: 0, y: 1, z: 0)
+                    )
+            }
         } else {
             UserVideoBackdrop(user: user)
         }

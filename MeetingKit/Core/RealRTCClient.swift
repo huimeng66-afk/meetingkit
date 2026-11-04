@@ -338,6 +338,11 @@ final class RealRTCClient: NSObject, RTCClient {
         }
         let view = RTCCameraPreviewView(frame: .zero)
         view.captureSession = capturer.captureSession
+        // 本地预览与远端保持一致：等比显示，比例不合时留黑边，不裁切画面。
+        // RTCCameraPreviewView 的 videoContentMode 是 AVLayerVideoGravity，对应 .resizeAspect。
+        view.videoContentMode = .resizeAspect
+        view.backgroundColor = .black
+        view.clipsToBounds = true
         previewView = view
         return view
     }
@@ -367,6 +372,8 @@ final class RealRTCClient: NSObject, RTCClient {
         // 用共享轨替换每条连接的 video sender（Web 端同款 replaceTrack）。
         for peer in remotePeers.values {
             peer.session.replaceVideoTrack(with: track)
+            // 1080p 共享按 4Mbps / 20fps 给足码率，与 Web 端 screen 档位（1080P/4Mbps）对齐。
+            peer.session.setVideoEncoding(maxBitrateBps: 4_000_000, maxFramerate: 20, keepResolution: true)
         }
 
         let pusher = ScreenFramePusher(source: source)
@@ -383,6 +390,8 @@ final class RealRTCClient: NSObject, RTCClient {
         let back = localVideoTrack
         for peer in remotePeers.values {
             peer.session.replaceVideoTrack(with: back)
+            // 恢复摄像头档位：2.5Mbps / 30fps，把上行让回给实时画面。
+            peer.session.setVideoEncoding(maxBitrateBps: 2_500_000, maxFramerate: 30)
         }
         syncTeardownBox()
     }
@@ -399,6 +408,7 @@ final class RealRTCClient: NSObject, RTCClient {
         let back = localVideoTrack
         for peer in remotePeers.values {
             peer.session.replaceVideoTrack(with: back)
+            peer.session.setVideoEncoding(maxBitrateBps: 2_500_000, maxFramerate: 30)
         }
         signaling?.sendMediaState(audio: nil, video: nil, screen: false)
         delegate?.rtcDidScreenShareRejected(reason: reason)
@@ -582,7 +592,7 @@ final class RealRTCClient: NSObject, RTCClient {
 
         // 共享源（帧由 SharedFrameStore 推送）。
         let screenSource = factory.videoSource()
-        screenSource.adaptOutputFormat(toWidth: 1280, height: 720, fps: 8)
+        screenSource.adaptOutputFormat(toWidth: 1920, height: 1080, fps: 20)
         let screenTrack = factory.videoTrack(with: screenSource, trackId: "screen-\(UUID().uuidString)")
         screenTrack.isEnabled = true
         localScreenSource = screenSource
@@ -1234,7 +1244,7 @@ final class RealRTCTeardownBox: @unchecked Sendable {
 // MARK: - 屏幕帧推送
 
 /// 把 Broadcast 扩展写入 App Group 的 JPEG 帧推给 WebRTC screen source。
-/// 2~4fps 的共享帧率下，解码在专用后台队列，绝不碰主线程。
+/// 20fps / 1080p 的共享帧率下，解码在专用后台队列，绝不碰主线程。
 final class ScreenFramePusher {
 
     private let source: RTCVideoSource
@@ -1243,11 +1253,12 @@ final class ScreenFramePusher {
     /// isRunning 主线程写、decodeQueue 读：用锁保护，避免 stop 后仍在解码的帧再推一帧。
     private let stateLock = NSLock()
     private var running = false
-    /// 当前输出画布方向：true = 横屏 1280x720，false = 竖屏 720x1280。
+    /// 当前输出画布方向：true = 横屏 1920x1080，false = 竖屏 1080x1920。
     /// 只在 decodeQueue 上读写。
     private var canvasLandscape = true
 
-    private static let pollInterval: TimeInterval = 0.4
+    /// 与扩展侧的 20fps 对齐：轮询比生产慢就会积压旧帧，比生产快则空转。
+    private static let pollInterval: TimeInterval = 1.0 / 20.0
     private static let decodeQueue = DispatchQueue(
         label: "com.example.meetingkit.screenpush",
         qos: .userInitiated
@@ -1297,15 +1308,15 @@ final class ScreenFramePusher {
 
         Self.decodeQueue.async { [weak self] in
             guard let self = self, self.isRunning else { return }
-            // 按图片宽高比选择画布方向：竖屏共享用 720x1280，
-            // 避免把竖屏画面硬塞进 1280x720 留出大面积黑边（远端看不清文字）。
+            // 按图片宽高比选择画布方向：竖屏共享用 1080x1920，
+            // 避免把竖屏画面硬塞进 1920x1080 留出大面积黑边（远端看不清文字）。
             guard let result = Self.jpegToPixelBuffer(jpeg) else { return }
             let landscape = result.width >= result.height
             if landscape != self.canvasLandscape {
                 self.canvasLandscape = landscape
-                let w = landscape ? 1280 : 720
-                let h = landscape ? 720 : 1280
-                self.source.adaptOutputFormat(toWidth: Int32(w), height: Int32(h), fps: 8)
+                let w = landscape ? 1920 : 1080
+                let h = landscape ? 1080 : 1920
+                self.source.adaptOutputFormat(toWidth: Int32(w), height: Int32(h), fps: 20)
             }
             // 单调时钟（系统校时/休眠不影响帧时间戳连续性）。
             let timestamp = Int64(CACurrentMediaTime() * 1_000_000_000)
@@ -1325,8 +1336,8 @@ final class ScreenFramePusher {
         else { return nil }
 
         let landscape = image.width >= image.height
-        let width = landscape ? 1280 : 720
-        let height = landscape ? 720 : 1280
+        let width = landscape ? 1920 : 1080
+        let height = landscape ? 1080 : 1920
 
         var pixelBuffer: CVPixelBuffer?
         let attributes: [String: Any] = [
