@@ -64,6 +64,9 @@ struct VideoCanvasView: View {
                         }
                 }
             }
+            // 只在"是否共享"变化时给子树加动画事务，其它更新（参会者进出、说话人切换）
+            // 不受影响——`.animation(_:value:)` 的语义就是"value 变化才起动画"。
+            .animationCompat(Theme.Motion.standard, value: isSharingActive)
         }
     }
 

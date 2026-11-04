@@ -500,6 +500,9 @@ struct HomeView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("一个会议号，")
                     .foregroundColor(Theme.Palette.ink)
+                    // kerning 必须挂在 Text 上：View 版本的 kerning 是 iOS 16 才有的，
+                    // 挂在 VStack 上会在 iOS 15 的部署目标下直接编译失败。
+                    .kerning(-0.3)
 
                 // 第二行用实色强调，不做渐变。
                 //
@@ -507,9 +510,9 @@ struct HomeView: View {
                 // 显得热闹，而且在小字号下会让笔画发灰。苹果自己的大标题从来是单色。
                 Text("把会开在屏幕里。")
                     .foregroundColor(Theme.Palette.accent)
+                    .kerning(-0.3)
             }
             .font(.system(size: 28, weight: .semibold))
-            .kerning(-0.3)
             .lineLimit(1)
             .minimumScaleFactor(0.8)
 
@@ -591,9 +594,11 @@ struct HomeView: View {
 
             TextField("会议号", text: $meetingNumber)
                 .keyboardType(.numberPad)
-                .font(.system(size: 18, weight: .medium, design: .rounded))
+                // TextField 只有 View 版本的 kerning（iOS 16+），
+                // 会议号的字距交给 rounded + monospacedDigit 的等宽字形，
+                // 不用为了 1.2pt 的间距把部署目标抬上去。
+                .font(.system(size: 18, weight: .medium, design: .rounded).monospacedDigit())
                 .foregroundColor(Theme.Palette.ink)
-                .kerning(1.2)
                 // 会议号只可能是数字：输入法粘贴进来的连字符、空格直接剔掉，
                 // 长度按 9 位截断（服务端最多 9 位，留一位余量比截断成 7 位更安全）。
                 .onChange(of: meetingNumber) { value in
