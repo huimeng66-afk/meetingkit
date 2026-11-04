@@ -500,8 +500,7 @@ struct HomeView: View {
         }
 
         let name = router.profile.displayName
-        APIClient.createMeeting(title: "\(name)的会议", instant: true) { [weak self] result in
-            guard let self = self else { return }
+        APIClient.createMeeting(title: "\(name)的会议", instant: true) { result in
             switch result {
             case .success(let meeting):
                 self.router.openPreJoin(

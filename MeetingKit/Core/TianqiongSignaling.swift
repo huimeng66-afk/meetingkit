@@ -22,6 +22,13 @@
 //
 
 import Foundation
+
+/// 信令层的失败原因。
+/// Result 的 Failure 必须实现 Error；直接用 String 会报
+/// "type 'String' does not conform to protocol 'Error'"。
+struct SignalingFailure: Error {
+    let message: String
+}
 import SocketIO
 
 // MARK: - 连接配置
@@ -130,8 +137,9 @@ final class TianqiongSignaling {
             .log(false),
         ]
         if !token.isEmpty {
-            // 服务端 realtime.js 只读 handshake.auth.token
-            config.insert(.auth(["token": token]))
+            // Socket.IO-Client-Swift 16 没有 .auth 配置项（auth 是协议 v5 的能力，
+            // 这个库还没暴露），只能走 query 参数；服务端已兼容 handshake.query.token。
+            config.insert(.connectParams(["token": token]))
         }
 
         let manager = SocketManager(
@@ -239,20 +247,20 @@ final class TianqiongSignaling {
 
     func sendChat(
         content: String,
-        completion: @escaping (Result<Int, String>) -> Void
+        completion: @escaping (Result<Int, SignalingFailure>) -> Void
     ) {
         socket?.emitWithAck("chat:send", ["content": content]).timingOut(after: 8) { [weak self] raw in
             let dict = raw.first as? [String: Any]
             Task { @MainActor in
                 guard let self = self else { return }
                 guard let dict = dict else {
-                    completion(.failure("发送超时，请重试"))
+                    completion(.failure(SignalingFailure(message: "发送超时，请重试")))
                     return
                 }
                 if dict["ok"] as? Bool == true {
                     completion(.success(dict["id"] as? Int ?? 0))
                 } else {
-                    completion(.failure(dict["error"] as? String ?? "发送失败"))
+                    completion(.failure(SignalingFailure(message: dict["error"] as? String ?? "发送失败")))
                 }
             }
         }

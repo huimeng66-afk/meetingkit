@@ -250,8 +250,8 @@ final class RealRTCClient: NSObject, RTCClient {
         localVideoTrack = nil
         localScreenTrack = nil
         localScreenSource = nil
-        // 释放后音视频设备指示灯应立即熄灭。
-        RTCAudioSession.sharedInstance().isActive = false
+        // 释放后音视频设备指示灯应立即熄灭。isActive 是只读属性，关闭要走 setActive。
+        try? RTCAudioSession.sharedInstance().setActive(false)
     }
 
     /// 把当前需要清理的对象同步给 nonisolated 盒子，供 deinit 兜底。
@@ -338,9 +338,8 @@ final class RealRTCClient: NSObject, RTCClient {
         }
         let view = RTCCameraPreviewView(frame: .zero)
         view.captureSession = capturer.captureSession
-        // 本地预览与远端保持一致：等比显示，比例不合时留黑边，不裁切画面。
-        // RTCCameraPreviewView 的 videoContentMode 是 AVLayerVideoGravity，对应 .resizeAspect。
-        view.videoContentMode = .resizeAspect
+        // 注意：M140 的 RTCCameraPreviewView 没有 videoContentMode 属性，
+        // 预览比例由外层容器决定；这里只把底色压黑，保证比例不符时露出的底是黑的。
         view.backgroundColor = .black
         view.clipsToBounds = true
         previewView = view
@@ -426,13 +425,13 @@ final class RealRTCClient: NSObject, RTCClient {
             case .success(let id):
                 // 自己发的消息：服务端会广播 chat:new，本地不用重复上屏。
                 self.consumedMessageIDs.insert(String(id))
-            case .failure(let message):
+            case .failure(let failure):
                 self.delegate?.rtcDidReceiveMessage(
                     ChatMessage(
                         id: "send-fail-\(UUID().uuidString)",
                         senderID: self.selfPeerID,
                         senderName: "我",
-                        text: message,
+                        text: failure.message,
                         kind: .system
                     )
                 )
@@ -502,24 +501,21 @@ final class RealRTCClient: NSObject, RTCClient {
                 }
             }
 
-            // 用一个临时观察者等首个 connect / error 事件。
-            // 简单起见：轮询 isConnected + 超时。
-            let deadline = Date().addingTimeInterval(timeout)
-            func poll() {
-                if signaling.isConnected {
-                    settle(.success(()))
-                    return
+            // TianqiongSignaling 整体隔离在 @MainActor：连接动作与 isConnected 的读取
+            // 都必须回到主线程，否则会报 "main actor-isolated property can not be
+            // referenced from a nonisolated context"。
+            Task { @MainActor in
+                signaling.connect()
+                let deadline = Date().addingTimeInterval(timeout)
+                while !signaling.isConnected {
+                    if Date() > deadline {
+                        settle(.failure(RTCJoinError(message: "连接超时", code: "SOCKET_TIMEOUT")))
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 200_000_000)
                 }
-                if Date() > deadline {
-                    settle(.failure(RTCJoinError(message: "连接超时", code: "SOCKET_TIMEOUT")))
-                    return
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    Task { @MainActor in poll() }
-                }
+                settle(.success(()))
             }
-            signaling.connect()
-            poll()
         }
     }
 
@@ -1264,8 +1260,13 @@ final class ScreenFramePusher {
         qos: .userInitiated
     )
 
+    /// RTCVideoSource.capturer(_:didCapture:) 的第一个参数是非空的 RTCVideoCapturer，
+    /// 这里挂一个只用于转发的采集器实例（真正推帧走 didCapture，不经过它的采集回调）。
+    private let frameCapturer: RTCVideoCapturer
+
     init(source: RTCVideoSource) {
         self.source = source
+        self.frameCapturer = RTCVideoCapturer(delegate: source)
     }
 
     private var isRunning: Bool {
@@ -1324,7 +1325,7 @@ final class ScreenFramePusher {
             let frame = RTCVideoFrame(buffer: buffer, rotation: ._0, timeStampNs: timestamp)
             // 解码完成后再确认一次运行态，杜绝 stop 后最后一帧串台。
             guard self.isRunning else { return }
-            self.source.capturer(nil, didCapture: frame)
+            self.source.capturer(self.frameCapturer, didCapture: frame)
         }
     }
 

@@ -145,16 +145,17 @@ final class PeerSession: NSObject {
         guard let sender = peerConnection.senders.first(where: { $0.track?.kind == "video" }) else {
             return
         }
-        sender.setTrack(track)
+        sender.track = track
     }
 
     /// 调整上行视频编码参数。屏幕共享是"文字优先"，需要比摄像头更高的码率上限，
     /// 否则 1080p 画面会被 WebRTC 按摄像头模型压到 1~2Mbps，文字边缘发糊。
     func setVideoEncoding(maxBitrateBps: Int?, maxFramerate: Int?, keepResolution: Bool = false) {
-        guard
-            let sender = peerConnection.senders.first(where: { $0.track?.kind == "video" }),
-            let params = sender.parameters
-        else { return }
+        guard let sender = peerConnection.senders.first(where: { $0.track?.kind == "video" }) else {
+            return
+        }
+        // RTCRtpSender.parameters 是非可选属性（M140 起），不能做可选绑定。
+        let params = sender.parameters
         for encoding in params.encodings {
             if let bps = maxBitrateBps {
                 encoding.maxBitrateBps = NSNumber(value: bps)

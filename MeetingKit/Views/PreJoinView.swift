@@ -471,8 +471,7 @@ struct PreJoinView: View {
         isJoining = true
         let no = digits
 
-        APIClient.fetchMeetingInfo(no: no) { [weak self] result in
-            guard let self = self else { return }
+        APIClient.fetchMeetingInfo(no: no) { result in
             self.isJoining = false
 
             switch result {
@@ -538,8 +537,7 @@ struct PreJoinView: View {
 
         isJoining = true
         let name = trimmedName.isEmpty ? router.profile.displayName : trimmedName
-        APIClient.createMeeting(title: "\(name)的会议", instant: true) { [weak self] result in
-            guard let self = self else { return }
+        APIClient.createMeeting(title: "\(name)的会议", instant: true) { result in
             self.isJoining = false
 
             switch result {

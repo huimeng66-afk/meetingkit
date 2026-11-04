@@ -228,7 +228,8 @@ struct GlassSheet<Content: View>: View {
     /// 面板顶部至少留出的高度。
     /// 拖拽条本体只有 4pt，但它的可点区域是整条 36pt 的 dragStrip；再算上圆角与顶部高光，
     /// 留 96pt 才能保证"键盘弹起后拖拽条还看得见、点得到"，遮罩也露出够大一块给点击关闭。
-    private static let minimumTopMargin: CGFloat = 96
+    /// 泛型类型不支持 static 存储属性，这里用实例计算属性等价表达。
+    private var minimumTopMargin: CGFloat { 96 }
 
     /// 面板总高（含底部安全区补偿）。
     ///
@@ -254,7 +255,7 @@ struct GlassSheet<Content: View>: View {
     /// - Returns: 面板总高，已包含底部安全区补偿，可直接喂给 `.frame(height:)`。
     private func panelHeight(containerHeight: CGFloat) -> CGFloat {
         let detentHeight = containerHeight * currentDetent.heightRatio
-        let maxVisibleHeight = containerHeight - keyboardHeight - Self.minimumTopMargin
+        let maxVisibleHeight = containerHeight - keyboardHeight - minimumTopMargin
         // min 保证顶边不被推出屏幕；max(0,...) 兜住"键盘比可用高度还高"的极端情况
         // （iPad 分屏 + 外接键盘），此时面板退化成只剩底部一个薄片，但不会翻负。
         let visibleHeight = max(0, min(detentHeight, maxVisibleHeight))
