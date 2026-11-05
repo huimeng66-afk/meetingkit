@@ -32,6 +32,7 @@ struct SharePickerPanel: View {
             if isSystemShareAvailable {
                 sourceCards
                 infoCard
+                diagnosticsCard
             } else {
                 // 不可用时不再摆两张点不动的来源卡：
                 // 用户点"共享屏幕"是来解决问题的，不是来看一个灰掉的界面。
@@ -97,7 +98,7 @@ struct SharePickerPanel: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: Theme.Metrics.cardRadius, style: .continuous)
-                .fill(Color.white.opacity(0.05))
+                .fill(Theme.Palette.surfaceSubtle)
         )
         .padding(.horizontal, Theme.Metrics.horizontal)
         .padding(.top, Theme.Metrics.space3)
@@ -233,10 +234,71 @@ struct SharePickerPanel: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: Theme.Metrics.cardRadius, style: .continuous)
-                .fill(Color.white.opacity(0.05))
+                .fill(Theme.Palette.surfaceSubtle)
         )
         .padding(.horizontal, Theme.Metrics.horizontal)
         .padding(.top, Theme.Metrics.space3)
+    }
+
+    // MARK: - 共享诊断
+
+    /// 一条链路四段的计数（出帧 / 落盘 / 读帧 / 推 RTC）。
+    ///
+    /// 做成常驻的小卡片而不是隐藏入口：这个 App 的共享失败在用户侧永远只有
+    /// "对方看不见"一个现象，没有分阶段计数就只能靠猜。展开一次、截个图，
+    /// 就能定位断在哪一段。
+    private var diagnosticsCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: SymbolCompat.name("waveform.path.ecg", "waveform.path"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Theme.Palette.ink3)
+
+                Text("共享诊断")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Theme.Palette.textSecondary)
+
+                Spacer(minLength: 0)
+
+                Button {
+                    UIPasteboard.general.string = viewModel.shareDiagnosticsReport
+                    Haptics.impact(.light)
+                    viewModel.showToast(
+                        ToastMessage(
+                            text: "诊断信息已复制",
+                            systemImage: "doc.on.doc.fill",
+                            style: .success
+                        )
+                    )
+                } label: {
+                    Text("复制")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Theme.Palette.accent)
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+
+            Text(viewModel.shareDiagnosticsReport)
+                .font(.system(size: 10.5, design: .monospaced))
+                .foregroundColor(Theme.Palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let failure = viewModel.shareFailure, !failure.isEmpty {
+                Text(failure)
+                    .font(Theme.Typography.caption)
+                    .foregroundColor(Theme.Palette.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(Theme.Metrics.space3)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Metrics.cardRadius, style: .continuous)
+                .fill(Theme.Palette.surfaceSubtle)
+        )
+        .padding(.horizontal, Theme.Metrics.horizontal)
+        .padding(.top, Theme.Metrics.space2)
     }
 
     private func stepRow(index: Int, text: String) -> some View {
@@ -255,7 +317,6 @@ struct SharePickerPanel: View {
             Spacer(minLength: 0)
         }
     }
-
     // MARK: - 主按钮
 
     @ViewBuilder

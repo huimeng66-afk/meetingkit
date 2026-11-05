@@ -201,7 +201,10 @@ final class AppSettings: ObservableObject {
         /// 默认不自动静音：普通参会者进会就想说话，莫名静音会让人以为麦克风坏了。
         static let autoMuteOnJoin = false
 
-        static let shareQuality: ShareQuality = .balanced
+        /// 默认清晰：这个 App 的共享场景是文档、代码、表格，
+        /// 720p 下 12pt 的正文在网页端放大后完全糊掉——用户第一句反馈就是"很糊"。
+        /// 流畅档保留给弱网用户手动切换。
+        static let shareQuality: ShareQuality = .sharp
 
         static let autoHideControlsDuringShare = true
 
@@ -229,6 +232,6 @@ final class AppSettings: ObservableObject {
     /// 这里绝不能强解包：偏好数据不是可信输入，读坏了也不能让 App 启动即崩。
     private static func readShareQuality() -> ShareQuality {
         let raw = UserDefaults.standard.string(forKey: Keys.shareQuality) ?? ""
-        return ShareQuality(rawValue: raw) ?? .balanced
+        return ShareQuality(rawValue: raw) ?? .sharp
     }
 }

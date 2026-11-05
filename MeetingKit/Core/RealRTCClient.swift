@@ -130,12 +130,7 @@ final class RealRTCClient: NSObject, RTCClient {
         let servers: [RTCIceServer]
         do {
             let configs = try await Self.fetchIceServersAsync()
-            servers = configs.map { config in
-                if let username = config.username, let credential = config.credential {
-                    return RTCIceServer(urlStrings: config.urls, username: username, credential: credential)
-                }
-                return RTCIceServer(urlStrings: config.urls)
-            }
+            servers = configs.map(Self.makeIceServer)
         } catch {
             // ICE 拉取失败不致命：继续用空列表，直连仍然可能成功。
             // 但把原因记下来，方便排障。
@@ -531,6 +526,15 @@ final class RealRTCClient: NSObject, RTCClient {
         }
     }
 
+    /// 服务端下发的 ICE 配置 → WebRTC 的 RTCIceServer。
+    /// 有 username/credential 才是 TURN，只给 urls 的是 STUN。
+    private static func makeIceServer(_ config: IceServerConfig) -> RTCIceServer {
+        if let username = config.username, let credential = config.credential {
+            return RTCIceServer(urlStrings: config.urls, username: username, credential: credential)
+        }
+        return RTCIceServer(urlStrings: config.urls)
+    }
+
     private func connectSignaling(_ signaling: TianqiongSignaling, timeout: TimeInterval) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             var settled = false
@@ -599,13 +603,18 @@ final class RealRTCClient: NSObject, RTCClient {
         // 自己看到的是一句"需要麦克风权限"。授权这件事应该发生在门外，不是会议里。
         //
         // 被拒绝不阻断入会：可以只听不说，会中再点开麦时系统会引导去设置。
-        _ = await Self.requestMicPermission()
+        let micGranted = await Self.requestMicPermission()
 
         // 麦克风（48kHz 由 WebRTC 内部音频单元保证）。
         let audioSource = factory.audioSource(with: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
         let audioTrack = factory.audioTrack(with: audioSource, trackId: "audio-\(UUID().uuidString)")
-        audioTrack.isEnabled = audioOn
+        // 权限被拒就不能让轨道保持 enabled：那会让界面显示"麦克风已开"、
+        // 对方却完全听不到，是比"开麦失败"更难自查的一种状态。
+        audioTrack.isEnabled = audioOn && micGranted
         localAudioTrack = audioTrack
+        if audioOn && !micGranted {
+            delegate?.rtcDidUpdateLocalMic(false)
+        }
 
         // 摄像头（前置，720p@30）。
         //
@@ -1078,6 +1087,23 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         let hadPeers = !remotePeers.isEmpty
         updateConnectionState(.reconnecting)
 
+        // TURN 的临时凭证只有 2 小时。长会里断一次网，如果继续拿入会那一刻的
+        // 旧凭证去重建 PeerConnection，ICE 会一直停在 checking——用户看到的
+        // 就是"一直在重连、始终连不上"。这里先换新凭证再入会。
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            if let configs = try? await Self.fetchIceServersAsync() {
+                self.iceServers = configs.map(Self.makeIceServer)
+            }
+            self.rejoinAfterReconnect(signaling, options: options, hadPeers: hadPeers)
+        }
+    }
+
+    private func rejoinAfterReconnect(
+        _ signaling: TianqiongSignaling,
+        options: JoinOptions,
+        hadPeers: Bool
+    ) {
         signaling.join(
             no: options.no,
             name: options.name,
@@ -1427,6 +1453,8 @@ final class ScreenFramePusher {
     /// isRunning 主线程写、decodeQueue 读：用锁保护，避免 stop 后仍在解码的帧再推一帧。
     private let stateLock = NSLock()
     private var running = false
+    /// 一帧正在解码。用来丢弃"来不赢处理"的采样，避免串行队列无限堆积。
+    private var decoding = false
     /// 当前输出画布方向：true = 横屏 1920x1080，false = 竖屏 1080x1920。
     /// 只在 decodeQueue 上读写。
     private var canvasLandscape = true
@@ -1481,12 +1509,28 @@ final class ScreenFramePusher {
 
     private func tick() {
         guard isRunning else { return }
+
+        // 关键：上一帧还没解码完就丢掉这一拍。
+        //
+        // 之前是每 1/24 秒无条件排一个 decode 任务进串行队列。单帧
+        // （1080p JPEG → 1080p BGRA + CGContext 绘制）在主线程之外大约 30~60ms，
+        // 也就是说生产速度永远快于消费速度，队列会**无限堆积**：
+        // 内存一路涨、画面延迟一路涨，几分钟后就是"很卡、越用越卡"，
+        // 严重时直接被 jetsam 杀掉（表现为共享突然中断）。
+        //
+        // 共享画面要的是"近实时"，不是"每帧都不丢"。宁可丢帧，
+        // 也不能让队列里躺着几百毫秒前的旧画面。
+        guard !isDecoding else { return }
+
         // readIfNewer 在文件级判断，轻量，可以主线程做；
         // 解码与帧构造丢到后台队列。
         guard let jpeg = SharedFrameStore.readIfNewer(than: &lastFrameDate) else { return }
 
+        beginDecoding()
         Self.decodeQueue.async { [weak self] in
-            guard let self = self, self.isRunning else { return }
+            guard let self = self else { return }
+            defer { self.endDecoding() }
+            guard self.isRunning else { return }
             // 按图片宽高比选择画布方向：竖屏共享用 1080x1920，
             // 避免把竖屏画面硬塞进 1920x1080 留出大面积黑边（远端看不清文字）。
             guard let result = Self.jpegToPixelBuffer(jpeg) else { return }
@@ -1508,7 +1552,26 @@ final class ScreenFramePusher {
             // 解码完成后再确认一次运行态，杜绝 stop 后最后一帧串台。
             guard self.isRunning else { return }
             self.source.capturer(self.frameCapturer, didCapture: frame)
+            ScreenShareRuntime.noteFramePushed()
         }
+    }
+
+    private var isDecoding: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return decoding
+    }
+
+    private func beginDecoding() {
+        stateLock.lock()
+        decoding = true
+        stateLock.unlock()
+    }
+
+    private func endDecoding() {
+        stateLock.lock()
+        decoding = false
+        stateLock.unlock()
     }
 
     /// JPEG → BGRA CVPixelBuffer（等比缩放，留黑边）。画布方向按图片宽高比选择。

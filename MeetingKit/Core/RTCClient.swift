@@ -174,6 +174,13 @@ protocol RTCClientDelegate: AnyObject {
     /// 不回调就等于让用户对着一个永远黑屏的格子。
     func rtcDidUpdateLocalCamera(_ enabled: Bool)
 
+    /// 本地麦克风的**实际**状态与界面请求不一致时回调。
+    ///
+    /// 典型场景：入会时用户拒绝了录音权限。上一版即使被拒也把音频轨标成 enabled，
+    /// 界面显示"麦克风已开"，对方却一个字都听不到——用户只能靠对方提醒才发现。
+    /// 现在改为：被拒就回落成关闭，并明确回调给界面。
+    func rtcDidUpdateLocalMic(_ enabled: Bool)
+
     /// 本地麦克风的实时电平（0...1），约每 180ms 一次。
     ///
     /// 用于说话脉冲：服务端不下发音量（Web 端也是各自在本地算的），
@@ -184,6 +191,8 @@ protocol RTCClientDelegate: AnyObject {
 extension RTCClientDelegate {
     /// 默认空实现：Mock 与旧实现不需要为这个回调改动。
     func rtcDidUpdateLocalCamera(_ enabled: Bool) {}
+
+    func rtcDidUpdateLocalMic(_ enabled: Bool) {}
 
     func rtcDidUpdateLocalAudioLevel(_ level: Float) {}
 }

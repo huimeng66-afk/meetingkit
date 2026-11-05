@@ -27,6 +27,10 @@ final class ScreenShareBridge: ObservableObject {
     @Published private(set) var latestFrame: UIImage?
     @Published private(set) var startedAt: Date?
 
+    /// 扩展侧上报的失败原因（App Group 不可用、编码器起不来……）。
+    /// 只在**没有在共享**时对外暴露：共享正常时残留的旧错误没有意义。
+    @Published private(set) var failure: String?
+
     // MARK: - 观察者生命周期
 
     /// 为什么用独立的盒子装 token：
@@ -131,7 +135,13 @@ final class ScreenShareBridge: ObservableObject {
     /// 从 App Group 重新读取状态。轮询兜底、回到前台、收到 stateChanged 时都会调用。
     func refreshState() {
         let state = ScreenShareStore.state
-        let broadcasting = Self.isBroadcasting(state)
+        // 双判据：状态文件 + "有没有新鲜帧"。
+        //
+        // 只信状态文件是有风险的——它是跨进程写出来的，任何一次写入失败、
+        // 或者上一版残留的旧实现，都会让界面永远认为"没在共享"，而实际上
+        // 扩展正在一帧一帧地写 JPEG。反过来，只要共享容器里的帧在 3 秒内被
+        // 更新过，就说明扩展进程确实在出帧，这比任何状态字段都硬。
+        let broadcasting = Self.isBroadcasting(state) || hasFreshFrame()
 
         if isBroadcasting != broadcasting {
             isBroadcasting = broadcasting
@@ -140,6 +150,13 @@ final class ScreenShareBridge: ObservableObject {
         let storedStart = broadcasting ? ScreenShareStore.startedAt : nil
         if startedAt != storedStart {
             startedAt = storedStart
+        }
+
+        // 失败原因：只在"确认没在共享"时取。共享进行中读到上一次的旧错误，
+        // 会弹一个和当前状态矛盾的提示。
+        let storedFailure = broadcasting ? nil : ScreenShareStore.lastError
+        if failure != storedFailure {
+            failure = storedFailure
         }
 
         if broadcasting {
@@ -151,6 +168,12 @@ final class ScreenShareBridge: ObservableObject {
             }
             lastFrameDate = nil
         }
+    }
+
+    /// 消费一次失败原因（弹过提示就清掉，避免每次刷新都重复弹）。
+    func consumeFailure() {
+        failure = nil
+        ScreenShareStore.clearError()
     }
 
     /// 存活检测。由 ViewModel 的低频轮询调用（每 4 秒一次即可：只是读一次 UserDefaults
@@ -206,14 +229,98 @@ final class ScreenShareBridge: ObservableObject {
         // 后台不解码：屏幕不可见，解码纯属浪费 CPU 和内存，还可能触发后台内存回收。
         guard UIApplication.shared.applicationState == .active else { return }
         guard let data = SharedFrameStore.readIfNewer(than: &lastFrameDate) else { return }
+        // 收到新帧就先记一笔：诊断面板据此区分"扩展没出帧"与"出了帧但没推上去"。
+        ScreenShareRuntime.noteFrameWritten()
         // JPEG 只有几十 KB，主线程解码耗时在毫秒级，比跨线程往返 + 图片对象传递更划算。
         guard let image = UIImage(data: data) else { return }
         latestFrame = image
     }
 
+    /// 生成一次共享链路诊断快照。面板每次展开时调用一次即可。
+    func makeDiagnostics() -> ScreenShareDiagnostics {
+        let snapshot = ScreenShareStore.snapshot()
+        let now = Date()
+        let state = ScreenShareState(rawValue: snapshot?.state ?? "") ?? .idle
+
+        let frameBytes: Int = {
+            guard let path = SharedFrameStore.fileURL()?.path,
+                  let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+                  let size = attributes[.size] as? Int else {
+                return 0
+            }
+            return size
+        }()
+
+        return ScreenShareDiagnostics(
+            appGroupAvailable: AppGroupConfig.isAvailable,
+            appGroupID: AppGroupConfig.identifier,
+            state: state,
+            startedAt: startedAt,
+            heartbeatAge: ScreenShareStore.heartbeat.map { now.timeIntervalSince($0) },
+            framesWritten: ScreenShareRuntime.framesWritten,
+            framesPushed: ScreenShareRuntime.framesPushed,
+            lastPushAge: ScreenShareRuntime.lastPushAt.map { now.timeIntervalSince($0) },
+            frameBytes: frameBytes,
+            lastError: snapshot?.lastError
+        )
+    }
+
     private static func isBroadcasting(_ state: ScreenShareState) -> Bool {
         // paused 也算"正在共享"：用户暂停的是画面推送，广播会话本身还在，UI 不能显示成已停止。
         state == .active || state == .paused
+    }
+
+    /// 共享容器里是否有一个"刚刚才写过"的帧文件。
+    ///
+    /// 3 秒 = 扩展侧 24fps 出帧的正常间隔的 70 倍，足够跨过卡顿、切后台、
+    /// 编码重入；又短到用户点完"停止"后不会长时间停留在共享态。
+    private func hasFreshFrame() -> Bool {
+        guard let path = SharedFrameStore.fileURL()?.path,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let modified = attributes[.modificationDate] as? Date else {
+            return false
+        }
+        return Date().timeIntervalSince(modified) < 3
+    }
+}
+
+// MARK: - 诊断快照
+
+/// 屏幕共享链路的一次性体检结果。
+///
+/// 链路是四段：扩展出帧 → 写共享容器 → 主 App 读帧 → 推给 WebRTC。
+/// 任何一段断掉，用户看到的都是"对方黑屏"。这四项计数就是用来定位断在哪一段的：
+///   · framesWritten == 0        → 扩展没出帧（多半是 App Group 或采样回调的问题）
+///   · framesWritten > 0 但 pushed == 0 → 主 App 侧没在推（状态没同步 / RTC 未入会）
+///   · 两者都在涨但对方仍黑屏     → 问题在 WebRTC 协商或浏览器端
+struct ScreenShareDiagnostics {
+    var appGroupAvailable: Bool
+    var appGroupID: String
+    var state: ScreenShareState
+    var startedAt: Date?
+    var heartbeatAge: TimeInterval?
+    var framesWritten: Int
+    var framesPushed: Int
+    var lastPushAge: TimeInterval?
+    var frameBytes: Int
+    var lastError: String?
+
+    /// 给面板直接展示的多行文本。
+    var report: String {
+        var lines: [String] = []
+        lines.append("App Group：\(appGroupAvailable ? "可用" : "不可用")（\(appGroupID)）")
+        lines.append("扩展状态：\(state.rawValue)")
+        if let age = heartbeatAge {
+            lines.append(String(format: "心跳：%.0f 秒前", age))
+        } else {
+            lines.append("心跳：无")
+        }
+        lines.append("出帧：\(framesWritten) 帧" + (frameBytes > 0 ? "（最新 \(frameBytes / 1024) KB）" : ""))
+        lines.append("已推 RTC：\(framesPushed) 帧" + (lastPushAge.map { String(format: "（%.0f 秒前）", $0) } ?? ""))
+        if let error = lastError {
+            lines.append("最近错误：\(error)")
+        }
+        return lines.joined(separator: "\n")
     }
 }
 

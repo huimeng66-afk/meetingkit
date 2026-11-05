@@ -98,6 +98,13 @@ final class MeetingViewModel: ObservableObject {
     /// 远端共享已持续时长 "mm:ss"。
     @Published private(set) var remoteShareDurationText: String = "00:00"
 
+    /// 屏幕共享失败的原因（扩展侧上报）。非 nil 时会议室会弹一次提示。
+    ///
+    /// 这条通道是上一版缺的：扩展在 `broadcastStarted` 里因为签名、
+    /// 容器或编码器起不来而结束广播时，主 App 只看到"状态没变成 active"，
+    /// 表现就是点了共享、面板也弹了、然后什么都没有——用户完全无从判断。
+    @Published private(set) var shareFailure: String?
+
     /// 顶栏共享条是否显示。
     ///
     /// 之前只判断 `isScreenSharing`：别人共享时顶栏没有任何提示，画面突然从宫格
@@ -123,6 +130,18 @@ final class MeetingViewModel: ObservableObject {
     /// 共享条右侧的时长。
     var shareBannerDurationText: String {
         isScreenSharing ? shareDurationText : remoteShareDurationText
+    }
+
+    /// 共享链路体检报告。面板展开时现算，不做成 @Published：
+    /// 它要读文件与心跳，没必要每秒刷新一次 UI。
+    var shareDiagnosticsReport: String {
+        shareBridge.makeDiagnostics().report
+    }
+
+    /// 用户已经看过失败提示：清掉，避免每次刷新重复弹。
+    func dismissShareFailure() {
+        shareFailure = nil
+        shareBridge.consumeFailure()
     }
 
     // MARK: - 布局与面板
@@ -225,10 +244,13 @@ final class MeetingViewModel: ObservableObject {
         isHost = join.isHost
         joinPassword = join.password
         joinToken = join.token.isEmpty ? (AuthStore.load()?.token ?? "") : join.token
-        // 入会页的预览开关直接成为会议室初始状态，避免"预览里关了麦、进去又开着"。
-        // "入会自动静音"是用户在设置里明确打开的强约束，优先级高于入会页的开关：
-        // 需要这项功能的场景（企业大会、旁听）里，静音比"记住上次选择"更重要。
-        isMicOn = join.micOn && !AppSettings.shared.autoMuteOnJoin
+        // 进会即开麦。
+        //
+        // 这是产品明确要求的行为：走进会议室就应该能直接说话，不需要先找麦克风按钮。
+        // 因此这里不再看入会页那个开关（它只影响入会前的试音预览），
+        // 唯一的例外是用户在「设置 → 入会自动静音」里显式打开过——
+        // 那是给大会旁听场景准备的强约束，必须尊重。
+        isMicOn = !AppSettings.shared.autoMuteOnJoin
         isCameraOn = join.cameraOn
 
         let resolvedClient: RTCClient
@@ -793,6 +815,22 @@ extension MeetingViewModel: RTCClientDelegate {
         localAudioLevel = level
     }
 
+    /// 麦克风权限被拒：把界面上的"开着"改回"关了"，否则用户会以为自己在说话。
+    func rtcDidUpdateLocalMic(_ enabled: Bool) {
+        guard !enabled else { return }
+        if isMicOn { isMicOn = false }
+        if let index = participants.firstIndex(where: { $0.isLocal }), participants[index].isMicOn {
+            participants[index].isMicOn = false
+        }
+        showToast(
+            ToastMessage(
+                text: "没有麦克风权限，请在系统设置中允许后重试",
+                systemImage: "mic.slash.fill",
+                style: .warning
+            )
+        )
+    }
+
     func rtcDidChangeNetworkQuality(_ quality: NetworkQuality) {
         let wasPoor: Bool
         if case .poor = networkQuality {
@@ -1065,6 +1103,9 @@ private extension MeetingViewModel {
             activePanel = nil
             isChromeVisible = true
             pendingStopAt = nil
+            // 新一轮共享：诊断计数从零开始，否则面板里会混着上一场的数字。
+            ScreenShareRuntime.reset()
+            shareFailure = nil
             // 首次同步不调：扩展早就在跑，重复 start 只是往日志里灌噪音。
             if !isInitial {
                 rtc.startScreenShare()
@@ -1125,11 +1166,19 @@ private extension MeetingViewModel {
             durationText = Self.formatClock(now.timeIntervalSince(start))
         }
 
-        // 屏幕共享与 App Group 的对账挂在这里，按拍数降频：
-        // 每 2 秒读一次状态、每 4 秒做一次存活检测，不必每秒都碰文件（D-02）。
-        if clockTickCount % 2 == 0 {
-            shareBridge.refreshState()
+        // 屏幕共享与 App Group 的对账挂在这里。
+        //
+        // 从"每 2 秒"提到"每秒"：共享状态是从另一个进程读回来的，2 秒的轮询
+        // 叠加 Darwin 通知的偶发丢失，会让用户点完"开始直播"后盯着屏幕等两秒
+        // 还没反应，体感就是"没连上"。读的只是共享容器里几百字节的 JSON，
+        // 一秒一次的代价可以忽略。
+        shareBridge.refreshState()
+
+        // 扩展侧上报的失败只提示一次。
+        if shareFailure == nil, let failure = shareBridge.failure {
+            shareFailure = failure
         }
+
         if clockTickCount % 4 == 0 {
             shareBridge.validateLiveness()
         }

@@ -117,6 +117,27 @@ struct MeetingRoomView: View {
                 onJoined?()
             }
         }
+        // 共享失败必须"说出来"。
+        // 扩展进程结束广播后不会留任何界面痕迹，用户只会觉得"点了没反应"；
+        // 把扩展写下的原因读出来弹一次，是这条链路唯一的可观测出口。
+        .alert(isPresented: shareFailureBinding) {
+            Alert(
+                title: Text("屏幕共享未能开始"),
+                message: Text(viewModel.shareFailure ?? ""),
+                dismissButton: .default(Text("知道了")) {
+                    viewModel.dismissShareFailure()
+                }
+            )
+        }
+    }
+
+    private var shareFailureBinding: Binding<Bool> {
+        Binding(
+            get: { viewModel.shareFailure != nil },
+            set: { presented in
+                if !presented { viewModel.dismissShareFailure() }
+            }
+        )
     }
 
     // MARK: - 顶栏 + 底栏

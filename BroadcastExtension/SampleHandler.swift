@@ -88,6 +88,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
         // 扩展照样能起播、照样在录屏，但一帧都写不出去，用户看到的是"共享中 + 对面黑屏"。
         // 与其让用户对着黑屏等到自己发现，不如在这里按系统规范立刻结束并给出原因。
         guard AppGroupConfig.isAvailable else {
+            // 先把原因落盘再结束：主 App 读不到这条记录时，用户只能看到
+            // "共享莫名其妙中断"，没有任何可排查的线索。
+            ScreenShareStore.recordError("签名未授予 App Group，共享画面无法传回会议")
             let error = NSError(
                 domain: Self.stopErrorDomain,
                 code: 2,
@@ -106,6 +109,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         isEncoding = false
         encodeLock.unlock()
 
+        ScreenShareStore.clearError()
         ScreenShareStore.state = .active
         ScreenShareStore.startedAt = Date()
         // 起播立刻写一次心跳：否则主 App 在收到第一帧之前只能退化成按 startedAt 计时，
