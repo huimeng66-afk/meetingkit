@@ -1172,7 +1172,7 @@ final class RealRTCClient: NSObject, RTCClient {
         guard let track = rebuildAudioTrack() else { return }
         track.isEnabled = true
         for peer in remotePeers.values {
-            peer.forceReattachAudio(track)
+            peer.session.forceReattachAudio(track)
         }
         publishLocalMediaState()
         publishParticipants()

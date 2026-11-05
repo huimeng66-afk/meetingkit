@@ -284,7 +284,6 @@ final class PeerSession: NSObject {
             if track.kind == "audio", audioSender == nil {
                 audioSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
             }
-            forceSendRecvIfNeeded(for: track)
             return
         }
         peerConnection.add(track, streamIds: [streamID])
@@ -293,22 +292,6 @@ final class PeerSession: NSObject {
         }
         if track.kind == "audio" {
             audioSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
-        }
-        forceSendRecvIfNeeded(for: track)
-    }
-
-    /// 把挂着这条轨的 transceiver 方向钉成 sendrecv。
-    ///
-    /// `addTrack` 默认就是 sendrecv，但当这条 m-line 之前被 answer 谈成
-    /// recvonly（例如本端先应答、后挂轨）时，方向会一直留在 recvonly：
-    /// 轨道 live、sender 也在，却一个包都不发。诊断里看到"SDP 本端 recvonly"
-    /// 就是这种状态。
-    private func forceSendRecvIfNeeded(for track: RTCMediaStreamTrack) {
-        guard let tx = peerConnection.transceivers.first(where: {
-            $0.sender.track?.trackId == track.trackId
-        }) else { return }
-        if tx.direction == .recvOnly {
-            tx.direction = .sendRecv
         }
     }
 
