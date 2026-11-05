@@ -31,6 +31,10 @@ final class ScreenShareBridge: ObservableObject {
     /// 只在**没有在共享**时对外暴露：共享正常时残留的旧错误没有意义。
     @Published private(set) var failure: String?
 
+    /// 用户已经点了"开始共享"、但扩展还没写回 .active 的请求时间。
+    /// 面板据此在 6 秒后提示"系统广播没有真正启动"，而不是一直显示空状态。
+    @Published private(set) var pendingRequestAt: Date?
+
     // MARK: - 观察者生命周期
 
     /// 为什么用独立的盒子装 token：
@@ -46,6 +50,9 @@ final class ScreenShareBridge: ObservableObject {
 
     private var lastFrameDate: Date?
     private var lastFramePullTime: CFTimeInterval = 0
+
+    /// 本次共享会话的帧新鲜度下界。早于它的文件属于上一场，不能当新帧。
+    private var sessionFloor: Date?
 
     /// 预览解码令牌：后台解码完成时只有"最新一帧"允许上屏，
     /// 否则慢的旧帧后到，会把已经显示的新帧盖回去（画面倒退一拍）。
@@ -78,6 +85,10 @@ final class ScreenShareBridge: ObservableObject {
         let state = ScreenShareStore.state
         isBroadcasting = Self.isBroadcasting(state)
         startedAt = ScreenShareStore.startedAt
+        sessionFloor = ScreenShareStore.sessionFloor
+        if !isBroadcasting {
+            pendingRequestAt = Self.recentPendingRequest(ScreenShareStore.requestedAt)
+        }
     }
 
     deinit {
@@ -145,32 +156,71 @@ final class ScreenShareBridge: ObservableObject {
         DarwinNotifier.post(ScreenShareSignal.stopRequested)
     }
 
+    /// 用户点"开始共享"、系统面板弹出**之前**调用。
+    ///
+    /// 做三件事：
+    ///   1. 清掉上一场留在容器里的 JPEG —— 否则主 App 会把旧图当成新帧，
+    ///      诊断面板出现"扩展 idle 却出了 46 帧"的鬼故事；
+    ///   2. 写 requestedAt，扩展起播后所有帧都必须晚于这个时刻；
+    ///   3. 清空上一场的诊断计数，面板只反映本次会话。
+    ///
+    /// 正在共享时不动：用户可能在共享中再次打开面板，清场会把真实会话抹掉。
+    func prepareForNewShare() {
+        guard !isBroadcasting else { return }
+
+        ScreenShareRuntime.reset()
+        SharedFrameStore.clear()
+        ScreenShareStore.prepareForNewSession()
+
+        sessionFloor = ScreenShareStore.sessionFloor
+        pendingRequestAt = ScreenShareStore.requestedAt
+        startedAt = nil
+        failure = nil
+        latestFrame = nil
+        lastFrameDate = nil
+        lastFramePullTime = 0
+        previewToken &+= 1
+    }
+
     /// 从 App Group 重新读取状态。轮询兜底、回到前台、收到 stateChanged 时都会调用。
     func refreshState() {
-        let state = ScreenShareStore.state
-        // 双判据：状态文件 + "有没有新鲜帧"。
+        // 一次调用只读一次快照：state / heartbeat / requestedAt 必须来自同一版本，
+        // 否则跨进程写入正好落在两次读之间，会拼出一个自相矛盾的诊断。
+        let snapshot = ScreenShareStore.snapshot()
+        let state = ScreenShareState(rawValue: snapshot?.state ?? "") ?? .idle
+
+        // 会话下界：扩展写回的 requestedAt 优先级最高，老版本没有就退回 startedAt。
+        // 再往前放宽 2 秒，跨过两进程时钟与文件系统 mtime 的毫秒级抖动。
+        if let raw = snapshot?.requestedAt ?? snapshot?.startedAt {
+            sessionFloor = Date(timeIntervalSince1970: raw - 2)
+        }
+
+        // 双判据：状态文件 + "有没有本次会话的新鲜帧"。
         //
         // 只信状态文件是有风险的——它是跨进程写出来的，任何一次写入失败、
         // 或者上一版残留的旧实现，都会让界面永远认为"没在共享"，而实际上
         // 扩展正在一帧一帧地写 JPEG。反过来，只要共享容器里的帧在 3 秒内被
         // 更新过，就说明扩展进程确实在出帧，这比任何状态字段都硬。
-        let broadcasting = Self.isBroadcasting(state) || hasFreshFrame()
+        //
+        // 1.5.4 起还必须晚于 sessionFloor：容器里可能躺着上一场的 JPEG，
+        // 它的 mtime 也可能很新（例如扩展被系统杀掉前刚写的一帧），
+        // 不加下界就会把一场已经结束的共享重新点亮。
+        let broadcasting = Self.isBroadcasting(state) || hasFreshFrame(since: sessionFloor)
 
         if isBroadcasting != broadcasting {
             isBroadcasting = broadcasting
         }
 
-        var storedStart = broadcasting ? ScreenShareStore.startedAt : nil
-
-        /* 兜底：状态文件已经被 reset，但扩展在 clear() 之前被系统杀掉，
-           会留下一张 3 秒内的"新鲜帧"。此时 hasFreshFrame() 让 UI 显示共享中，
-           startedAt 却是 nil，计时器就卡在 0:00。
-           帧文件的 mtime 就是这一场共享第一次出帧的时刻，误差 < 1 帧。 */
-        if broadcasting, storedStart == nil,
-           let path = SharedFrameStore.fileURL()?.path,
-           let attributes = try? FileManager.default.attributesOfItem(atPath: path),
-           let modified = attributes[.modificationDate] as? Date {
-            storedStart = modified
+        var storedStart: Date?
+        if broadcasting {
+            storedStart = snapshot?.startedAt.map(Date.init(timeIntervalSince1970:))
+            /* 兜底：状态文件已经被 reset，但扩展在 clear() 之前被系统杀掉，
+               会留下一张 3 秒内的"新鲜帧"。此时 hasFreshFrame() 让 UI 显示共享中，
+               startedAt 却是 nil，计时器就卡在 0:00。
+               帧文件的 mtime 就是这一场共享第一次出帧的时刻，误差 < 1 帧。 */
+            if storedStart == nil {
+                storedStart = SharedFrameStore.modificationDate()
+            }
         }
 
         if startedAt != storedStart {
@@ -179,9 +229,17 @@ final class ScreenShareBridge: ObservableObject {
 
         // 失败原因：只在"确认没在共享"时取。共享进行中读到上一次的旧错误，
         // 会弹一个和当前状态矛盾的提示。
-        let storedFailure = broadcasting ? nil : ScreenShareStore.lastError
+        let storedFailure = broadcasting ? nil : snapshot?.lastError
         if failure != storedFailure {
             failure = storedFailure
+        }
+
+        // 请求了但扩展没起来：保留 requestedAt，面板 6 秒后据此提示。
+        // 只认 90 秒内的请求：用户上次在系统面板点了取消，下一次冷启动
+        // 不该再弹一次"系统广播没有启动"。
+        let storedPending = broadcasting ? nil : Self.recentPendingRequest(snapshot?.requestedAt.map(Date.init(timeIntervalSince1970:)))
+        if pendingRequestAt != storedPending {
+            pendingRequestAt = storedPending
         }
 
         if broadcasting {
@@ -255,7 +313,7 @@ final class ScreenShareBridge: ObservableObject {
 
         // 后台不解码：屏幕不可见，解码纯属浪费 CPU 和内存，还可能触发后台内存回收。
         guard UIApplication.shared.applicationState == .active else { return }
-        guard let data = SharedFrameStore.readIfNewer(than: &lastFrameDate) else { return }
+        guard let data = SharedFrameStore.readIfNewer(than: &lastFrameDate, notBefore: sessionFloor) else { return }
         // 收到新帧就先记一笔：诊断面板据此区分"扩展没出帧"与"出了帧但没推上去"。
         ScreenShareRuntime.noteFrameWritten()
         /* 解码挪到后台：1080p JPEG 是 10~20ms 的活，放在主线程会和
@@ -277,25 +335,33 @@ final class ScreenShareBridge: ObservableObject {
         let now = Date()
         let state = ScreenShareState(rawValue: snapshot?.state ?? "") ?? .idle
 
-        let frameBytes: Int = {
-            guard let path = SharedFrameStore.fileURL()?.path,
-                  let attributes = try? FileManager.default.attributesOfItem(atPath: path),
-                  let size = attributes[.size] as? Int else {
-                return 0
-            }
-            return size
-        }()
+        var frameBytes = 0
+        var frameModified: Date?
+        if let path = SharedFrameStore.fileURL()?.path,
+           let attributes = try? FileManager.default.attributesOfItem(atPath: path) {
+            frameBytes = (attributes[.size] as? Int) ?? 0
+            frameModified = attributes[.modificationDate] as? Date
+        }
+        let video = ScreenShareRuntime.videoStats
 
         return ScreenShareDiagnostics(
             appGroupAvailable: AppGroupConfig.isAvailable,
             appGroupID: AppGroupConfig.identifier,
+            extensionAppGroup: snapshot?.appGroup,
             state: state,
             startedAt: startedAt,
-            heartbeatAge: ScreenShareStore.heartbeat.map { now.timeIntervalSince($0) },
+            heartbeatAge: snapshot?.heartbeat.map { now.timeIntervalSince1970 - $0 },
+            extensionFrameSeq: snapshot?.frameSeq,
+            extensionVersion: snapshot?.extensionVersion,
             framesWritten: ScreenShareRuntime.framesWritten,
             framesPushed: ScreenShareRuntime.framesPushed,
             lastPushAge: ScreenShareRuntime.lastPushAt.map { now.timeIntervalSince($0) },
             frameBytes: frameBytes,
+            frameAge: frameModified.map { now.timeIntervalSince($0) },
+            requestedAt: snapshot?.requestedAt.map(Date.init(timeIntervalSince1970:)),
+            videoPacketsSent: video.packetsSent,
+            videoFramesEncoded: video.framesEncoded,
+            screenTrackAttached: video.screenAttached,
             lastError: snapshot?.lastError
         )
     }
@@ -305,16 +371,23 @@ final class ScreenShareBridge: ObservableObject {
         state == .active || state == .paused
     }
 
+    /// 只把 90 秒内的 requestedAt 当作"刚刚点过共享"。
+    /// 超时的请求属于上一次已放弃的尝试，不能在新会话/冷启动时反复提示。
+    private static func recentPendingRequest(_ date: Date?) -> Date? {
+        guard let date = date else { return nil }
+        return Date().timeIntervalSince(date) < 90 ? date : nil
+    }
+
     /// 共享容器里是否有一个"刚刚才写过"的帧文件。
     ///
     /// 3 秒 = 扩展侧 24fps 出帧的正常间隔的 70 倍，足够跨过卡顿、切后台、
     /// 编码重入；又短到用户点完"停止"后不会长时间停留在共享态。
-    private func hasFreshFrame() -> Bool {
-        guard let path = SharedFrameStore.fileURL()?.path,
-              let attributes = try? FileManager.default.attributesOfItem(atPath: path),
-              let modified = attributes[.modificationDate] as? Date else {
-            return false
-        }
+    ///
+    /// - Parameter floor: 本次会话的起始时间。早于它的文件一律不算，
+    ///   否则上一场的残留帧会把"已经停止的共享"重新点亮。
+    private func hasFreshFrame(since floor: Date?) -> Bool {
+        guard let modified = SharedFrameStore.modificationDate() else { return false }
+        if let floor = floor, modified < floor { return false }
         return Date().timeIntervalSince(modified) < 3
     }
 }
@@ -324,34 +397,87 @@ final class ScreenShareBridge: ObservableObject {
 /// 屏幕共享链路的一次性体检结果。
 ///
 /// 链路是四段：扩展出帧 → 写共享容器 → 主 App 读帧 → 推给 WebRTC。
-/// 任何一段断掉，用户看到的都是"对方黑屏"。这四项计数就是用来定位断在哪一段的：
-///   · framesWritten == 0        → 扩展没出帧（多半是 App Group 或采样回调的问题）
-///   · framesWritten > 0 但 pushed == 0 → 主 App 侧没在推（状态没同步 / RTC 未入会）
-///   · 两者都在涨但对方仍黑屏     → 问题在 WebRTC 协商或浏览器端
+/// 任何一段断掉，用户看到的都是"对方黑屏"。这些计数就是用来定位断在哪一段的：
+///   · 扩展组与 App 组不一致 → 扩展写多少帧主 App 都读不到（1.5.4 真机根因）
+///   · extensionFrameSeq == 0 → 扩展没出帧（采样回调 / 编码器的问题）
+///   · extensionFrameSeq 在涨、framesWritten 不涨 → 主 App 没读到（组或路径不一致）
+///   · 两者都在涨但 videoPacketsSent == 0 → 共享轨没挂到 video sender / 编码器没启动
+///   · packetsSent 在涨但对方仍黑屏 → 浏览器选轨或渲染问题
 struct ScreenShareDiagnostics {
     var appGroupAvailable: Bool
     var appGroupID: String
+    var extensionAppGroup: String?
     var state: ScreenShareState
     var startedAt: Date?
     var heartbeatAge: TimeInterval?
+    var extensionFrameSeq: Int?
+    var extensionVersion: String?
     var framesWritten: Int
     var framesPushed: Int
     var lastPushAge: TimeInterval?
     var frameBytes: Int
+    var frameAge: TimeInterval?
+    var requestedAt: Date?
+    var videoPacketsSent: Int
+    var videoFramesEncoded: Int
+    var screenTrackAttached: Bool
     var lastError: String?
+
+    /// 扩展与主 App 解析出的 App Group 是否真的不一致。
+    var appGroupMismatch: Bool {
+        guard let extensionAppGroup = extensionAppGroup else { return false }
+        return extensionAppGroup != appGroupID
+    }
 
     /// 给面板直接展示的多行文本。
     var report: String {
         var lines: [String] = []
-        lines.append("App Group：\(appGroupAvailable ? "可用" : "不可用")（\(appGroupID)）")
-        lines.append("扩展状态：\(state.rawValue)")
-        if let age = heartbeatAge {
-            lines.append(String(format: "心跳：%.0f 秒前", age))
+        lines.append("App Group（App）：\(appGroupAvailable ? "可用" : "不可用")（\(appGroupID)）")
+
+        if let extensionAppGroup = extensionAppGroup {
+            let suffix = extensionAppGroup == appGroupID ? " · 一致" : "  ⚠️ 不一致，扩展写不进本容器"
+            lines.append("App Group（扩展）：\(extensionAppGroup)\(suffix)")
         } else {
-            lines.append("心跳：无")
+            lines.append("App Group（扩展）：未上报（扩展未启动，或读不到本容器）")
         }
-        lines.append("出帧：\(framesWritten) 帧" + (frameBytes > 0 ? "（最新 \(frameBytes / 1024) KB）" : ""))
+
+        var stateLine = "扩展状态：\(state.rawValue)"
+        if let version = extensionVersion {
+            stateLine += " · 扩展 \(version)"
+        }
+        if let frames = extensionFrameSeq {
+            stateLine += " · 扩展出帧 \(frames) 帧"
+        }
+        if let age = heartbeatAge {
+            stateLine += String(format: " · 心跳 %.0f 秒前", age)
+        } else {
+            stateLine += " · 心跳无"
+        }
+        lines.append(stateLine)
+
+        if state == .idle, let requestedAt = requestedAt {
+            let waited = Date().timeIntervalSince(requestedAt)
+            if waited > 6 {
+                lines.append(String(format: "请求已 %.0f 秒，仍未收到扩展状态 ⚠️", waited))
+            }
+        }
+
+        var readLine = "主 App 读到：\(framesWritten) 帧"
+        if frameBytes > 0 {
+            readLine += "（最新 \(frameBytes / 1024) KB"
+            if let age = frameAge {
+                readLine += String(format: " · %.1f 秒前", age)
+            }
+            readLine += "）"
+        }
+        lines.append(readLine)
+
         lines.append("已推 RTC：\(framesPushed) 帧" + (lastPushAge.map { String(format: "（%.0f 秒前）", $0) } ?? ""))
+        lines.append(
+            "RTC 视频：发送 \(videoPacketsSent) 包 · 编码 \(videoFramesEncoded) 帧 · "
+            + (screenTrackAttached ? "共享轨已挂" : "共享轨未挂 ⚠️")
+        )
+
         if let error = lastError {
             lines.append("最近错误：\(error)")
         }

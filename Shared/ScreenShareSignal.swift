@@ -68,6 +68,34 @@ enum ScreenShareStore {
         /// 主 App 读到后直接展示给用户——否则这类失败在真机上完全不可观测。
         var lastError: String?
         var errorAt: Double?
+
+        // MARK: 1.5.4 会话握手
+
+        /// 主 App 点"开始共享"时写入的请求时间。
+        ///
+        /// 它解决的是"旧帧冒充新帧"：容器里可能躺着上一场共享的 JPEG，
+        /// 主 App 一读 mtime 就以为扩展正在出帧，诊断里出现"出帧 46 帧、
+        /// 已推 299 帧"但扩展其实是 idle。只有 mtime ≥ requestedAt 的帧
+        /// 才属于本次会话。
+        var requestedAt: Double?
+
+        /// 扩展进程实际解析到的 App Group。
+        ///
+        /// 这是 1.5.4 的关键自检：主 App 与扩展各自从签名里探测 group，
+        /// 只要两边名字不一致，扩展写多少帧主 App 都看不到。把它写进
+        /// 共享状态，诊断面板就能直接指出"App 组 ≠ 扩展组"。
+        var appGroup: String?
+
+        /// 扩展侧累计出帧数（每 2 秒随心跳写一次）。
+        /// 与主 App 自己读到的新帧数分开：前者证明"扩展在编码"，
+        /// 后者证明"主 App 读到了"，两段链路可以分别定位。
+        var frameSeq: Int?
+
+        /// 扩展侧最后一帧的写入时间。
+        var lastFrameAt: Double?
+
+        /// 扩展的 CFBundleShortVersionString（用于确认设备上跑的是新包）。
+        var extensionVersion: String?
     }
 
     private static let fileName = "screen-share-state.json"
@@ -166,9 +194,79 @@ enum ScreenShareStore {
 
     // MARK: 便捷操作
 
+    /// 本次共享的请求时间（主 App 在弹系统面板前写入）。
+    static var requestedAt: Date? {
+        guard let raw = snapshot()?.requestedAt else { return nil }
+        return Date(timeIntervalSince1970: raw)
+    }
+
+    /// 本次会话的帧新鲜度下界。
+    ///
+    /// 优先用 requestedAt（用户在本次点"开始共享"的时刻），
+    /// 老版本状态没有这个字段时退回 startedAt。再往前放宽 2 秒，
+    /// 避免两进程时钟读数与文件系统 mtime 的毫秒级抖动误杀第一帧。
+    static var sessionFloor: Date? {
+        let current = snapshot()
+        let raw = current?.requestedAt ?? current?.startedAt
+        guard let raw = raw else { return nil }
+        return Date(timeIntervalSince1970: raw - 2)
+    }
+
+    /// 主 App 点"开始共享"后、系统面板弹出前调用。
+    ///
+    /// 目的有三个：
+    ///   1. 给本次会话打时间戳，旧帧不能再冒充新帧；
+    ///   2. 清掉上一场的失败原因与组信息，诊断面板只反映本次；
+    ///   3. 留下 requestedAt。即使用户在系统面板里点了取消，主 App
+    ///      也能据此判断"请求过、但扩展没起来"，给出明确提示。
+    static func prepareForNewSession() {
+        var fresh = Snapshot()
+        fresh.requestedAt = Date().timeIntervalSince1970
+        // 旧错误不带到新会话：用户点共享是来解决问题的，
+        // 不该先被上一场的报错吓一次。
+        fresh.lastError = nil
+        fresh.errorAt = nil
+        write(fresh)
+    }
+
+    /// 扩展 `broadcastStarted` 时调用：一次写入完整会话头。
+    ///
+    /// 为什么不复用 state/startedAt 两个 setter：那样会读改写三次 JSON，
+    /// 中间任何一次被系统杀掉都会留下半截状态。这里只写一次。
+    static func beginSession(appGroup: String, extensionVersion: String?) {
+        var current = snapshot() ?? Snapshot()
+        let now = Date().timeIntervalSince1970
+
+        current.state = ScreenShareState.active.rawValue
+        current.startedAt = now
+        current.heartbeat = now
+        current.lastError = nil
+        current.errorAt = nil
+        current.appGroup = appGroup
+        current.frameSeq = 0
+        current.lastFrameAt = nil
+        current.extensionVersion = extensionVersion
+        // 主 App 没写 requestedAt（例如从控制中心直接起播）时，以启动时间为准。
+        if current.requestedAt == nil {
+            current.requestedAt = now
+        }
+        write(current)
+    }
+
     /// 刷新心跳为当前时间。只应由广播扩展调用（主 App 若也写，就失去了判活意义）。
-    static func touchHeartbeat() {
-        mutate { $0.heartbeat = Date().timeIntervalSince1970 }
+    /// - Parameter frames: 扩展侧累计出帧数；随心跳一起写，主 App 可分辨
+    ///   "扩展没出帧"与"扩展出了帧但主 App 没读到"。
+    static func touchHeartbeat(frames: Int? = nil) {
+        let now = Date().timeIntervalSince1970
+        mutate {
+            $0.heartbeat = now
+            if let frames = frames {
+                $0.frameSeq = frames
+                if frames > 0 {
+                    $0.lastFrameAt = now
+                }
+            }
+        }
     }
 
     /// 记录一次失败。必须在 `finishBroadcastWithError` **之前**调用：
@@ -195,6 +293,7 @@ enum ScreenShareStore {
         // 失败原因要保留：扩展结束的同一刻主 App 可能正要展示它。
         fresh.lastError = previous?.lastError
         fresh.errorAt = previous?.errorAt
+        // requestedAt / appGroup / frameSeq 属于上一场会话，必须清掉。
         write(fresh)
     }
 
@@ -233,6 +332,11 @@ enum ScreenShareRuntime {
     private static var _framesPushed = 0
     private static var _lastPushAt: Double?
 
+    // 1.5.4：RTP 视频上行统计。用来区分"帧没进编码器"与"编码了但没发出去"。
+    private static var _videoPacketsSent = 0
+    private static var _videoFramesEncoded = 0
+    private static var _screenTrackAttached = true
+
     /// 扩展写出过多少帧（由主 App 读到新帧时累加）。
     static var framesWritten: Int {
         lock.lock(); defer { lock.unlock() }
@@ -251,6 +355,12 @@ enum ScreenShareRuntime {
         return Date(timeIntervalSince1970: raw)
     }
 
+    /// 最近一次采样到的视频 RTP 计数。
+    static var videoStats: (packetsSent: Int, framesEncoded: Int, screenAttached: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        return (_videoPacketsSent, _videoFramesEncoded, _screenTrackAttached)
+    }
+
     static func noteFrameWritten() {
         lock.lock(); _framesWritten += 1; lock.unlock()
     }
@@ -262,11 +372,24 @@ enum ScreenShareRuntime {
         lock.unlock()
     }
 
+    /// 由共享看门狗写入。`screenAttached` 表示当前 peer 的 video sender
+    /// 确实挂着共享轨（而不是摄像头黑轨或空轨）。
+    static func noteVideoStats(packetsSent: Int, framesEncoded: Int, screenAttached: Bool) {
+        lock.lock()
+        _videoPacketsSent = packetsSent
+        _videoFramesEncoded = framesEncoded
+        _screenTrackAttached = screenAttached
+        lock.unlock()
+    }
+
     static func reset() {
         lock.lock()
         _framesWritten = 0
         _framesPushed = 0
         _lastPushAt = nil
+        _videoPacketsSent = 0
+        _videoFramesEncoded = 0
+        _screenTrackAttached = true
         lock.unlock()
     }
 }

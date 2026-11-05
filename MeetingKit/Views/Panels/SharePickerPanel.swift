@@ -428,7 +428,12 @@ struct SharePickerPanel: View {
     // MARK: - 动作
 
     private func startSharing() {
-        // 先弹系统面板再收自己的面板：系统的「屏幕录制」是独立 window，
+        // 先清旧帧、写本次会话的 requestedAt，再弹系统面板。
+        // 顺序不能反：第一帧可能比面板点击更早落盘，晚写 requestedAt
+        // 会把它误判成"上一场的旧帧"。
+        viewModel.prepareForScreenShare()
+
+        // 再弹系统面板再收自己的面板：系统的「屏幕录制」是独立 window，
         // 但我们的抽屉如果还开着，用户会以为界面卡住没反应。
         let didPresent = BroadcastPickerPresenter.present()
 

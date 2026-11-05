@@ -37,13 +37,19 @@ struct SharedFrameStore {
     /// 注意这里是同步写：调用方（扩展的编码队列）写完紧接着就要 post frameUpdated，
     /// 如果改成异步，主 App 可能收到通知时文件还是上一帧，出现"画面总是慢一拍"的诡异现象。
     /// 写操作本身在编码队列上执行，不会阻塞 ReplayKit 的采样回调。
-    static func write(jpeg data: Data) {
+    ///
+    /// - Returns: 真正落盘成功返回 true。扩展用它累加"出帧数"，
+    ///   写失败（容器被回收、磁盘满）时不虚报。
+    @discardableResult
+    static func write(jpeg data: Data) -> Bool {
         fileQueue.sync {
-            guard let url = fileURL() else { return }
+            guard let url = fileURL() else { return false }
             do {
                 try data.write(to: url, options: .atomic)
+                return true
             } catch {
                 // 静默失败：共享画面丢一帧不影响会议，宁可什么都不做也不能中断广播。
+                return false
             }
         }
     }
@@ -58,10 +64,18 @@ struct SharedFrameStore {
     ///
     /// `date` 是调用方持有的"上次已消费版本"，成功读取后会被就地更新为新的修改时间；
     /// 没有新帧时既不读取文件内容，也不修改 `date`。
-    static func readIfNewer(than date: inout Date?) -> Data? {
+    ///
+    /// - Parameter notBefore: 本次共享会话的起始时间。早于它的文件属于上一场，
+    ///   即使 mtime 比调用方的游标新也必须丢弃——1.5.3 的"出帧 46 帧、
+    ///   已推 299 帧但扩展 idle"就是旧文件在这里冒充了新帧。
+    static func readIfNewer(than date: inout Date?, notBefore: Date? = nil) -> Data? {
         guard let url = fileURL() else { return nil }
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
               let modified = attributes[.modificationDate] as? Date else {
+            return nil
+        }
+
+        if let floor = notBefore, modified < floor {
             return nil
         }
 
@@ -74,6 +88,16 @@ struct SharedFrameStore {
         }
         date = modified
         return data
+    }
+
+    /// 当前帧文件的修改时间。诊断面板用它显示"最后一帧有多旧"。
+    static func modificationDate() -> Date? {
+        guard let url = fileURL()?.path,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: url),
+              let modified = attributes[.modificationDate] as? Date else {
+            return nil
+        }
+        return modified
     }
 
     /// 清空共享帧。扩展结束广播时调用，避免主 App 下次进会时看到上一场会议的残留画面。

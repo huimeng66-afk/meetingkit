@@ -201,6 +201,9 @@ final class MeetingViewModel: ObservableObject {
     /// 用户狂点要有响应，但不能每点一下就往 Darwin 通知里灌一条消息。
     private var pendingStopAt: Date?
 
+    /// 已经提示过"系统广播没有启动"，避免每秒重复弹。
+    private var didWarnPendingShare = false
+
     /// 停止请求的最小重发间隔。
     private static let stopRetryInterval: TimeInterval = 3
 
@@ -518,6 +521,15 @@ final class MeetingViewModel: ObservableObject {
     /// 而不是让一次签名能力探测把整个入口吞掉。
     func toggleScreenShare() {
         openPanel(.sharePicker)
+    }
+
+    /// 系统共享面板弹出**之前**调用：清旧帧、写本次会话的 requestedAt。
+    ///
+    /// 必须在 `BroadcastPickerPresenter.present()` 之前完成，否则第一帧
+    /// 可能早于 requestedAt 落盘，被主 App 的新鲜度下界挡掉。
+    func prepareForScreenShare() {
+        didWarnPendingShare = false
+        shareBridge.prepareForNewShare()
     }
 
     /// 请求停止屏幕共享。
@@ -1229,6 +1241,7 @@ private extension MeetingViewModel {
             activePanel = nil
             isChromeVisible = true
             pendingStopAt = nil
+            didWarnPendingShare = false
             // 新一轮共享：诊断计数从零开始，否则面板里会混着上一场的数字。
             ScreenShareRuntime.reset()
             shareFailure = nil
@@ -1303,6 +1316,33 @@ private extension MeetingViewModel {
         // 扩展侧上报的失败只提示一次。
         if shareFailure == nil, let failure = shareBridge.failure {
             shareFailure = failure
+            // 1.5.4：App Group 不匹配这类失败以前只藏在面板里，
+            // 用户点完共享回到会议界面就再也看不到。直接弹一次，
+            // 把"扩展根本没起来"和"起来了但没画面"彻底分开。
+            showToast(
+                ToastMessage(
+                    text: failure,
+                    systemImage: "exclamationmark.triangle.fill",
+                    style: .danger
+                )
+            )
+        }
+
+        // 用户点了开始共享、系统面板也弹了，但 6 秒内扩展一个状态都没写回来：
+        // 多半是在系统面板里点了取消，或者旧广播卡在"停止中"。
+        // 不提示的话，界面看起来就是"点了没反应"。
+        if !isScreenSharing,
+           !didWarnPendingShare,
+           let requested = shareBridge.pendingRequestAt,
+           now.timeIntervalSince(requested) > 6 {
+            didWarnPendingShare = true
+            showToast(
+                ToastMessage(
+                    text: "没有收到共享扩展的状态。请确认系统弹窗里点了「开始直播」；若仍无反应，多半是当前签名没有把 App Group 授予扩展，需要重签安装。",
+                    systemImage: "dot.radiowaves.left.and.right",
+                    style: .warning
+                )
+            )
         }
 
         if clockTickCount % 4 == 0 {

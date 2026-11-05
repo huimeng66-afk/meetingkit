@@ -10,7 +10,7 @@
 		<string>en</string>
 	</array>
 	<key>CFBundleDisplayName</key>
-	<string>天穹会议 屏幕共享</string>
+	<string>天穹会议</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -18,7 +18,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>$(PRODUCT_NAME)</string>
+	<string>天穹会议</string>
 	<key>CFBundlePackageType</key>
 	<string>XPC!</string>
 	<key>CFBundleShortVersionString</key>

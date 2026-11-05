@@ -82,6 +82,16 @@ final class PeerSession: NSObject {
     /// 就再也找不到它，第二次开共享直接推不上去——这正是"关了重新开就不行"的成因。
     private var videoSender: RTCRtpSender?
 
+    /// 视频收发器（Unified Plan 下一条 m-line 对应一个 transceiver）。
+    ///
+    /// 1.5.4 起共享换轨**不再 removeTrack + addTrack**：
+    /// 那会新增第二条 m-line，浏览器同时收到两条视频轨，`<video>` 往往
+    /// 只播第一条（摄像头黑轨），于是 iOS 这边"已推 358 帧"，网页永远
+    /// 停在"正在接收共享画面…"。
+    /// 正确做法是把原 transceiver 的方向拨回 sendRecv，再 replaceTrack，
+    /// 全程只有一条视频 m-line。
+    private var videoTransceiver: RTCRtpTransceiver?
+
     /// 本端音频发送通道。
     ///
     /// 与 videoSender 同理必须缓存：麦克风轨因设备切换 / 音频会话重建被整体替换时，
@@ -239,21 +249,34 @@ final class PeerSession: NSObject {
 
         if let sender = videoSender ?? senderForVideoTrack() {
             videoSender = sender
-            sender.track = track
-            /* 换轨**不改变 SDP 方向**。
-               摄像头从没开过时，这条 video transceiver 是被谈成 recvonly 的；
-               把共享轨塞进同一个 sender，本地看"挂了轨、在推帧"，
-               对端却一个包都收不到——浏览器就永远停在"正在接收共享画面…"。
-               这种情况必须拆了重挂，让 addTrack 把方向重新谈成 sendrecv。 */
-            if !localVideoSendsUpstream {
-                forceReattachVideo(track)
-                return
+            // 记录"当前该发哪条轨"：共享看门狗用它判断 sender 是否真的挂上了
+            // 屏幕轨；新 peer 在共享中接入时也靠它拿同一条轨。
+            localVideo = track
+            videoTransceiver = videoTransceiver ?? transceiverForVideoSender()
+
+            if let transceiver = videoTransceiver {
+                if transceiver.isStopped {
+                    // transceiver 被 stop 过就再也拨不回来，只能重建一条。
+                    rebuildVideoSender(with: track)
+                    return
+                }
+                /* 换轨本身不改变 SDP 方向。摄像头从没开过时，这条
+                   video transceiver 可能被谈成 recvonly；只把 track 塞进
+                   sender，本地看"挂了轨、在推帧"，对端一个包都收不到。
+                   先把 preferred direction 拨回 sendRecv，再显式协商。
+
+                   这里不先比较 `direction`：本 SDK 把同一个枚举导入成了
+                   不可比较的类型（和 currentDirection 一样），比较过不了编译；
+                   而 setDirection 本身就是幂等的，已经是 sendRecv 时是空操作。 */
+                _ = transceiver.setDirection(.sendRecv, error: nil)
             }
+            sender.track = track
         } else {
             /* 一条 video sender 都没有（对端加入时本端摄像头是关的）：
                补一条上行轨。addTrack 会新建 sendrecv transceiver。 */
             peerConnection.add(track, streamIds: ["tq-\(peerID)"])
             videoSender = senderForVideoTrack()
+            videoTransceiver = transceiverForVideoSender()
         }
 
         /* 必须显式协商，不能只赌 negotiationNeeded 回调。
@@ -292,23 +315,60 @@ final class PeerSession: NSObject {
         return sawVideo
     }
 
-    /// 拆掉旧 sender 再挂一次，强制把方向谈回 sendrecv。
+    /// 共享上行看门狗的补救入口。
+    ///
+    /// 1.5.3 这里是 removeTrack + addTrack，会新增第二条 m-line；
+    /// 1.5.4 改为只拨方向 + 重新挂轨，保持单条 m-line。
     func forceReattachVideo(_ track: RTCVideoTrack) {
         guard !isClosed else { return }
         localVideo = track
+
+        if let transceiver = videoTransceiver ?? transceiverForVideoSender(), !transceiver.isStopped {
+            // 同 replaceVideoTrack：不比较枚举，直接幂等地拨回 sendRecv。
+            _ = transceiver.setDirection(.sendRecv, error: nil)
+            videoSender?.track = track
+            videoTransceiver = transceiver
+            negotiate()
+            return
+        }
+
+        rebuildVideoSender(with: track)
+    }
+
+    /// 仅在原 transceiver 被 stop 时使用。
+    ///
+    /// 这条路径确实会新增 m-line，但旧 m-line 已经是 stopped，
+    /// 浏览器侧对应轨道会 ended；网页端选轨逻辑也会优先取最新的 live 轨。
+    private func rebuildVideoSender(with track: RTCVideoTrack) {
         if let old = videoSender ?? senderForVideoTrack() {
             peerConnection.removeTrack(old)
         }
         videoSender = nil
+        videoTransceiver = nil
         peerConnection.add(track, streamIds: ["tq-\(peerID)"])
         videoSender = senderForVideoTrack()
+        videoTransceiver = transceiverForVideoSender()
         negotiate()
+    }
+
+    /// 当前 video sender 是否真的挂着本端正在推的那条轨。
+    /// 共享期间 `localVideo` 就是屏幕轨；看门狗用它区分"没挂上"与"挂了没发包"。
+    var isVideoTrackAttached: Bool {
+        guard let current = localVideo else { return false }
+        return (videoSender ?? senderForVideoTrack())?.track?.trackId == current.trackId
     }
 
     /// 记录并返回当前 video sender。sender.track 可能为 nil（关闭视频时），
     /// 所以不能只靠 `track?.kind` 反查，必须缓存引用。
     private func senderForVideoTrack() -> RTCRtpSender? {
         peerConnection.senders.first(where: { $0.track?.kind == "video" })
+    }
+
+    private func transceiverForVideoSender() -> RTCRtpTransceiver? {
+        if let sender = videoSender {
+            return peerConnection.transceivers.first { $0.sender.senderId == sender.senderId }
+        }
+        return peerConnection.transceivers.first { $0.mediaType == .video }
     }
 
     /// 调整上行视频编码参数。屏幕共享是"文字优先"，需要比摄像头更高的码率上限，
@@ -343,6 +403,9 @@ final class PeerSession: NSObject {
             if track.kind == "video", videoSender == nil {
                 videoSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
             }
+            if track.kind == "video", videoTransceiver == nil {
+                videoTransceiver = transceiverForVideoSender()
+            }
             if track.kind == "audio", audioSender == nil {
                 audioSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
             }
@@ -351,6 +414,7 @@ final class PeerSession: NSObject {
         peerConnection.add(track, streamIds: [streamID])
         if track.kind == "video" {
             videoSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
+            videoTransceiver = transceiverForVideoSender()
         }
         if track.kind == "audio" {
             audioSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })

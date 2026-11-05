@@ -776,7 +776,9 @@ final class RealRTCClient: NSObject, RTCClient {
         isScreenSharing = true
 
         let profile = Self.screenEncodingProfile
-        let pusher = ScreenFramePusher(source: source)
+        // 帧新鲜度下界：早于本次会话请求时刻的 JPEG 属于上一场，不推。
+        let floor = ScreenShareStore.sessionFloor ?? Date().addingTimeInterval(-2)
+        let pusher = ScreenFramePusher(source: source, notBefore: floor)
         screenPusher = pusher
         /* 格式切换必须和 tick() 的解码走同一个串行队列：
            RTCVideoSource.adaptOutputFormat 内部会重建 video adapter，
@@ -804,34 +806,63 @@ final class RealRTCClient: NSObject, RTCClient {
     ///
     /// 真机反馈：共享诊断显示"已推 RTC 358 帧"，浏览器却一直停在
     /// "正在接收共享画面…"。帧推给了 video source，但 sender 所在
-    /// transceiver 是 recvonly（摄像头从没开过时就是这样），编码器
-    /// 一个包都不发。这里 4 秒后查一次，0 包就拆了重挂再协商。
-    private func scheduleVideoUplinkWatchdog() {
+    /// transceiver 可能还是 recvonly，编码器一个包都不发。
+    ///
+    /// 1.5.4 起看门狗做三件事：
+    ///   1. 读 packetsSent **和 framesEncoded**：前者证明包出了网卡，
+    ///      后者证明编码器真的在消费共享帧。两个都为 0 才是换轨问题。
+    ///   2. 把结果写进 ScreenShareRuntime，诊断面板直接展示。
+    ///   3. 0 包时最多补救两轮（4 秒、+5 秒），第二轮仍无效就停手，
+    ///      避免每 5 秒重复协商把连接拖垮。
+    private func scheduleVideoUplinkWatchdog(attempt: Int = 0) {
         videoUplinkWatchdog?.cancel()
         let item = DispatchWorkItem { [weak self] in
             Task { @MainActor in
                 guard let self, self.isScreenSharing else { return }
+                guard !self.remotePeers.isEmpty else { return }
+
+                let totals = VideoUplinkTotals()
+                let group = DispatchGroup()
+
                 for peer in self.remotePeers.values {
-                    peer.session.peerConnection.statistics { report in
-                        var sent = 0
-                        for (_, st) in report.statistics where st.type == "outbound-rtp" {
-                            if (st.values["kind"] as? String) == "video" {
-                                sent = (st.values["packetsSent"] as? NSNumber)?.intValue ?? 0
-                            }
-                        }
-                        guard sent == 0 else { return }
-                        Task { @MainActor in
-                            guard self.isScreenSharing,
-                                  let track = self.localScreenTrack,
-                                  self.remotePeers[peer.peerID] != nil else { return }
-                            peer.session.forceReattachVideo(track)
-                        }
+                    if !peer.session.isVideoTrackAttached {
+                        totals.markDetached()
                     }
+                    group.enter()
+                    peer.session.peerConnection.statistics { report in
+                        var peerPackets = 0
+                        var peerEncoded = 0
+                        for (_, stat) in report.statistics where stat.type == "outbound-rtp" {
+                            guard (stat.values["kind"] as? String) == "video" else { continue }
+                            peerPackets += (stat.values["packetsSent"] as? NSNumber)?.intValue ?? 0
+                            peerEncoded += (stat.values["framesEncoded"] as? NSNumber)?.intValue ?? 0
+                        }
+                        totals.merge(packets: peerPackets, encoded: peerEncoded)
+                        group.leave()
+                    }
+                }
+
+                group.notify(queue: .main) {
+                    guard self.isScreenSharing else { return }
+                    let snapshot = totals.snapshot()
+                    ScreenShareRuntime.noteVideoStats(
+                        packetsSent: snapshot.packets,
+                        framesEncoded: snapshot.encoded,
+                        screenAttached: snapshot.attached
+                    )
+
+                    guard snapshot.packets == 0, attempt < 2 else { return }
+                    for peer in self.remotePeers.values {
+                        guard let track = self.localScreenTrack else { return }
+                        peer.session.forceReattachVideo(track)
+                    }
+                    // 第二轮间隔拉长到 5 秒：给 ICE 与编码器足够的重启时间。
+                    self.scheduleVideoUplinkWatchdog(attempt: attempt + 1)
                 }
             }
         }
         videoUplinkWatchdog = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + (attempt == 0 ? 4 : 5), execute: item)
     }
 
     private func stopVideoUplinkWatchdog() {
@@ -2439,11 +2470,44 @@ final class RealRTCTeardownBox: @unchecked Sendable {
 
 // MARK: - 屏幕帧推送
 
+/// 共享看门狗的多 peer 统计累加器。
+///
+/// WebRTC 的 `statistics` 回调在库内部线程，多个 peer 并发回调；
+/// 用一个小盒子加锁累加，避免在 `@Sendable` 闭包里捕获可变的局部变量。
+private final class VideoUplinkTotals: @unchecked Sendable {
+
+    private let lock = NSLock()
+    private var packets = 0
+    private var encoded = 0
+    private var attached = true
+
+    func merge(packets: Int, encoded: Int) {
+        lock.lock()
+        self.packets = max(self.packets, packets)
+        self.encoded = max(self.encoded, encoded)
+        lock.unlock()
+    }
+
+    func markDetached() {
+        lock.lock()
+        attached = false
+        lock.unlock()
+    }
+
+    func snapshot() -> (packets: Int, encoded: Int, attached: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (packets, encoded, attached)
+    }
+}
+
 /// 把 Broadcast 扩展写入 App Group 的 JPEG 帧推给 WebRTC screen source。
 /// 20fps / 1080p 的共享帧率下，解码在专用后台队列，绝不碰主线程。
 final class ScreenFramePusher {
 
     private let source: RTCVideoSource
+    /// 本次会话的帧新鲜度下界。早于它的 JPEG 属于上一场，直接跳过。
+    private let notBefore: Date
     private var timer: DispatchSourceTimer?
     private var lastFrameDate: Date?
     /// isRunning 主线程写、decodeQueue 读：用锁保护，避免 stop 后仍在解码的帧再推一帧。
@@ -2474,8 +2538,9 @@ final class ScreenFramePusher {
     /// 这里挂一个只用于转发的采集器实例（真正推帧走 didCapture，不经过它的采集回调）。
     private let frameCapturer: RTCVideoCapturer
 
-    init(source: RTCVideoSource) {
+    init(source: RTCVideoSource, notBefore: Date) {
         self.source = source
+        self.notBefore = notBefore
         self.frameCapturer = RTCVideoCapturer(delegate: source)
     }
 
@@ -2545,7 +2610,9 @@ final class ScreenFramePusher {
 
         // readIfNewer 在文件级判断，轻量，可以主线程做；
         // 解码与帧构造丢到后台队列。
-        guard let jpeg = SharedFrameStore.readIfNewer(than: &lastFrameDate) else { return }
+        // notBefore 把上一场残留的 JPEG 挡在门外——否则 push 会从旧帧开始，
+        // 诊断计数看着在涨，实际上推的是几分钟前的画面。
+        guard let jpeg = SharedFrameStore.readIfNewer(than: &lastFrameDate, notBefore: notBefore) else { return }
 
         beginDecoding()
         Self.decodeQueue.async { [weak self] in
