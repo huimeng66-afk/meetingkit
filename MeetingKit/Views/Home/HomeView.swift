@@ -254,13 +254,17 @@ struct HomeView: View {
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text("输入会议号，")
+                        // kerning 必须挂在 Text 上：Text.kerning 是 iOS 13 起就有的，
+                        // 挂到外层 VStack 会命中 View.kerning——那是 iOS 16+ 的 API，
+                        // 在 15.0 的部署目标下直接编译失败（CI 就是被这一行卡住的）。
+                        .kerning(-0.5)
                         .foregroundColor(Theme.Palette.ink)
 
                     Text("直接进会。")
+                        .kerning(-0.5)
                         .foregroundColor(Theme.Palette.accent)
                 }
                 .font(.system(size: 30, weight: .semibold))
-                .kerning(-0.5)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
                 .padding(.top, 44)
