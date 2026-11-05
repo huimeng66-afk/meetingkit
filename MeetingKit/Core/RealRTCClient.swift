@@ -423,7 +423,7 @@ final class RealRTCClient: NSObject, RTCClient {
             .headphones, .bluetoothA2DP, .bluetoothHFP, .bluetoothLE,
             .airPlay, .usbAudio
         ]
-        return session.currentRoute.outputs.contains { external.contains($0.portType) }
+        return session.currentRoute.outputs.contains(where: { external.contains($0.portType) })
     }
 
     // MARK: - 共享期间的音频路由看守
@@ -462,7 +462,7 @@ final class RealRTCClient: NSObject, RTCClient {
             : av.categoryOptions.contains(.defaultToSpeaker)
         let fellBackToEarpiece = speakerOn
             && !hasExternalAudioRoute(av)
-            && av.currentRoute.outputs.contains { $0.portType == .builtInEarpiece }
+            && av.currentRoute.outputs.contains(where: { $0.portType == .builtInEarpiece })
         let wrongRoute = av.category != .playAndRecord
             || av.mode != .voiceChat
             || speakerOptionMismatch
