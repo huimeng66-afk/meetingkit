@@ -279,9 +279,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
            旧实现 CGImage → UIImage → jpegData 会同时持有三份大对象，
            1080p 下峰值接近 40MB，扩展很容易被 jetsam 杀掉。
            CIContext 的 jpegRepresentation 在渲染管线内直接编码，
-           只保留一份输出 Data。 */
-        let options: [CIContextOption: Any] = [
-            CIContextOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): Self.jpegQuality
+           只保留一份输出 Data。
+
+           注意 options 的类型是 `[CIImageRepresentationOption: Any]`，
+           不是 `[CIContextOption: Any]` —— 这两个类型互不兼容，写错直接编译失败
+           （1.5.4 第一次 CI 就栽在这里）。压缩质量键仍是 CoreGraphics 的那个常量。 */
+        let options: [CIImageRepresentationOption: Any] = [
+            CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): Self.jpegQuality
         ]
         guard let jpeg = ciContext.jpegRepresentation(
             of: scaled,
