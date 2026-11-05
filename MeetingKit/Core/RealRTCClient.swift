@@ -89,9 +89,13 @@ final class RealRTCClient: NSObject, RTCClient {
 
     private var localAudioTrack: RTCAudioTrack?
     private var localVideoTrack: RTCVideoTrack?
+    private var localVideoSource: RTCVideoSource?
     private var localScreenTrack: RTCVideoTrack?
     private var localScreenSource: RTCVideoSource?
     private var videoCapturer: RTCCameraVideoCapturer?
+    /// 摄像头是否正在采集。与 `localVideoTrack.isEnabled` 分开：
+    /// 轨可以一直是开的，但采集停了（关摄像头时 stopCapture 会熄灯）。
+    private var isCameraCapturing = false
     private var previewView: RTCCameraPreviewView?
 
     private var screenPusher: ScreenFramePusher?
@@ -274,23 +278,50 @@ final class RealRTCClient: NSObject, RTCClient {
 
     func setCameraEnabled(_ enabled: Bool) {
         guard let track = localVideoTrack else { return }
-        track.isEnabled = enabled
-        if enabled {
-            // 重新开摄像头：恢复采集（关闭时已 stopCapture，指示灯随之熄灭）。
-            if let device = currentCameraDevice,
-               let format = Self.bestFormat(for: device),
-               let capturer = videoCapturer {
-                capturer.startCapture(with: device, format: format, fps: Self.cameraFPS) { error in
-                    if let error = error {
-                        print("[rtc] camera resume failed: \(error.localizedDescription)")
-                    }
-                }
-            }
-        } else {
+
+        guard enabled else {
+            track.isEnabled = false
             videoCapturer?.stopCapture()
+            isCameraCapturing = false
+            publishLocalMediaState()
+            publishParticipants()
+            return
         }
+
+        // 先把轨与界面状态打开：采集启动是异步的，等它完成再改 UI 会有一段黑屏。
+        track.isEnabled = true
         publishLocalMediaState()
         publishParticipants()
+
+        // 已经在采集（入会时摄像头就是开的）：只打开轨即可，不必再碰硬件。
+        guard !isCameraCapturing else { return }
+
+        // 首次开启才请求权限：入会时关着摄像头的人，不应该一进来就被弹窗拦住。
+        Task { [weak self] in
+            guard let self = self else { return }
+
+            let granted = await Self.requestCameraPermission()
+            guard granted,
+                  let device = Self.preferredCameraDevice(),
+                  let format = Self.bestFormat(for: device) else {
+                // 开不起来就退回关闭状态，并明确告诉界面——
+                // 否则图标显示"已开"，画面永远是黑的。
+                self.localVideoTrack?.isEnabled = false
+                self.isCameraCapturing = false
+                self.publishLocalMediaState()
+                self.publishParticipants()
+                self.delegate?.rtcDidUpdateLocalCamera(false)
+                return
+            }
+
+            self.currentCameraDevice = device
+            self.videoCapturer?.startCapture(with: device, format: format, fps: Self.cameraFPS) { error in
+                if let error = error {
+                    print("[rtc] camera resume failed: \(error.localizedDescription)")
+                }
+            }
+            self.isCameraCapturing = true
+        }
     }
 
     func switchCamera() {
@@ -563,35 +594,44 @@ final class RealRTCClient: NSObject, RTCClient {
         localAudioTrack = audioTrack
 
         // 摄像头（前置，720p@30）。
+        //
+        // 视频源与视频轨**始终创建**，即使本次入会是关着摄像头的。
+        // 原因：PeerConnection 里有没有 video sender，取决于入会时有没有 addTrack。
+        // 入会时没建轨，会中再点"开摄像头"就只能走 addTrack + 重新协商，
+        // 而自定义信令里没有实现这条路径——用户看到的就是"点了没反应"。
+        //
+        // 创建 source/track 不触碰摄像头，也不会亮指示灯；只有 startCapture 才会。
+        let videoSource = factory.videoSource()
+        localVideoSource = videoSource
+        let capturer = RTCCameraVideoCapturer(delegate: videoSource)
+        videoCapturer = capturer
+
+        let track = factory.videoTrack(with: videoSource, trackId: "video-\(UUID().uuidString)")
+        localVideoTrack = track
+
         if videoOn || cameraOn {
-            let videoSource = factory.videoSource()
-            let capturer = RTCCameraVideoCapturer(delegate: videoSource)
-            videoCapturer = capturer
-
             let granted = await Self.requestCameraPermission()
-            guard granted else {
-                throw RTCJoinError(message: "需要摄像头权限才能开启画面，可在系统设置中开启", code: "CAMERA_DENIED")
-            }
 
-            let device = RTCCameraVideoCapturer.captureDevices().first(where: { $0.position == .front })
-                ?? RTCCameraVideoCapturer.captureDevices().first
-            guard let device = device else {
-                throw RTCJoinError(message: "未检测到可用摄像头", code: "NO_CAMERA")
-            }
-
-            guard let format = Self.bestFormat(for: device) else {
-                throw RTCJoinError(message: "摄像头不支持可用分辨率", code: "NO_CAMERA_FORMAT")
-            }
-            currentCameraDevice = device
-            capturer.startCapture(with: device, format: format, fps: Self.cameraFPS) { error in
-                if let error = error {
-                    print("[rtc] camera start failed: \(error.localizedDescription)")
+            // 权限被拒 / 无可用设备：降级为纯音频入会，不再 throw。
+            // 之前这里直接抛错，用户只是想开个会，却被一个摄像头授权挡在门外，
+            // 连"关掉摄像头再进"的提示都没有。
+            if granted,
+               let device = Self.preferredCameraDevice(),
+               let format = Self.bestFormat(for: device) {
+                currentCameraDevice = device
+                capturer.startCapture(with: device, format: format, fps: Self.cameraFPS) { error in
+                    if let error = error {
+                        print("[rtc] camera start failed: \(error.localizedDescription)")
+                    }
                 }
+                isCameraCapturing = true
+                track.isEnabled = videoOn
+            } else {
+                track.isEnabled = false
+                delegate?.rtcDidUpdateLocalCamera(false)
             }
-
-            let track = factory.videoTrack(with: videoSource, trackId: "video-\(UUID().uuidString)")
-            track.isEnabled = videoOn
-            localVideoTrack = track
+        } else {
+            track.isEnabled = false
         }
 
         // 共享源（帧由 SharedFrameStore 推送）。
@@ -647,6 +687,13 @@ final class RealRTCClient: NSObject, RTCClient {
         case .balanced:
             return (1280, 720, 15, 1_600_000)
         }
+    }
+
+    /// 前置优先；没有前置（少见的 iPad 外接场景）就退回第一个可用设备。
+    /// 入会建流与会中开摄像头共用这一处选择逻辑，避免两边挑到不同的摄像头。
+    static func preferredCameraDevice() -> AVCaptureDevice? {
+        let devices = RTCCameraVideoCapturer.captureDevices()
+        return devices.first(where: { $0.position == .front }) ?? devices.first
     }
 
     /// 选 720p 档位里最合适的格式：优先 1280x720@30，否则最接近 720p 且不超采。
@@ -826,9 +873,12 @@ final class RealRTCClient: NSObject, RTCClient {
     }
 
     private func buildLocalUser() -> MeetingUser {
-        MeetingUser(
+        // 不用 `options!`：同一表达式里的短路求值虽然安全，但读的人得先算一遍
+        // 才敢确认它不会崩。取出来判空更直接。
+        let joinedName = options?.name ?? ""
+        return MeetingUser(
             id: selfPeerID,
-            name: selfName.isEmpty ? (options?.name.isEmpty == false ? options!.name : "访客") : selfName,
+            name: selfName.isEmpty ? (joinedName.isEmpty ? "访客" : joinedName) : selfName,
             role: isSelfHost ? .host : .participant,
             isMicOn: localAudioTrack?.isEnabled ?? true,
             isCameraOn: localVideoTrack?.isEnabled ?? false,

@@ -62,6 +62,11 @@ struct HomeView: View {
     /// 资料保存中。服务端改名是一次网络请求，重复点击会发出两次 PATCH。
     @State private var isSavingProfile = false
 
+    /// 正在向服务端创建即时会议。
+    /// 创建是一次网络往返，期间按钮没有任何变化；用户会以为没点上而连点，
+    /// 结果服务端多出几场空会议，进的是最后一场，前面几场永远没人进。
+    @State private var isStartingMeeting = false
+
     /// GeometryReader 不会为键盘自动上移，资料卡的昵称输入需要自己抬起来。
     @State private var keyboardHeight: CGFloat = 0
 
@@ -1580,8 +1585,14 @@ struct HomeView: View {
             return
         }
 
+        // 防重入：创建期间再点一次，只会多产生一场没人进的空会议。
+        guard !isStartingMeeting else { return }
+        isStartingMeeting = true
+
         let name = router.profile.displayName
         APIClient.createMeeting(title: "\(name)的会议", instant: true) { result in
+            self.isStartingMeeting = false
+
             switch result {
             case .success(let meeting):
                 self.router.openPreJoin(

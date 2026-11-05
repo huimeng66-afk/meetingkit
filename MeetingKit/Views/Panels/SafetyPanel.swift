@@ -22,11 +22,16 @@ struct SafetyPanel: View {
                 settingRow(
                     symbol: SymbolCompat.name("lock.fill", "lock"),
                     title: "锁定会议",
-                    subtitle: "新参会人将无法加入",
+                    // 非主持人把开关点来点去也不会生效（ViewModel 里会静默 return），
+                    // 直接在界面上禁用并说明原因，比"点了没反应"诚实。
+                    subtitle: viewModel.isCurrentUserHost
+                        ? "新参会人将无法加入"
+                        : "仅主持人可操作",
                     isOn: Binding(
                         get: { viewModel.isLocked },
                         set: { viewModel.setLocked($0) }
-                    )
+                    ),
+                    isDisabled: !viewModel.isCurrentUserHost
                 )
 
                 rowDivider

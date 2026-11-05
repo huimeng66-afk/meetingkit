@@ -232,6 +232,10 @@ struct AppRootView: View {
                 title: "加入会议",
                 displayName: router.profile.displayName,
                 isHost: false,
+                // 从链接进来同样尊重设置里的默认音视频，
+                // 否则"我在设置里关了麦克风"这件事会被一条邀请链接推翻。
+                micOn: AppSettings.mediaDefaultsSnapshot.mic,
+                cameraOn: AppSettings.mediaDefaultsSnapshot.camera,
                 token: AuthStore.load()?.token ?? ""
             )
         )

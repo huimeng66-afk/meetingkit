@@ -346,6 +346,10 @@ struct VideoCanvasView: View {
         if user.isLocal {
             return nil
         }
+        // 对方关了摄像头就别再挂旧画面。
+        // WebRTC 关摄像头只是停发帧、不断流，view 仍留在字典里；
+        // 继续渲染会定格在最后一帧，看起来像"卡住了"而不是"他关了摄像头"。
+        guard user.isCameraOn else { return nil }
         return viewModel.remoteVideoViews[user.id]
     }
 
@@ -384,7 +388,9 @@ struct VideoCanvasView: View {
 
     private func copyInvite() {
         let number = viewModel.formattedMeetingNumber
-        let link = "tianqiong://join/\(viewModel.meetingNumber)"
+        // 与邀请面板、首页通讯录共用同一个网页地址：
+        // 同一个会议出现两种链接，未安装 App 的人扫到 tianqiong:// 只会停在"无法打开"。
+        let link = TianqiongAPI.roomLink(number: viewModel.meetingNumber)
         UIPasteboard.general.string = "天穹会议邀请你加入\n会议号：\(number)\n点击加入：\(link)"
         Haptics.impact(.light)
         viewModel.showToast(

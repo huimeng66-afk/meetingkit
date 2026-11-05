@@ -166,6 +166,18 @@ protocol RTCClientDelegate: AnyObject {
 
     /// 断线重连后重新入会失败且不可恢复（会议已结束 / 被移出 / 已锁定等）。
     func rtcDidRejoinFail(message: String)
+
+    /// 本地摄像头的**实际**状态与界面请求不一致时回调。
+    ///
+    /// 典型场景：用户点开摄像头，但系统权限被拒、或设备上没有可用摄像头。
+    /// 此时 RTC 层不能默默失败——界面已经乐观地把图标切成了"开"，
+    /// 不回调就等于让用户对着一个永远黑屏的格子。
+    func rtcDidUpdateLocalCamera(_ enabled: Bool)
+}
+
+extension RTCClientDelegate {
+    /// 默认空实现：Mock 与旧实现不需要为这个回调改动。
+    func rtcDidUpdateLocalCamera(_ enabled: Bool) {}
 }
 
 // MARK: - 客户端能力

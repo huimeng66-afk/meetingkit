@@ -191,6 +191,11 @@ struct MicPulseRing: View {
     var isMicOn: Bool
     var diameter: CGFloat
 
+    /// 系统"减弱动态效果"。
+    /// 一圈永不停止的扩散动画对前庭敏感用户是持续刺激；开启后改为静态描边，
+    /// "麦克风开着"的信息仍然在，只是不再动。
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     @State private var expand: Bool = false
 
     /// 说话时更亮、更快；仅开麦时只留一层几乎不可见的呼吸。
@@ -209,9 +214,17 @@ struct MicPulseRing: View {
     var body: some View {
         ZStack {
             if isMicOn {
-                ring(delay: 0)
-                if isSpeaking {
-                    ring(delay: duration * 0.5)
+                if reduceMotion {
+                    // 静态描边：不跑循环动画，但保留"正在开麦"的视觉提示。
+                    Circle()
+                        .stroke(isSpeaking ? Color.white.opacity(0.5) : Color.white.opacity(0.2),
+                                lineWidth: isSpeaking ? 2 : 1)
+                        .frame(width: diameter, height: diameter)
+                } else {
+                    ring(delay: 0)
+                    if isSpeaking {
+                        ring(delay: duration * 0.5)
+                    }
                 }
             }
         }

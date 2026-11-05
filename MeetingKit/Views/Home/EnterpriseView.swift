@@ -1178,6 +1178,10 @@ struct EnterpriseView: View {
                 // canManage 是服务端对"主持人 / 企业管理员"的合并判定，
                 // 比在客户端猜身份更接近真实权限。
                 isHost: room.canManage,
+                // 音视频预置要跟着设置走。不传就落到 JoinInfo 的默认值
+                // （麦克风开、摄像头关），用户在设置里关掉的默认麦克风会在这里被悄悄打开。
+                micOn: AppSettings.mediaDefaultsSnapshot.mic,
+                cameraOn: AppSettings.mediaDefaultsSnapshot.camera,
                 token: AuthStore.load()?.token ?? ""
             )
         )
@@ -1199,6 +1203,8 @@ struct EnterpriseView: View {
                 title: trimmedTitle.isEmpty ? "企业会议" : trimmedTitle,
                 displayName: router.profile.displayName,
                 isHost: false,
+                micOn: AppSettings.mediaDefaultsSnapshot.mic,
+                cameraOn: AppSettings.mediaDefaultsSnapshot.camera,
                 token: AuthStore.load()?.token ?? ""
             )
         )

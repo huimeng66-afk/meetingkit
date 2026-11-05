@@ -145,6 +145,13 @@ final class MeetingViewModel: ObservableObject {
     private var toastDismissTask: Task<Void, Never>?
     private var hasJoined = false
 
+    /// 用户已经主动离会。
+    ///
+    /// 入会握手是异步的（信令 + ICE，慢网下要好几秒）。如果用户在握手返回前点了离开，
+    /// 迟到的回调会把已经收起来的"无法加入会议"错误页重新推上来——
+    /// 表现为"我明明退出了，怎么又弹一个加入失败"。
+    private var hasLeftLocally = false
+
     /// 计时器的拍数。屏幕共享的轮询挂在这里，避免再起一个计时器。
     private var clockTickCount = 0
 
@@ -600,7 +607,9 @@ final class MeetingViewModel: ObservableObject {
             ),
             title: isCurrentUserHost ? "会议已结束" : "已离开会议",
             text: isCurrentUserHost ? "你结束了本次会议" : "你可以重新加入会议",
-            canRejoin: true
+            // 主持人结束的是会议本身（即时会议在服务端已置为 ENDED），
+            // 再点"重新入会"只会得到一句"会议已结束"。参会者只是离开，会议还在，可以重进。
+            canRejoin: !isCurrentUserHost
         )
     }
 
@@ -614,6 +623,8 @@ final class MeetingViewModel: ObservableObject {
         canRejoin: Bool = true
     ) {
         rtc.leave()
+        // 标记主动离会：正在飞行中的入会回调看到它就不再改写界面状态。
+        hasLeftLocally = true
         connectionState = .disconnected
         participants = []
         remoteVideoViews.removeAll()
@@ -725,6 +736,21 @@ extension MeetingViewModel: RTCClientDelegate {
 
     func rtcDidChangeActiveSpeaker(_ userID: String?) {
         activeSpeakerID = userID
+    }
+
+    /// 摄像头实际没开成（权限被拒 / 无可用设备）。
+    ///
+    /// 状态本身由 `rtcDidUpdateParticipants` 的快照统一回灌，这里只负责解释原因：
+    /// 用户点了"开摄像头"，图标闪一下又变回关闭，不给一句话只会以为是 App 坏了。
+    func rtcDidUpdateLocalCamera(_ enabled: Bool) {
+        guard !enabled else { return }
+        showToast(
+            ToastMessage(
+                text: "无法开启摄像头，请在系统设置中允许访问相机",
+                systemImage: "video.slash.fill",
+                style: .warning
+            )
+        )
     }
 
     func rtcDidChangeNetworkQuality(_ quality: NetworkQuality) {
@@ -843,7 +869,9 @@ extension MeetingViewModel: RTCClientDelegate {
                 text: "会议已结束",
                 systemImage: "phone.down.fill",
                 style: .danger
-            )
+            ),
+            // 会议已经在服务端结束，重新入会必然失败，不给这个死按钮。
+            canRejoin: false
         )
     }
 
@@ -881,7 +909,9 @@ extension MeetingViewModel: RTCClientDelegate {
             ),
             title: "账号在其他设备入会",
             text: "同一账号只能在一个设备参加会议",
-            canRejoin: true
+            // 这里不能给"重新入会"：点下去会把另一台设备顶掉，
+            // 两边来回点就是无限互踢。要换设备，请在那边先退出。
+            canRejoin: false
         )
     }
 
@@ -1165,6 +1195,7 @@ private extension MeetingViewModel {
 
     /// onAppear 与 rejoin 共用的入会流程：构造本机用户 → rtc.join，失败则回到 disconnected。
     func joinSession() {
+        hasLeftLocally = false
         let me = makeLocalUser()
         let options = JoinOptions(
             no: meetingNumber,
@@ -1178,6 +1209,10 @@ private extension MeetingViewModel {
             guard let self = self else { return }
             do {
                 try await self.rtc.join(roomID: self.meetingNumber, me: me, options: options)
+
+                // 握手期间用户已经离会：不要再往界面上写任何"入会成功"的状态。
+                guard !self.hasLeftLocally else { return }
+
                 // 结束会议后重新入会：sessionStart 已在 endMeeting 里清空，
                 // 这里把计时基准复位到"入会成功"的瞬间，durationText 从 00:00:00 重新走（H-3）。
                 // 首次入会时 startTickerIfNeeded 已经起过基准，不能覆盖，
@@ -1189,6 +1224,8 @@ private extension MeetingViewModel {
                 // 入会成功后同步本地预览视图。
                 self.localPreviewView = self.rtc.localPreviewView()
             } catch let joinError as RTCJoinError {
+                // 主动离会导致的失败不是"入会失败"，不要用错误页盖掉离会结果。
+                guard !self.hasLeftLocally else { return }
                 self.connectionState = .disconnected
                 // 终态错误（会议已结束/被移出/已锁定/号无效/预约过期）重试也不会成功，
                 // 直接隐藏「重新入会」，避免用户反复点同一个失败按钮。
@@ -1205,6 +1242,7 @@ private extension MeetingViewModel {
                     )
                 )
             } catch {
+                guard !self.hasLeftLocally else { return }
                 self.connectionState = .disconnected
                 self.endTitle = "无法加入会议"
                 self.endText = "加入会议失败，请检查网络"
