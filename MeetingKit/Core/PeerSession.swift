@@ -229,18 +229,58 @@ final class PeerSession: NSObject {
     /// 屏幕共享：用 screen 替换当前的 video sender（Web 端同款 replaceTrack 策略）。
     /// track 为 nil 时移除上行视频（结束共享且本端无摄像头）。
     func replaceVideoTrack(with track: RTCVideoTrack?) {
-        guard let sender = videoSender ?? senderForVideoTrack() else {
-            /* 一条 video sender 都没有（例如对端加入时本端摄像头是关的、
-               共享又刚被停掉）：直接补一条上行轨，让它走一次重新协商。
-               原来的实现这里直接 return，第二次开共享就永远推不上去。 */
-            if let track = track {
-                peerConnection.add(track, streamIds: ["tq-\(peerID)"])
-                videoSender = senderForVideoTrack()
-            }
+        guard let track = track else {
+            /* 停止共享：只摘轨、不发 offer。
+               m-line 不能删（SDP 里删 m-line 等于重新协商整条会话），
+               对端由 screen:false 信令收口。 */
+            (videoSender ?? senderForVideoTrack())?.track = nil
             return
         }
-        videoSender = sender
-        sender.track = track
+
+        if let sender = videoSender ?? senderForVideoTrack() {
+            videoSender = sender
+            sender.track = track
+            /* 换轨**不改变 SDP 方向**。
+               摄像头从没开过时，这条 video transceiver 是被谈成 recvonly 的；
+               把共享轨塞进同一个 sender，本地看"挂了轨、在推帧"，
+               对端却一个包都收不到——浏览器就永远停在"正在接收共享画面…"。
+               这种情况必须拆了重挂，让 addTrack 把方向重新谈成 sendrecv。 */
+            if !canSend(on: sender) {
+                forceReattachVideo(track)
+                return
+            }
+        } else {
+            /* 一条 video sender 都没有（对端加入时本端摄像头是关的）：
+               补一条上行轨。addTrack 会新建 sendrecv transceiver。 */
+            peerConnection.add(track, streamIds: ["tq-\(peerID)"])
+            videoSender = senderForVideoTrack()
+        }
+
+        /* 必须显式协商，不能只赌 negotiationNeeded 回调。
+           真机现象：帧推了三百多帧，对端一帧没收到——offer 根本没发出去。 */
+        negotiate()
+    }
+
+    /// 这条 sender 所在 transceiver 协商后的实际方向是否允许发送。
+    private func canSend(on sender: RTCRtpSender) -> Bool {
+        guard let tx = peerConnection.transceivers.first(where: { $0.sender === sender }) else {
+            // 找不到 transceiver（极少见）：当作不可发，走重挂兜底。
+            return false
+        }
+        return tx.currentDirection == .sendRecv || tx.currentDirection == .sendOnly
+    }
+
+    /// 拆掉旧 sender 再挂一次，强制把方向谈回 sendrecv。
+    func forceReattachVideo(_ track: RTCVideoTrack) {
+        guard !isClosed else { return }
+        localVideo = track
+        if let old = videoSender ?? senderForVideoTrack() {
+            peerConnection.removeTrack(old)
+        }
+        videoSender = nil
+        peerConnection.add(track, streamIds: ["tq-\(peerID)"])
+        videoSender = senderForVideoTrack()
+        negotiate()
     }
 
     /// 记录并返回当前 video sender。sender.track 可能为 nil（关闭视频时），

@@ -155,6 +155,10 @@ final class RealRTCClient: NSObject, RTCClient {
     private var latestLocalLevel: Float = 0
     private var latestRemoteLevel: [String: Float] = [:]
 
+    /// 共享视频上行看门狗：起播 4 秒后仍有 peer 一个视频包没发出去，
+    /// 说明 sender 方向或 track 挂载有问题，强制重挂一次。
+    private var videoUplinkWatchdog: DispatchWorkItem?
+
     /// 上行音频看门狗（peerID → 待执行的探测）。
     private var outboundAudioWatchdogs: [String: DispatchWorkItem] = [:]
     private var outboundAudioProbeCounts: [String: Int] = [:]
@@ -544,6 +548,7 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 释放本地采集与音频会话（入会失败 / 主动离开共用）。
     private func teardownLocalMedia() {
         stopLifecycleObservers()
+        stopVideoUplinkWatchdog()
         stopRouteGuard()
         screenPusher?.stop()
         screenPusher = nil
@@ -791,7 +796,47 @@ final class RealRTCClient: NSObject, RTCClient {
            只靠这一次同步调用，经常正好打在 ReplayKit 改配置之前。 */
         reactivateAudioSession(force: true)
         startRouteGuard()
+        scheduleVideoUplinkWatchdog()
         syncTeardownBox()
+    }
+
+    /// 共享起播后核对"视频包到底发出去了没有"。
+    ///
+    /// 真机反馈：共享诊断显示"已推 RTC 358 帧"，浏览器却一直停在
+    /// "正在接收共享画面…"。帧推给了 video source，但 sender 所在
+    /// transceiver 是 recvonly（摄像头从没开过时就是这样），编码器
+    /// 一个包都不发。这里 4 秒后查一次，0 包就拆了重挂再协商。
+    private func scheduleVideoUplinkWatchdog() {
+        videoUplinkWatchdog?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, self.isScreenSharing else { return }
+                for peer in self.remotePeers.values {
+                    peer.session.peerConnection.statistics { report in
+                        var sent = 0
+                        for (_, st) in report.statistics where st.type == "outbound-rtp" {
+                            if (st.values["kind"] as? String) == "video" {
+                                sent = (st.values["packetsSent"] as? NSNumber)?.intValue ?? 0
+                            }
+                        }
+                        guard sent == 0 else { return }
+                        Task { @MainActor in
+                            guard self.isScreenSharing,
+                                  let track = self.localScreenTrack,
+                                  self.remotePeers[peer.peerID] != nil else { return }
+                            peer.session.forceReattachVideo(track)
+                        }
+                    }
+                }
+            }
+        }
+        videoUplinkWatchdog = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: item)
+    }
+
+    private func stopVideoUplinkWatchdog() {
+        videoUplinkWatchdog?.cancel()
+        videoUplinkWatchdog = nil
     }
 
     /// 按当前人数重新分配共享上行码率。
@@ -827,6 +872,7 @@ final class RealRTCClient: NSObject, RTCClient {
 
     /// Broadcast 扩展确认停止共享后调用：恢复摄像头轨。
     func endScreenFramePush() {
+        stopVideoUplinkWatchdog()
         stopRouteGuard()
         screenPusher?.stop()
         screenPusher = nil
@@ -848,6 +894,7 @@ final class RealRTCClient: NSObject, RTCClient {
             delegate?.rtcDidScreenShareRejected(reason: reason)
             return
         }
+        stopVideoUplinkWatchdog()
         stopRouteGuard()
         isScreenSharing = false
         screenPusher?.stop()
@@ -1424,8 +1471,9 @@ final class RealRTCClient: NSObject, RTCClient {
             let name = peer.name.isEmpty ? String(id.prefix(6)) : peer.name
             let conn = Self.connectionText(peer.session.peerConnection.connectionState)
             let ice = Self.iceText(peer.session.peerConnection.iceConnectionState)
-            let localDir = Self.audioDirection(in: peer.session.peerConnection.localDescription?.sdp)
-            let remoteDir = Self.audioDirection(in: peer.session.peerConnection.remoteDescription?.sdp)
+            let localDir = Self.mediaDirection(in: peer.session.peerConnection.localDescription?.sdp, kind: "audio")
+            let remoteDir = Self.mediaDirection(in: peer.session.peerConnection.remoteDescription?.sdp, kind: "audio")
+            let localVideoDir = Self.mediaDirection(in: peer.session.peerConnection.localDescription?.sdp, kind: "video")
             let senderCount = peer.session.audioSenderCount
 
             peer.session.peerConnection.statistics { report in
@@ -1454,7 +1502,8 @@ final class RealRTCClient: NSObject, RTCClient {
                 }
                 let line = """
                 \(name)：\(conn) / ICE \(ice)
-                  SDP 本端 \(localDir) · 远端 \(remoteDir) · 音频发送器 \(senderCount)
+                  SDP 音频 本端 \(localDir) · 远端 \(remoteDir)
+                  SDP 视频 本端 \(localVideoDir) · 音频发送器 \(senderCount)
                   收音频 \(inPackets) 包 · \(inKB)KB · 电平 \(String(format: "%.2f", level))
                   发音频 \(outPackets) 包 · \(outKB)KB · 电平 \(String(format: "%.2f", outLevel)) · 发视频 \(outVideo) 包 · 收视频 \(frameKB)KB
                 """
@@ -1506,7 +1555,7 @@ final class RealRTCClient: NSObject, RTCClient {
     /// RFC 4566 规定方向属性缺省即 sendrecv，libwebrtc 在部分路径下
     /// 会省略这一行——旧实现把它显示成"未声明"，看起来像没协商成功，
     /// 实际是正常的。这里按协议把它还原成 sendrecv(默认)。
-    private static func audioDirection(in sdp: String?) -> String {
+    private static func mediaDirection(in sdp: String?, kind: String) -> String {
         guard let sdp = sdp, !sdp.isEmpty else { return "无描述" }
         var inAudio = false
         var sawAudioLine = false
@@ -1517,7 +1566,7 @@ final class RealRTCClient: NSObject, RTCClient {
            不成立，诊断里就永远是"无音频行"。 */
         for rawLine in sdp.split(whereSeparator: { $0.isNewline }) {
             let line = String(rawLine)
-            if line.hasPrefix("m=audio") {
+            if line.hasPrefix("m=\(kind)") {
                 inAudio = true
                 sawAudioLine = true
                 continue
@@ -1533,7 +1582,7 @@ final class RealRTCClient: NSObject, RTCClient {
             if line.hasPrefix("a=inactive") { return "inactive" }
         }
         if sawAudioLine { return "sendrecv(默认)" }
-        return "无音频行"
+        return "无\(kind)行"
     }
 
     /// 屏幕共享的编码档位。
