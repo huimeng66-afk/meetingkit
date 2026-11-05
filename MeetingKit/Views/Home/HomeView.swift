@@ -875,10 +875,11 @@ struct HomeView: View {
                 // 不用为了 1.2pt 的间距把部署目标抬上去。
                 .font(.system(size: 18, weight: .medium, design: .rounded).monospacedDigit())
                 .foregroundColor(Theme.Palette.ink)
-                // 会议号只可能是数字：输入法粘贴进来的连字符、空格直接剔掉，
-                // 长度按 9 位截断（服务端最多 9 位，留一位余量比截断成 7 位更安全）。
+                // 会议号只可能是数字：输入法粘贴进来的连字符、空格直接剔掉。
+                // 长度按 7 位截断——服务端 util.js 的 meetingNo() 固定生成 7 位，
+                // 这里多留余量没有意义，只会让人以为自己能输 9 位。
                 .onChange(of: meetingNumber) { value in
-                    let digits = String(value.filter { $0.isNumber }.prefix(9))
+                    let digits = String(value.filter { $0.isNumber }.prefix(7))
                     if digits != value {
                         meetingNumber = digits
                     }
@@ -1116,6 +1117,20 @@ struct HomeView: View {
         let trimmed = meetingNumber.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             showToast("请先输入会议号", icon: "number", style: .warning)
+            return
+        }
+
+        // 首页就拦住位数不对的输入。
+        // 之前只判"非空"：输入 3 位也能点，跳进入会页才被拦下，
+        // 用户白跳一次还要重新理解一遍规则。
+        guard trimmed.count == 7 else {
+            let remaining = max(0, 7 - trimmed.count)
+            showToast(
+                remaining > 0 ? "会议号是 7 位数字，还差 \(remaining) 位" : "请输入 7 位会议号",
+                icon: "number",
+                style: .warning
+            )
+            Haptics.notify(.warning)
             return
         }
 
