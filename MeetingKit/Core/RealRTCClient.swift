@@ -137,6 +137,24 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 设备级重启的冷却时间：重启一次要断 200ms 左右，不能连环触发。
     private var lastAudioPipelineRestartAt: Date = .distantPast
 
+    /// 一次 RTP 音频的能量快照。
+    ///
+    /// 为什么要自己算电平：`audioLevel` 这个统计字段在 iOS 的 WebRTC 里
+    /// 只有对端开了 RTP 头扩展（ssrc-audio-level）才会被填。线上两台 iOS
+    /// 或者网页端没协商该扩展时，`audioLevel` 恒为 0——诊断面板和"谁在说话"
+    /// 的脉冲就永远是死的。`totalAudioEnergy / totalSamplesDuration` 是
+    /// 累计量，不依赖头扩展，做差分就能还原出真实 RMS。
+    private struct AudioEnergySample {
+        var energy: Double
+        var duration: Double
+    }
+
+    private var lastRemoteEnergy: [String: AudioEnergySample] = [:]
+    private var lastLocalEnergy: AudioEnergySample?
+    /// 最近一次算出的电平，诊断面板直接复用，避免再对同一份数据算一遍。
+    private var latestLocalLevel: Float = 0
+    private var latestRemoteLevel: [String: Float] = [:]
+
     /// 上行音频看门狗（peerID → 待执行的探测）。
     private var outboundAudioWatchdogs: [String: DispatchWorkItem] = [:]
     private var outboundAudioProbeCounts: [String: Int] = [:]
@@ -505,6 +523,7 @@ final class RealRTCClient: NSObject, RTCClient {
             delegate?.rtcDidLoseRemoteMedia(for: peer.peerID)
         }
         remotePeers.removeAll()
+        clearAllAudioLevelState()
         resetOutboundAudioTracking()
         didHandleFirstRemoteAudio = false
         consumedMessageIDs.removeAll()
@@ -1160,42 +1179,69 @@ final class RealRTCClient: NSObject, RTCClient {
            两者都会和 WebRTC 抢音频设备，是 1.4.6 ~ 1.4.9 全部
            "有人进会后麦克风就哑了"的根源。界面如实显示"已就绪"。 */
         guard !peers.isEmpty else {
+            latestLocalLevel = 0
+            latestRemoteLevel.removeAll()
+            lastLocalEnergy = nil
+            lastRemoteEnergy.removeAll()
             delegate?.rtcDidUpdateLocalAudioLevel(0)
             delegate?.rtcDidChangeActiveSpeaker(nil)
             return
         }
 
-        /* 多人：一条 report 里同时有本地（media-source / outbound-rtp）
-           和远端（inbound-rtp）两种电平。远端逐条比大小，最大的那个
-           就是当前发言人——服务端并不下发音量，iOS 端的"谁在说话"只能从这里来。 */
+        /* 多人：一条 report 里同时有本地（media-source）和远端（inbound-rtp）
+           两种电平。远端逐条比大小，最大的那个就是当前发言人——
+           服务端并不下发音量，iOS 端的"谁在说话"只能从这里来。 */
         var loudestID: String?
         var loudestLevel: Float = 0
         var localPeak: Float = 0
         var outboundTotal = 0
+        var remoteEnergy: [String: AudioEnergySample] = [:]
+        var remoteLevels: [String: Float] = [:]
+        var localSample: AudioEnergySample?
         let lock = NSLock()
         let group = DispatchGroup()
 
         for (index, peer) in peers.enumerated() {
+            /* 上一次的累计量必须在**发起统计之前**快照：
+               statistics 的回调在 WebRTC 的串行队列上，回调里再读主线程
+               字典就是数据竞争。 */
+            let previousRemote = lastRemoteEnergy[peer.peerID]
+            let previousLocal = index == 0 ? lastLocalEnergy : nil
+
             group.enter()
             peer.session.peerConnection.statistics { report in
                 var remote: Float = 0
+                var remoteSample: AudioEnergySample?
+                var local: Float = 0
+                var localSampled: AudioEnergySample?
                 var sent = 0
+
                 for (_, stat) in report.statistics {
                     if stat.type == "inbound-rtp",
-                       (stat.values["kind"] as? String) == "audio",
-                       let value = stat.values["audioLevel"] as? NSNumber {
-                        remote = max(remote, value.floatValue)
+                       (stat.values["kind"] as? String) == "audio" {
+                        let (level, sample) = Self.audioLevel(stat: stat, previous: previousRemote)
+                        if level > remote { remote = level }
+                        if let sample { remoteSample = sample }
                     }
                     if stat.type == "outbound-rtp",
                        (stat.values["kind"] as? String) == "audio" {
                         sent = (stat.values["packetsSent"] as? NSNumber)?.intValue ?? 0
                     }
+                    if index == 0, stat.type == "media-source" {
+                        let (level, sample) = Self.audioLevel(stat: stat, previous: previousLocal)
+                        if level > local { local = level }
+                        if let sample { localSampled = sample }
+                    }
                 }
-                let local = index == 0 ? Self.localAudioLevel(in: report) : 0
 
                 lock.lock()
-                if index == 0 { localPeak = local }
+                if index == 0 {
+                    localPeak = local
+                    localSample = localSampled
+                }
                 outboundTotal += sent
+                if let remoteSample { remoteEnergy[peer.peerID] = remoteSample }
+                if remote > 0 { remoteLevels[peer.peerID] = remote }
                 if remote > loudestLevel {
                     loudestLevel = remote
                     loudestID = peer.peerID
@@ -1207,28 +1253,65 @@ final class RealRTCClient: NSObject, RTCClient {
 
         group.notify(queue: .main) { [weak self] in
             guard let self else { return }
+            if let localSample { self.lastLocalEnergy = localSample }
+            for (id, sample) in remoteEnergy { self.lastRemoteEnergy[id] = sample }
+            self.latestLocalLevel = localPeak
+            self.latestRemoteLevel = remoteLevels
             self.delegate?.rtcDidUpdateLocalAudioLevel(localPeak)
-            // 0.02 是 WebRTC 的底噪水位：低于它的都是空调/键盘，
+            // 0.02 是底噪水位：低于它的都是空调/键盘，
             // 不设门限会出现"没人说话但一直有人亮着"。
             self.delegate?.rtcDidChangeActiveSpeaker(loudestLevel > 0.02 ? loudestID : nil)
             self.evaluateOutboundAudioHealth(total: outboundTotal)
         }
     }
 
-    /// 本地发送电平。优先 `outbound-rtp.audioLevel`（真正发出去的能量），
-    /// 没有这个字段时退回 `media-source.audioLevel`（采集端的能量）。
-    private static func localAudioLevel(in report: RTCStatisticsReport) -> Float {
-        var fromSender: Float = 0
-        var fromSource: Float = 0
-        for (_, stat) in report.statistics {
-            guard let value = (stat.values["audioLevel"] as? NSNumber)?.floatValue else { continue }
-            if stat.type == "outbound-rtp", (stat.values["kind"] as? String) == "audio" {
-                fromSender = max(fromSender, value)
-            } else if stat.type == "media-source" {
-                fromSource = max(fromSource, value)
-            }
+    /// 从一条统计里还原电平。
+    ///
+    /// 优先用累计能量做差分：`audioLevel` 依赖 RTP 头扩展
+    /// （urn:ietf:params:rtp-hdrext:ssrc-audio-level），对方没协商该扩展时
+    /// 这个字段恒为 0——线上"说话时脉冲不动、诊断永远 0.00"就是这么来的。
+    /// `totalAudioEnergy` / `totalSamplesDuration` 是端点自己累计的，
+    /// 不依赖任何协商，差分后开方就是这段时间的真实 RMS 幅度。
+    private static func audioLevel(
+        stat: RTCStatistics,
+        previous: AudioEnergySample?
+    ) -> (Float, AudioEnergySample?) {
+        let direct = (stat.values["audioLevel"] as? NSNumber)?.floatValue ?? 0
+
+        guard let energy = (stat.values["totalAudioEnergy"] as? NSNumber)?.doubleValue,
+              let duration = (stat.values["totalSamplesDuration"] as? NSNumber)?.doubleValue,
+              duration > 0 else {
+            // 老版本 SDK 或该统计不支持能量字段：至少别把已有的 audioLevel 丢掉。
+            return (direct, nil)
         }
-        return max(fromSender, fromSource)
+
+        let sample = AudioEnergySample(energy: energy, duration: duration)
+        guard let previous else { return (direct, sample) }
+
+        let deltaEnergy = energy - previous.energy
+        let deltaDuration = duration - previous.duration
+        // 两次统计间隔太短时差值是噪声，沿用 direct，等下一轮再算。
+        guard deltaEnergy > 0, deltaDuration > 0.002 else { return (direct, sample) }
+
+        let rms = sqrt(deltaEnergy / deltaDuration)
+        // 正常说话的 RMS 约 0.02~0.15；×4 让普通音量就能点亮脉冲，
+        // 又不至于空调声一直满格。
+        let level = Float(min(1, rms * 4))
+        return (max(direct, level), sample)
+    }
+
+    /// 清掉某个 peer 的能量基线：人走了还留着上一场的累计量，
+    /// 下次同 ID 再进来算出的差值会是一个巨大的负数，电平直接归零。
+    private func clearAudioLevelState(for peerID: String) {
+        lastRemoteEnergy.removeValue(forKey: peerID)
+        latestRemoteLevel.removeValue(forKey: peerID)
+    }
+
+    private func clearAllAudioLevelState() {
+        lastRemoteEnergy.removeAll()
+        latestRemoteLevel.removeAll()
+        lastLocalEnergy = nil
+        latestLocalLevel = 0
     }
 
     /// 上行音频健康度。每 5 秒对一次总包数：
@@ -1331,6 +1414,10 @@ final class RealRTCClient: NSObject, RTCClient {
         let group = DispatchGroup()
         var perPeer: [String] = []
         let lock = NSLock()
+        /* 电平直接取轮询缓存：同一份 statistics 在这里再算一遍差值，
+           既要重复两套逻辑，也会因为采样间隔不同得出不同的数。 */
+        let localLevelSnapshot = latestLocalLevel
+        let remoteLevelSnapshot = latestRemoteLevel
 
         for (id, peer) in remotePeers {
             group.enter()
@@ -1351,12 +1438,12 @@ final class RealRTCClient: NSObject, RTCClient {
                     if st.type == "inbound-rtp", (st.values["kind"] as? String) == "audio" {
                         inPackets = (st.values["packetsReceived"] as? NSNumber)?.intValue ?? 0
                         inKB = ((st.values["bytesReceived"] as? NSNumber)?.intValue ?? 0) / 1024
-                        level = (st.values["audioLevel"] as? NSNumber)?.doubleValue ?? 0
+                        level = Double(remoteLevelSnapshot[id] ?? 0)
                     }
                     if st.type == "outbound-rtp", (st.values["kind"] as? String) == "audio" {
                         outPackets = (st.values["packetsSent"] as? NSNumber)?.intValue ?? 0
                         outKB = ((st.values["bytesSent"] as? NSNumber)?.intValue ?? 0) / 1024
-                        outLevel = (st.values["audioLevel"] as? NSNumber)?.doubleValue ?? 0
+                        outLevel = Double(localLevelSnapshot)
                     }
                     if st.type == "outbound-rtp", (st.values["kind"] as? String) == "video" {
                         outVideo = (st.values["packetsSent"] as? NSNumber)?.intValue ?? 0
@@ -1423,7 +1510,12 @@ final class RealRTCClient: NSObject, RTCClient {
         guard let sdp = sdp, !sdp.isEmpty else { return "无描述" }
         var inAudio = false
         var sawAudioLine = false
-        for rawLine in sdp.split(whereSeparator: { $0 == "\r" || $0 == "\n" }) {
+        /* 用 isNewline 而不是逐个比较 "\r" / "\n"：
+           Swift 的 String 按 Character 遍历，"遇到换行时 CRLF 会被合并成
+           一个 Character——它既不等于 "\r" 也不等于 "\n"。旧写法等于
+           完全没有切分，整段 SDP 变成"一行"，hasPrefix("m=audio") 永远
+           不成立，诊断里就永远是"无音频行"。 */
+        for rawLine in sdp.split(whereSeparator: { $0.isNewline }) {
             let line = String(rawLine)
             if line.hasPrefix("m=audio") {
                 inAudio = true
@@ -1600,6 +1692,7 @@ final class RealRTCClient: NSObject, RTCClient {
             delegate?.rtcDidLoseRemoteMedia(for: peerID)
         }
         remotePeers.removeAll()
+        clearAllAudioLevelState()
 
         for raw in snapshot.peers {
             guard let peerID = raw["peerId"] as? String else { continue }
@@ -1913,6 +2006,7 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         if pendingScreenPeerID == peerID { pendingScreenPeerID = nil }
         guard let peer = remotePeers.removeValue(forKey: peerID) else { return }
         peer.session.close()
+        clearAudioLevelState(for: peerID)
         delegate?.rtcDidLoseRemoteMedia(for: peerID)
         // 少一个人，剩下的人可以分到更多上行。
         if isScreenSharing { applyScreenEncodingBudget() }
@@ -2221,6 +2315,7 @@ extension RealRTCClient: PeerSessionDelegate {
         guard let newSession = makePeerSession(peerID: session.peerID) else {
             // 重建失败：把该 peer 移出（等 peer:joined/重连快照再恢复）。
             remotePeers.removeValue(forKey: session.peerID)
+            clearAudioLevelState(for: session.peerID)
             delegate?.rtcDidLoseRemoteMedia(for: session.peerID)
             publishParticipants()
             syncTeardownBox()

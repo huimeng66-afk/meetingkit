@@ -39,7 +39,9 @@ struct BottomControlBar: View {
     /// activeSpeakerID 作为兜底，覆盖 getStats 还没返回第一帧的瞬间。
     private var isLocalSpeaking: Bool {
         guard viewModel.isMicOn else { return false }
-        if viewModel.localAudioLevel > 0.015 { return true }
+        // 0.035：电平现在是 RMS×4 的线性值，安静房间底噪在 0.01~0.03，
+        // 说话在 0.1 以上。门限定 0.015 会让空调声把脉冲一直点亮。
+        if viewModel.localAudioLevel > 0.035 { return true }
         guard let me = viewModel.localUser else { return false }
         return viewModel.activeSpeakerID == me.id
     }
@@ -111,7 +113,12 @@ struct BottomControlBar: View {
             systemImage: viewModel.isCameraOn
                 ? SymbolCompat.name("video.fill")
                 : SymbolCompat.name("video.slash.fill", "video.slash"),
-            title: viewModel.isCameraOn ? "摄像头" : "已关闭",
+            /* 固定写"摄像头"。
+               以前关闭时标签是"已关闭"，底栏又是图标为主，用户一眼扫过去
+               会把它读成"麦克风已关闭"——真机反馈里"有人进会就自动关麦"
+               有一半是这句话造成的误解。状态交给图标和红色，标签只说明
+               这是哪个键。 */
+            title: "摄像头",
             appearance: viewModel.isCameraOn ? .neutral : .off,
             size: keySize,
             accessibilityText: viewModel.isCameraOn ? "关闭摄像头" : "开启摄像头"
