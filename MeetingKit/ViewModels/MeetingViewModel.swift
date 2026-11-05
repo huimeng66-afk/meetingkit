@@ -14,6 +14,7 @@
 //  业务代码不允许把它当成"我点了共享"的开关来用。
 //
 
+import AVFoundation
 import Combine
 import Foundation
 import UIKit
@@ -39,6 +40,8 @@ final class MeetingViewModel: ObservableObject {
     // MARK: - 本机状态
 
     @Published private(set) var isMicOn: Bool = true
+    /// 麦克风授权是否已在入会后对账过（只对账一次，重连不重复提示）。
+    private var hasReconciledMicPermission = false
     @Published private(set) var isCameraOn: Bool = true
     @Published private(set) var isFrontCamera: Bool = true
     @Published private(set) var isHandRaised: Bool = false
@@ -367,11 +370,66 @@ final class MeetingViewModel: ObservableObject {
     // MARK: - 本机设备
 
     func toggleMic() {
-        isMicOn.toggle()
-        let enabled = isMicOn
+        guard !isMicOn else {
+            applyMicState(false)
+            return
+        }
+
+        // 开麦前先看系统授权。这一步不做的话会出现最难排查的一类反馈：
+        // "我明明开了麦，对方听不到，波形也不动"。
+        // 原因是麦克风权限被拒时，WebRTC 的 audio track 依然能 isEnabled = true，
+        // 它只是采不到任何一点数据——界面全绿，实际是哑的。
+        switch micPermission {
+        case .granted:
+            applyMicState(true)
+        case .denied:
+            // denied 状态下系统不会再弹窗，只能引导用户自己去设置里改。
+            showToast(.micPermissionDenied())
+        case .undetermined:
+            // 首次授权：这里弹系统弹窗，回来再决定要不要真的开麦。
+            Task { @MainActor [weak self] in
+                let granted = await RealRTCClient.requestMicPermission()
+                guard let self = self else { return }
+                if granted {
+                    self.applyMicState(true)
+                } else {
+                    self.showToast(.micPermissionDenied())
+                }
+            }
+        }
+    }
+
+    /// 把麦克风状态同时落到 RTC 轨、本地成员和界面上。
+    /// 集中在一处，避免"改了 isMicOn 忘了通知 RTC"这类不一致。
+    private func applyMicState(_ enabled: Bool) {
+        isMicOn = enabled
         rtc.setMicEnabled(enabled)
         updateLocalParticipant { $0.isMicOn = enabled }
         showToast(.micMuted(!enabled))
+    }
+
+    /// 当前系统麦克风授权状态。
+    ///
+    /// iOS 17 起 `AVAudioSession.recordPermission` 被 `AVAudioApplication` 取代，
+    /// 部署目标是 15.0，两条路都要留。
+    private var micPermission: MicPermission {
+        if #available(iOS 17.0, *) {
+            switch AVAudioApplication.shared.recordPermission {
+            case .granted: return .granted
+            case .denied: return .denied
+            default: return .undetermined
+            }
+        } else {
+            switch AVAudioSession.sharedInstance().recordPermission {
+            case .granted: return .granted
+            case .denied: return .denied
+            default: return .undetermined
+            }
+        }
+    }
+
+    private enum MicPermission: Equatable {
+        case granted, denied, undetermined
     }
 
     func toggleCamera() {
@@ -849,6 +907,24 @@ extension MeetingViewModel: RTCClientDelegate {
 
     func rtcDidChangeConnectionState(_ state: ConnectionState) {
         connectionState = state
+
+        // 首次真正连上时对账一次麦克风授权。
+        // 入会流程里确实请求过权限，但结果被丢掉了：如果用户在系统弹窗里点了
+        // "不允许"，isMicOn 仍是 true，界面显示正在发言，实际采不到声音。
+        // 这里把它纠正过来并明确告知原因，而不是让对方去猜。
+        if case .connected = state, !hasReconciledMicPermission {
+            hasReconciledMicPermission = true
+            reconcileMicPermissionOnJoin()
+        }
+    }
+
+    /// 入会后的麦克风授权对账。只做一次，重连不再重复提示。
+    private func reconcileMicPermissionOnJoin() {
+        guard isMicOn, micPermission != .granted else { return }
+        isMicOn = false
+        rtc.setMicEnabled(false)
+        updateLocalParticipant { $0.isMicOn = false }
+        showToast(.micPermissionDenied())
     }
 
     func rtcDidReceiveMessage(_ message: ChatMessage) {

@@ -78,4 +78,17 @@ extension ToastMessage {
             style: .warning
         )
     }
+
+    /// 麦克风授权未通过。
+    ///
+    /// 这条必须单独存在：权限被拒时 WebRTC 的 track 仍可以 isEnabled = true，
+    /// 界面一片"已开麦"，实际一个采样都收不到——对方听不见、脉冲不动。
+    /// 如果不点明是权限问题，用户只会以为"这个 App 声音坏了"。
+    static func micPermissionDenied() -> ToastMessage {
+        ToastMessage(
+            text: "麦克风未授权，请到「设置 → 天穹会议」中开启",
+            systemImage: "mic.slash.fill",
+            style: .warning
+        )
+    }
 }
