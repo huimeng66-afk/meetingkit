@@ -1600,6 +1600,14 @@ final class ScreenFramePusher {
         qos: .userInitiated
     )
 
+    /// 轮询队列。与 decodeQueue 分开：轮询只读文件头判断新旧，
+    /// 解码更重；共用一个队列会让「读文件」排在一次 1080p 解码后面，
+    /// 帧率被自己的解码拖累。
+    private static let pollQueue = DispatchQueue(
+        label: "com.tianqiong.meetingkit.screenpoll",
+        qos: .userInitiated
+    )
+
     /// RTCVideoSource.capturer(_:didCapture:) 的第一个参数是非空的 RTCVideoCapturer，
     /// 这里挂一个只用于转发的采集器实例（真正推帧走 didCapture，不经过它的采集回调）。
     private let frameCapturer: RTCVideoCapturer
@@ -1623,7 +1631,12 @@ final class ScreenFramePusher {
         lastFrameDate = nil
         canvasLandscape = true
 
-        let timer = DispatchSource.makeTimerSource(queue: .main)
+        // 必须挂在自己的串行队列，不能挂主队列。
+        //
+        // 屏幕共享的典型用法就是「共享后切到别的 App 去演示」——此时主 App 在后台，
+        // 主队列会被系统降频甚至冻结，帧循环一停，对端画面就定住不动。
+        // 挂到后台队列后，只要进程还活着（会议中有 audio 后台模式保活），帧就继续推。
+        let timer = DispatchSource.makeTimerSource(queue: Self.pollQueue)
         timer.schedule(deadline: .now(), repeating: Self.pollInterval, leeway: .milliseconds(100))
         timer.setEventHandler { [weak self] in
             self?.tick()
