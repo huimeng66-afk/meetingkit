@@ -86,13 +86,15 @@ struct BottomControlBar: View {
             systemImage: viewModel.isMicOn
                 ? SymbolCompat.name("mic.fill")
                 : SymbolCompat.name("mic.slash.fill", "mic.slash"),
-            title: viewModel.isMicOn ? "麦克风" : "已静音",
+            title: viewModel.isMicPending ? "开启中" : (viewModel.isMicOn ? "麦克风" : "已静音"),
             appearance: viewModel.isMicOn ? .neutral : .off,
             size: keySize,
+            isLoading: viewModel.isMicPending,
             accessibilityText: viewModel.isMicOn ? "静音" : "取消静音"
         ) {
             viewModel.toggleMic()
         }
+        .disabled(viewModel.isMicPending)
         // 脉冲画在圆钮下方，不参与命中测试。
         .overlay(alignment: .top) {
             MicPulseRing(
@@ -250,11 +252,12 @@ struct MicPulseRing: View {
 
     private func ring(delay: Double) -> some View {
         Circle()
+            /* 一律用品牌色，不再用白色。
+               浅色主题的底栏是 #f4f5f7，白色 0.30 的环压上去等于没有——
+               用户看到的就是"麦开着，按钮一动不动"。 */
             .stroke(
-                isSpeaking
-                    ? Theme.Palette.accent.opacity(ringOpacity)
-                    : Color.white.opacity(ringOpacity),
-                lineWidth: isSpeaking ? 2 : 1
+                Theme.Palette.accent.opacity(isSpeaking ? 0.78 : 0.34),
+                lineWidth: isSpeaking ? 2.5 : 1.5
             )
             .frame(width: diameter, height: diameter)
             .scaleEffect(expand ? ringScale : 1.0)

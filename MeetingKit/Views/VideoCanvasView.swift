@@ -67,6 +67,36 @@ struct VideoCanvasView: View {
             // 只在"是否共享"变化时给子树加动画事务，其它更新（参会者进出、说话人切换）
             // 不受影响——`.animation(_:value:)` 的语义就是"value 变化才起动画"。
             .animationCompat(Theme.Motion.standard, value: isSharingActive)
+            .overlay(alignment: .bottom) {
+                micEvidenceChip
+                    .padding(.bottom, contentBottom + 6)
+                    .opacity(viewModel.isChromeVisible ? 1 : 0)
+            }
+        }
+    }
+
+    /// 单人会议里的麦克风状态。
+    ///
+    /// P2P 架构下没有对端就不存在音频发送通道：麦克风已经授权、轨道也建好了，
+    /// 但 WebRTC 要等第一条音频发送流才会真正启动采集。这里如实说明
+    /// "已就绪、等人进来才开始传"，不做一条永远不动的假波形。
+    @ViewBuilder
+    private var micEvidenceChip: some View {
+        if viewModel.isMicOn, !viewModel.participants.contains(where: { !$0.isLocal }) {
+            HStack(spacing: 7) {
+                Image(systemName: "mic.fill")
+                    .font(.system(size: 11, weight: .semibold))
+
+                Text("麦克风已就绪 · 有人加入后自动开始传输")
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .foregroundColor(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(Capsule().fill(Color.black.opacity(0.58)))
+            .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+            .transition(.opacity)
+            .accessibilityLabel("麦克风已就绪，等待参会人加入")
         }
     }
 
@@ -313,6 +343,16 @@ struct VideoCanvasView: View {
                     Text("会议号 \(viewModel.formattedMeetingNumber)")
                         .font(.system(size: 12).monospacedDigit())
                         .foregroundColor(Theme.Palette.textTertiary)
+
+                    /* P2P 没有对端就没有发送通道。如实说明"已就绪、等人进来"，
+                       不让用户把"还没人进会"误读成"麦克风坏了"。 */
+                    Text(viewModel.isMicOn
+                         ? "麦克风已就绪 · 有人加入后自动开始传输"
+                         : "麦克风已静音 · 点底部麦克风可开启")
+                        .font(.system(size: 11))
+                        .foregroundColor(viewModel.isMicOn ? Theme.Palette.accent : Theme.Palette.textTertiary)
+                        .padding(.top, 2)
+                        .accessibilityLabel(viewModel.isMicOn ? "麦克风已就绪" : "麦克风已静音")
                 }
 
                 Button {

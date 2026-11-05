@@ -54,6 +54,10 @@ struct ControlButton: View {
     /// 是否显示圆钮下方的文字。默认显示：见文件头的可用性说明。
     var showsTitle: Bool = true
 
+    /// 正在等待设备/权限（例如开麦时的系统授权弹窗）。
+    /// 图标位置换成转圈，配合外部的 .disabled 防止连点。
+    var isLoading: Bool = false
+
     /// 朗读用的完整语义。nil 时回退到 title。
     var accessibilityText: String? = nil
 
@@ -70,6 +74,13 @@ struct ControlButton: View {
                         .font(.system(size: 17, weight: .medium))
                         .foregroundColor(iconColor)
                         .frame(width: size, height: size)
+                        .overlay {
+                            if isLoading {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                                    .tint(iconColor)
+                            }
+                        }
                         .liquidGlass(
                             glassVariant,
                             cornerStyle: .circle,

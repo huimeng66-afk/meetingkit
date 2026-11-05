@@ -78,6 +78,11 @@ final class RealRTCClient: NSObject, RTCClient {
 
     private var remotePeers: [String: RemotePeer] = [:]
 
+    /// 收到 `screen:state(on)` 时对应 peer 还没建出来（信令事件先于 peer:joined
+    /// 到达的竞态）。先记下，等 peer 建好立刻补一次屏幕态，否则这条共享
+    /// 会永远停在"服务端说在共享、客户端没有舞台"的状态。
+    private var pendingScreenPeerID: String?
+
     /// 已消费的聊天消息 id（重连恢复快照时去重）。
     private var consumedMessageIDs: Set<String> = []
 
@@ -87,7 +92,17 @@ final class RealRTCClient: NSObject, RTCClient {
     private var factory: RTCPeerConnectionFactory?
     private var iceServers: [RTCIceServer] = []
 
+    /// 进程内唯一的 PeerConnectionFactory。
+    ///
+    /// 旧实现每次 join 都 new 一个：factory 内部持有 AudioDeviceModule、
+    /// 编解码器和线程池，重复创建会让音频设备在"上一场会的旧实例"和
+    /// "这一场的新实例"之间来回切，真机上表现为第一场正常、第二场没声。
+    /// Jitsi 也是全局单例（`RTCPeerConnectionFactory` 只初始化一次）。
+    private static let sharedFactory = RTCPeerConnectionFactory()
+
     private var localAudioTrack: RTCAudioTrack?
+    /// 首次收到远端音频的标志：只做一次路由修正。
+    private var didHandleFirstRemoteAudio = false
     private var localVideoTrack: RTCVideoTrack?
     private var localVideoSource: RTCVideoSource?
     private var localScreenTrack: RTCVideoTrack?
@@ -99,6 +114,32 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 本地音频电平轮询。WebRTC 没有公开的"当前麦克风电平"API，
     /// 只能从 getStats 的 media-source 统计里取 audioLevel。
     private var audioLevelTimer: Timer?
+
+    // 单人会议时的本地电平来源：**不存在。**
+    //
+    // 这是 1.5.0 最重要的一处删除。
+    //
+    // 1.4.6 用 loopback 探针（和主连接共用同一条麦克风轨）导致"收得到、发不出"；
+    // 1.4.9 换成 AVAudioRecorder 后问题换了个形态：录音器和 WebRTC 的
+    // VoiceProcessingIO 抢同一个设备，且 `stop()` 里的 `setActive(false)`
+    // 会把 WebRTC 刚启动的 AudioUnit 一起按停。线上表现就是
+    // "一个人开会正常，有人一进来麦克风就死了"——因为 peerJoined
+    // 正好触发了录音器的停止。
+    //
+    // 单人会议没有 RTP 通道，本来就不存在"发送电平"这个东西。
+    // 界面如实显示"麦克风已就绪"，不做假波形，比演一个会动的环更可信。
+
+    /// 上行音频健康度：连续多轮统计里 packetsSent 不增长，说明
+    /// AudioDeviceModule 已经停采（而不是 sender 没挂上）。
+    private var lastOutboundAudioTotal: Int = -1
+    private var lastOutboundAudioCheckAt: Date = .distantPast
+    private var stagnantOutboundChecks = 0
+    /// 设备级重启的冷却时间：重启一次要断 200ms 左右，不能连环触发。
+    private var lastAudioPipelineRestartAt: Date = .distantPast
+
+    /// 上行音频看门狗（peerID → 待执行的探测）。
+    private var outboundAudioWatchdogs: [String: DispatchWorkItem] = [:]
+    private var outboundAudioProbeCounts: [String: Int] = [:]
     private var previewView: RTCCameraPreviewView?
 
     private var screenPusher: ScreenFramePusher?
@@ -195,6 +236,9 @@ final class RealRTCClient: NSObject, RTCClient {
 
         updateConnectionState(.connected)
         updateNetworkQuality(.good)
+        /* 建连过程中 WebRTC 的 audio unit 才真正启动；此时再抢一次 session，
+           保证首帧音频和麦克风采集都落在 playAndRecord 路由上。 */
+        reactivateAudioSession()
         syncTeardownBox()
         startAudioLevelPolling()
         startLifecycleObservers()
@@ -296,14 +340,52 @@ final class RealRTCClient: NSObject, RTCClient {
         reactivateAudioSession()
     }
 
-    /// 重新把音频会话抢回 playAndRecord + active。
-    /// 幂等：已经在跑的时候调用只是多一次系统查询。
-    private func reactivateAudioSession() {
+    /// 重新把音频会话抢回 playAndRecord + voiceChat + active。
+    /// 幂等：只在 category / mode / active 真的不对时才碰系统。
+    ///
+    /// 为什么不能每次都无脑 setCategory：会议进行中改 category 会触发一次
+    /// 路由重配，正在播放的远端声音会断一拍。旧实现每次开麦、每次远端音频
+    /// 到达都要重设一遍，长会里能听到规律的"咔哒"。
+    ///
+    /// 对照 Jitsi 的 `RTCAudioSessionConfiguration`：category / mode / options
+    /// 必须一次性写全。只 setCategory 不设 mode，系统可能沿用上一次的
+    /// `AVAudioSessionModeVideoRecording`（共享广播扩展留下的），
+    /// 那种模式下采集增益极低，对方听到的就是"有电流声、听不清人声"。
+    private func reactivateAudioSession(force: Bool = false) {
+        let av = AVAudioSession.sharedInstance()
         let session = RTCAudioSession.sharedInstance()
+
+        let needsRoute = force
+            || av.category != .playAndRecord
+            || av.mode != .voiceChat
+
         session.lockForConfiguration()
-        defer { session.unlockForConfiguration() }
-        try? session.setCategory(.playAndRecord, with: [.allowBluetooth, .defaultToSpeaker])
-        try? session.setActive(true)
+        do {
+            if needsRoute {
+                try session.setCategory(
+                    .playAndRecord,
+                    with: [.allowBluetooth, .defaultToSpeaker]
+                )
+                try session.setMode(.voiceChat)
+            }
+            if force || !session.isActive {
+                try session.setActive(true)
+            }
+            /* 自动音频模式下 WebRTC 会自行 start/stop audio unit；
+               这里只需确认它没被上一次中断留在 stop 状态。 */
+            if !session.isAudioEnabled {
+                session.isAudioEnabled = true
+            }
+        } catch {
+            print("[rtc] audio session activate failed: \(error.localizedDescription)")
+            // 一次失败多半是设备被别的进程占着：稍后再试一次，
+            // 不把错误抛给用户——真正的兜底是上行看门狗。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self, self.isJoined else { return }
+                self.reactivateAudioSession(force: true)
+            }
+        }
+        session.unlockForConfiguration()
     }
 
     private func endBackgroundTask() {
@@ -338,6 +420,8 @@ final class RealRTCClient: NSObject, RTCClient {
             delegate?.rtcDidLoseRemoteMedia(for: peer.peerID)
         }
         remotePeers.removeAll()
+        resetOutboundAudioTracking()
+        didHandleFirstRemoteAudio = false
         consumedMessageIDs.removeAll()
         selfPeerID = ""
         selfUserID = nil
@@ -368,6 +452,7 @@ final class RealRTCClient: NSObject, RTCClient {
         localVideoTrack = nil
         localScreenTrack = nil
         localScreenSource = nil
+        resetOutboundAudioTracking()
         // 释放后音视频设备指示灯应立即熄灭。isActive 是只读属性，关闭要走 setActive。
         try? RTCAudioSession.sharedInstance().setActive(false)
     }
@@ -384,10 +469,72 @@ final class RealRTCClient: NSObject, RTCClient {
     // MARK: - 设备控制
 
     func setMicEnabled(_ enabled: Bool) {
-        guard let track = localAudioTrack else { return }
+        guard let track = localAudioTrack else {
+            /* 轨不存在（权限刚放开 / 入会时被拒 / 上一轮会话重建）：
+               不能静默 return，否则用户点开麦只会看到图标亮着、实际没轨。 */
+            if enabled {
+                ensureMicEnabled(true, completion: nil)
+            }
+            return
+        }
+        if enabled {
+            /* 只把 track.isEnabled 置 true 不够：用户在系统设置里刚打开权限、
+               或音频会话被来电/共享广播打断过时，RTCAudioSession 可能已经
+               inactive。不重新抢回 session，表现就是"图标亮了、对方没声音"。 */
+            reactivateAudioSession()
+        }
         track.isEnabled = enabled
         publishLocalMediaState()
         publishParticipants()
+    }
+
+    /// 开麦自愈：轨不存在 / 已失效时重建，并接回所有 peer 的音频 sender。
+    ///
+    /// 对应 Jitsi 的 `setTrackMuted` + `IGUMPendingState.PENDING_UNMUTE`：
+    /// 调用方在 completion 返回前应把按钮置为"开启中"，返回后按结果落定或回滚。
+    func ensureMicEnabled(_ enabled: Bool, completion: ((Bool, String?) -> Void)? = nil) {
+        guard enabled else {
+            setMicEnabled(false)
+            completion?(true, nil)
+            return
+        }
+        if let track = localAudioTrack, track.readyState == .live {
+            setMicEnabled(true)
+            completion?(true, nil)
+            return
+        }
+
+        Task { @MainActor in
+            let granted = await Self.requestMicPermission()
+            guard granted else {
+                completion?(false, "麦克风权限未开启，请到系统设置里允许后重试")
+                return
+            }
+            guard let track = self.rebuildAudioTrack() else {
+                completion?(false, "麦克风启动失败，请重试")
+                return
+            }
+            track.isEnabled = true
+            for peer in self.remotePeers.values {
+                peer.session.replaceAudioTrack(with: track)
+            }
+            self.setMicEnabled(true)
+            completion?(true, nil)
+        }
+    }
+
+    /// 重建本地音频轨。只换音频，不动摄像头、不重建 PeerConnection——
+    /// 重建连接会把整场会议的音视频都断一次，代价远大于换一条轨。
+    @discardableResult
+    private func rebuildAudioTrack() -> RTCAudioTrack? {
+        guard let factory = factory else { return nil }
+        reactivateAudioSession()
+        let source = factory.audioSource(
+            with: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
+        )
+        let track = factory.audioTrack(with: source, trackId: "audio-\(UUID().uuidString)")
+        localAudioTrack = track
+        return track
     }
 
     func setCameraEnabled(_ enabled: Bool) {
@@ -464,10 +611,12 @@ final class RealRTCClient: NSObject, RTCClient {
         do {
             if enabled {
                 try session.setCategory(.playAndRecord, with: [.allowBluetooth, .defaultToSpeaker])
+                try session.setMode(.voiceChat)
                 try session.overrideOutputAudioPort(.speaker)
             } else {
                 // 听筒模式：去掉 defaultToSpeaker 让系统按接近传感器路由。
                 try session.setCategory(.playAndRecord, with: [.allowBluetooth])
+                try session.setMode(.voiceChat)
                 try session.overrideOutputAudioPort(.none)
             }
             try session.setActive(true)
@@ -691,13 +840,24 @@ final class RealRTCClient: NSObject, RTCClient {
         _ signaling: TianqiongSignaling,
         options: JoinOptions
     ) async throws -> JoinSnapshot {
-        try await withCheckedThrowingContinuation { continuation in
+        /* 入会声明必须反映"真实可用的媒体"，而不是入会页上的开关。
+           麦克风被系统拒绝时 track.isEnabled 已经是 false，如果这里仍按
+           options.audioOn 上报 true，服务端和所有对端都会以为这个人在说话：
+           成员列表亮着麦克风、实际一个采样都没有——这是用户反馈"开了麦没声音"
+           里最容易被误判成网络问题的一类。摄像头同理。 */
+        let audioNow = localAudioTrack?.isEnabled ?? options.audioOn
+        let videoNow = localVideoTrack?.isEnabled ?? options.videoOn
+
+        return try await withCheckedThrowingContinuation { continuation in
             signaling.join(
                 no: options.no,
                 name: options.name,
                 password: options.password,
-                audio: options.audioOn,
-                video: options.videoOn,
+                audio: audioNow,
+                video: videoNow,
+                /* 冷启动时广播扩展可能已经在跑：把共享状态一并带进首包，
+                   否则服务端不知道本端在共享，对端永远等不到 screen:state。 */
+                screen: isScreenSharing,
                 timeout: 12
             ) { result in
                 switch result {
@@ -713,7 +873,7 @@ final class RealRTCClient: NSObject, RTCClient {
     // MARK: - 内部：本地媒体
 
     private func setupLocalMedia(audioOn: Bool, videoOn: Bool, cameraOn: Bool) async throws {
-        let factory = RTCPeerConnectionFactory()
+        let factory = Self.sharedFactory
         self.factory = factory
 
         // 麦克风权限必须在**入会时**要，不能等到用户点开麦。
@@ -790,15 +950,15 @@ final class RealRTCClient: NSObject, RTCClient {
         localScreenSource = screenSource
         localScreenTrack = screenTrack
 
-        // 激活音频会话：外放 + 后台混音模式。
-        let audioSession = RTCAudioSession.sharedInstance()
-        audioSession.lockForConfiguration()
-        defer { audioSession.unlockForConfiguration() }
-        try? audioSession.setCategory(.playAndRecord, with: [.allowBluetooth, .defaultToSpeaker])
-        try? audioSession.setActive(true)
+        /* 激活音频会话。走统一的 reactivateAudioSession：
+           原来这里只 setCategory + setActive，漏了 setMode(.voiceChat)。
+           共享广播扩展会把系统 mode 留在 videoRecording，入会时如果沿用，
+           采集增益低到对方几乎听不见，而本地一切显示正常——
+           正是"麦克风开了、对方就是没声"的另一条成因。 */
+        reactivateAudioSession()
     }
 
-    private static func requestCameraPermission() async -> Bool {
+    static func requestCameraPermission() async -> Bool {
         await withCheckedContinuation { continuation in
             switch AVCaptureDevice.authorizationStatus(for: .video) {
             case .authorized:
@@ -834,6 +994,14 @@ final class RealRTCClient: NSObject, RTCClient {
         }
     }
 
+    /// 当前录音授权状态（只读，不触发弹窗）。
+    nonisolated static var micPermissionGranted: Bool {
+        if #available(iOS 17.0, *) {
+            return AVAudioApplication.shared.recordPermission == .granted
+        }
+        return AVAudioSession.sharedInstance().recordPermission == .granted
+    }
+
     // MARK: - 本地音频电平
 
     /// 每 180ms 取一次本地麦克风电平。
@@ -864,22 +1032,295 @@ final class RealRTCClient: NSObject, RTCClient {
     }
 
     private func pollLocalAudioLevel() {
-        // 任意一条连接拿到的都是同一路本地音频，取第一条即可。
-        guard let pc = remotePeers.values.first?.session.peerConnection else { return }
+        let peers = Array(remotePeers.values)
 
-        pc.statistics { [weak self] report in
-            guard let self = self else { return }
+        /* 单人：没有任何连接，也就没有任何 RTP 统计可读。
+           这里既不起 AVAudioRecorder，也不挂 loopback 探针——
+           两者都会和 WebRTC 抢音频设备，是 1.4.6 ~ 1.4.9 全部
+           "有人进会后麦克风就哑了"的根源。界面如实显示"已就绪"。 */
+        guard !peers.isEmpty else {
+            delegate?.rtcDidUpdateLocalAudioLevel(0)
+            delegate?.rtcDidChangeActiveSpeaker(nil)
+            return
+        }
 
-            var peak: Float = 0
-            for (_, stat) in report.statistics where stat.type == "media-source" {
-                guard let value = stat.values["audioLevel"] as? NSNumber else { continue }
-                peak = max(peak, value.floatValue)
-            }
+        /* 多人：一条 report 里同时有本地（media-source / outbound-rtp）
+           和远端（inbound-rtp）两种电平。远端逐条比大小，最大的那个
+           就是当前发言人——服务端并不下发音量，iOS 端的"谁在说话"只能从这里来。 */
+        var loudestID: String?
+        var loudestLevel: Float = 0
+        var localPeak: Float = 0
+        var outboundTotal = 0
+        let lock = NSLock()
+        let group = DispatchGroup()
 
-            DispatchQueue.main.async {
-                self.delegate?.rtcDidUpdateLocalAudioLevel(peak)
+        for (index, peer) in peers.enumerated() {
+            group.enter()
+            peer.session.peerConnection.statistics { report in
+                var remote: Float = 0
+                var sent = 0
+                for (_, stat) in report.statistics {
+                    if stat.type == "inbound-rtp",
+                       (stat.values["kind"] as? String) == "audio",
+                       let value = stat.values["audioLevel"] as? NSNumber {
+                        remote = max(remote, value.floatValue)
+                    }
+                    if stat.type == "outbound-rtp",
+                       (stat.values["kind"] as? String) == "audio" {
+                        sent = (stat.values["packetsSent"] as? NSNumber)?.intValue ?? 0
+                    }
+                }
+                let local = index == 0 ? Self.localAudioLevel(in: report) : 0
+
+                lock.lock()
+                if index == 0 { localPeak = local }
+                outboundTotal += sent
+                if remote > loudestLevel {
+                    loudestLevel = remote
+                    loudestID = peer.peerID
+                }
+                lock.unlock()
+                group.leave()
             }
         }
+
+        group.notify(queue: .main) { [weak self] in
+            guard let self else { return }
+            self.delegate?.rtcDidUpdateLocalAudioLevel(localPeak)
+            // 0.02 是 WebRTC 的底噪水位：低于它的都是空调/键盘，
+            // 不设门限会出现"没人说话但一直有人亮着"。
+            self.delegate?.rtcDidChangeActiveSpeaker(loudestLevel > 0.02 ? loudestID : nil)
+            self.evaluateOutboundAudioHealth(total: outboundTotal)
+        }
+    }
+
+    /// 本地发送电平。优先 `outbound-rtp.audioLevel`（真正发出去的能量），
+    /// 没有这个字段时退回 `media-source.audioLevel`（采集端的能量）。
+    private static func localAudioLevel(in report: RTCStatisticsReport) -> Float {
+        var fromSender: Float = 0
+        var fromSource: Float = 0
+        for (_, stat) in report.statistics {
+            guard let value = (stat.values["audioLevel"] as? NSNumber)?.floatValue else { continue }
+            if stat.type == "outbound-rtp", (stat.values["kind"] as? String) == "audio" {
+                fromSender = max(fromSender, value)
+            } else if stat.type == "media-source" {
+                fromSource = max(fromSource, value)
+            }
+        }
+        return max(fromSender, fromSource)
+    }
+
+    /// 上行音频健康度。每 5 秒对一次总包数：
+    /// 有人、麦克风开着、总包数却不动 → AudioDeviceModule 已停采。
+    ///
+    /// 这不是"重挂 sender"能修的问题：sender 挂着、轨道 live、SDP 也是
+    /// sendrecv，但音频设备不出帧，所以一个包都发不出去。必须把整条
+    /// 音频设备链路重启（停会话 → 重配 → 重建轨 → 全部重挂）。
+    private func evaluateOutboundAudioHealth(total: Int) {
+        guard localAudioTrack?.isEnabled == true, !remotePeers.isEmpty else {
+            resetOutboundAudioTracking()
+            return
+        }
+        let now = Date()
+        guard now.timeIntervalSince(lastOutboundAudioCheckAt) >= 5 else { return }
+        lastOutboundAudioCheckAt = now
+
+        defer { lastOutboundAudioTotal = total }
+
+        // 第一次只建立基线：刚连上时包数本来就是 0。
+        guard lastOutboundAudioTotal >= 0 else { return }
+
+        if total > lastOutboundAudioTotal {
+            stagnantOutboundChecks = 0
+            return
+        }
+
+        stagnantOutboundChecks += 1
+        guard stagnantOutboundChecks >= 2 else { return }
+        stagnantOutboundChecks = 0
+        restartAudioPipeline(reason: "上行音频 10 秒无增长（累计 \(total) 包）")
+    }
+
+    private func resetOutboundAudioTracking() {
+        lastOutboundAudioTotal = -1
+        lastOutboundAudioCheckAt = .distantPast
+        stagnantOutboundChecks = 0
+    }
+
+    /// 把音频设备整条重启一次。
+    ///
+    /// 顺序必须是"先停会话、再重建轨、最后挂回去"：
+    /// 只 replaceTrack 不会让已经停采的 ADM 重新出帧。
+    private func restartAudioPipeline(reason: String) {
+        let now = Date()
+        guard now.timeIntervalSince(lastAudioPipelineRestartAt) > 8 else { return }
+        lastAudioPipelineRestartAt = now
+        print("[rtc] audio pipeline restart: \(reason)")
+
+        resetOutboundAudioTracking()
+
+        let session = RTCAudioSession.sharedInstance()
+        session.lockForConfiguration()
+        session.isAudioEnabled = false
+        try? session.setActive(false)
+        try? session.setCategory(.playAndRecord, with: [.allowBluetooth, .defaultToSpeaker])
+        try? session.setMode(.voiceChat)
+        try? session.setActive(true)
+        session.isAudioEnabled = true
+        session.unlockForConfiguration()
+
+        guard let track = rebuildAudioTrack() else { return }
+        track.isEnabled = true
+        for peer in remotePeers.values {
+            peer.forceReattachAudio(track)
+        }
+        publishLocalMediaState()
+        publishParticipants()
+    }
+
+    // MARK: - 诊断
+
+    /// 一份能一眼看出"卡在哪一段"的音视频诊断。
+    ///
+    /// 排查顺序：连接状态 → 收发 RTP 计数 → 音频会话/路由。
+    /// 连接 failed = 打洞没过；connected 但 packetsReceived 为 0 = 对端没发；
+    /// 收包在涨却没声音 = 播放或路由问题。
+    func collectDiagnostics(completion: @escaping (String) -> Void) {
+        var lines: [String] = []
+        lines.append("本端 \(selfPeerID.isEmpty ? "未入会" : String(selfPeerID.prefix(8))) · 在线 \(remotePeers.count + 1) 人")
+
+        let trackState = localAudioTrack.map { track -> String in
+            let ready = track.readyState == .live ? "live" : "ended"
+            return "\(track.isEnabled ? "开启" : "静音")/\(ready)"
+        } ?? "无轨道"
+        lines.append("本地麦克风 \(trackState) · 权限 \(Self.micPermissionGranted ? "已授权" : "未授权")")
+
+        let session = RTCAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
+        lines.append("音频会话 active=\(session.isActive) enabled=\(session.isAudioEnabled)")
+        lines.append("模式 \(session.mode) · 输出 \(outputs.isEmpty ? "无" : outputs)")
+        lines.append("")
+
+        guard !remotePeers.isEmpty else {
+            lines.append("没有远端连接：单人会议不产生 RTP 统计。")
+            completion(lines.joined(separator: "\n"))
+            return
+        }
+
+        let group = DispatchGroup()
+        var perPeer: [String] = []
+        let lock = NSLock()
+
+        for (id, peer) in remotePeers {
+            group.enter()
+            let name = peer.name.isEmpty ? String(id.prefix(6)) : peer.name
+            let conn = Self.connectionText(peer.session.peerConnection.connectionState)
+            let ice = Self.iceText(peer.session.peerConnection.iceConnectionState)
+            let localDir = Self.audioDirection(in: peer.session.peerConnection.localDescription?.sdp)
+            let remoteDir = Self.audioDirection(in: peer.session.peerConnection.remoteDescription?.sdp)
+            let senderCount = peer.session.audioSenderCount
+
+            peer.session.peerConnection.statistics { report in
+                var inPackets = 0, outPackets = 0, inKB = 0, outKB = 0
+                var outVideo = 0
+                var level: Double = 0
+                var outLevel: Double = 0
+                var frameKB = 0
+                for (_, st) in report.statistics {
+                    if st.type == "inbound-rtp", (st.values["kind"] as? String) == "audio" {
+                        inPackets = (st.values["packetsReceived"] as? NSNumber)?.intValue ?? 0
+                        inKB = ((st.values["bytesReceived"] as? NSNumber)?.intValue ?? 0) / 1024
+                        level = (st.values["audioLevel"] as? NSNumber)?.doubleValue ?? 0
+                    }
+                    if st.type == "outbound-rtp", (st.values["kind"] as? String) == "audio" {
+                        outPackets = (st.values["packetsSent"] as? NSNumber)?.intValue ?? 0
+                        outKB = ((st.values["bytesSent"] as? NSNumber)?.intValue ?? 0) / 1024
+                        outLevel = (st.values["audioLevel"] as? NSNumber)?.doubleValue ?? 0
+                    }
+                    if st.type == "outbound-rtp", (st.values["kind"] as? String) == "video" {
+                        outVideo = (st.values["packetsSent"] as? NSNumber)?.intValue ?? 0
+                    }
+                    if st.type == "inbound-rtp", (st.values["kind"] as? String) == "video" {
+                        frameKB = ((st.values["bytesReceived"] as? NSNumber)?.intValue ?? 0) / 1024
+                    }
+                }
+                let line = """
+                \(name)：\(conn) / ICE \(ice)
+                  SDP 本端 \(localDir) · 远端 \(remoteDir) · 音频发送器 \(senderCount)
+                  收音频 \(inPackets) 包 · \(inKB)KB · 电平 \(String(format: "%.2f", level))
+                  发音频 \(outPackets) 包 · \(outKB)KB · 电平 \(String(format: "%.2f", outLevel)) · 发视频 \(outVideo) 包 · 收视频 \(frameKB)KB
+                """
+                lock.lock(); perPeer.append(line); lock.unlock()
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) {
+            lines.append(contentsOf: perPeer.sorted())
+            completion(lines.joined(separator: "\n"))
+        }
+    }
+
+    /// 诊断里的人话状态。`String(describing:)` 会输出
+    /// `RTCPeerConnectionState(rawValue: 2)`，用户在电话里根本没法复述。
+    private static func connectionText(_ state: RTCPeerConnectionState) -> String {
+        switch state {
+        case .new: return "新建"
+        case .connecting: return "连接中"
+        case .connected: return "已连接"
+        case .disconnected: return "已断开"
+        case .failed: return "失败"
+        case .closed: return "已关闭"
+        @unknown default: return "未知"
+        }
+    }
+
+    private static func iceText(_ state: RTCIceConnectionState) -> String {
+        switch state {
+        case .new: return "新建"
+        case .checking: return "检测中"
+        case .connected: return "已连接"
+        case .completed: return "已完成"
+        case .failed: return "失败"
+        case .disconnected: return "已断开"
+        case .closed: return "已关闭"
+        case .count: return "计数"
+        @unknown default: return "未知"
+        }
+    }
+
+    /// 从 SDP 里读音频 m-line 的方向。
+    ///
+    /// 这是判断"本端到底有没有在发"的唯一静态证据：
+    /// 本端方向是 recvonly，就说明 answer 生成时本地没有 audio sender，
+    /// 之后不管轨道多正常，都不会有一个包出去。
+    ///
+    /// RFC 4566 规定方向属性缺省即 sendrecv，libwebrtc 在部分路径下
+    /// 会省略这一行——旧实现把它显示成"未声明"，看起来像没协商成功，
+    /// 实际是正常的。这里按协议把它还原成 sendrecv(默认)。
+    private static func audioDirection(in sdp: String?) -> String {
+        guard let sdp = sdp, !sdp.isEmpty else { return "无描述" }
+        var inAudio = false
+        var sawAudioLine = false
+        for rawLine in sdp.split(whereSeparator: { $0 == "\r" || $0 == "\n" }) {
+            let line = String(rawLine)
+            if line.hasPrefix("m=audio") {
+                inAudio = true
+                sawAudioLine = true
+                continue
+            }
+            if line.hasPrefix("m=") {
+                inAudio = false
+                continue
+            }
+            guard inAudio else { continue }
+            if line.hasPrefix("a=sendrecv") { return "sendrecv" }
+            if line.hasPrefix("a=sendonly") { return "sendonly" }
+            if line.hasPrefix("a=recvonly") { return "recvonly" }
+            if line.hasPrefix("a=inactive") { return "inactive" }
+        }
+        if sawAudioLine { return "sendrecv(默认)" }
+        return "无音频行"
     }
 
     /// 屏幕共享的编码档位。
@@ -952,7 +1393,7 @@ final class RealRTCClient: NSObject, RTCClient {
         selfPeerID = snapshot.selfPeerID
         selfUserID = snapshot.selfInfo["userId"] as? Int
         isSelfHost = snapshot.selfRole == "host"
-        selfName = snapshot.selfInfo["name"] as? String ?? ""
+        selfName = DisplayName.clean(snapshot.selfInfo["name"] as? String)
         selfAvatarColor = snapshot.selfInfo["avatarColor"] as? String ?? ""
         meetingInfo = snapshot.meeting
         publishBrand(from: snapshot.meeting)
@@ -964,7 +1405,7 @@ final class RealRTCClient: NSObject, RTCClient {
             guard let session = makePeerSession(peerID: peerID) else { continue }
             let peer = RemotePeer(
                 peerID: peerID,
-                name: raw["name"] as? String ?? "",
+                name: DisplayName.clean(raw["name"] as? String),
                 role: raw["role"] as? String ?? "attendee",
                 audio: raw["audio"] as? Bool ?? false,
                 video: raw["video"] as? Bool ?? false,
@@ -1026,7 +1467,8 @@ final class RealRTCClient: NSObject, RTCClient {
         selfPeerID = snapshot.selfPeerID
         selfUserID = snapshot.selfInfo["userId"] as? Int
         isSelfHost = snapshot.selfRole == "host"
-        selfName = snapshot.selfInfo["name"] as? String ?? selfName
+        let snapshotName = DisplayName.clean(snapshot.selfInfo["name"] as? String)
+        if !snapshotName.isEmpty { selfName = snapshotName }
         selfAvatarColor = snapshot.selfInfo["avatarColor"] as? String ?? selfAvatarColor
         meetingInfo = snapshot.meeting
         publishBrand(from: snapshot.meeting)
@@ -1043,7 +1485,7 @@ final class RealRTCClient: NSObject, RTCClient {
             guard let session = makePeerSession(peerID: peerID) else { continue }
             let peer = RemotePeer(
                 peerID: peerID,
-                name: raw["name"] as? String ?? "",
+                name: DisplayName.clean(raw["name"] as? String),
                 role: raw["role"] as? String ?? "attendee",
                 audio: raw["audio"] as? Bool ?? false,
                 video: raw["video"] as? Bool ?? false,
@@ -1064,6 +1506,7 @@ final class RealRTCClient: NSObject, RTCClient {
 
         // 共享恢复：远端共享者 / 本端共享中（断线后服务端清空了 screenPeerId，
         // 本端重新声明并重推屏幕轨）。
+        pendingScreenPeerID = nil
         if let screenPeerID = snapshot.screenPeerID, let peer = remotePeers[screenPeerID] {
             peer.screen = true
             delegate?.rtcDidReceiveRemoteScreen(peer.session.makeRemoteVideoView(), for: screenPeerID)
@@ -1307,26 +1750,42 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         guard isJoined, let peerID = peer["peerId"] as? String else { return }
         guard remotePeers[peerID] == nil else { return }
 
+        /* 有人进来之前，本端可能一直在等（单人没有 RTP 通道）。
+           这一刻先确认音频会话是活的，再建连接挂轨道——WebRTC 的 ADM
+           会在第一条音频发送流建立时启动采集，会话必须是 active 的。 */
+        reactivateAudioSession()
+
         guard let session = makePeerSession(peerID: peerID) else { return }
         session.attachLocalTracks(audio: localAudioTrack, video: isScreenSharing ? localScreenTrack : localVideoTrack)
+        /* 两路来源都要认：入会快照里带的 screen 标记，以及先于本事件到达、
+           被 pendingScreenPeerID 暂存的 screen:state。 */
+        let screenOn = (peer["screen"] as? Bool ?? false) || pendingScreenPeerID == peerID
         let remote = RemotePeer(
             peerID: peerID,
-            name: peer["name"] as? String ?? "",
+            name: DisplayName.clean(peer["name"] as? String),
             role: peer["role"] as? String ?? "attendee",
             audio: peer["audio"] as? Bool ?? false,
             video: peer["video"] as? Bool ?? false,
-            screen: peer["screen"] as? Bool ?? false,
+            screen: screenOn,
             hand: peer["hand"] as? Bool ?? false,
             userId: peer["userId"] as? Int,
             avatarColor: peer["avatarColor"] as? String ?? "",
             session: session
         )
         remotePeers[peerID] = remote
+        if pendingScreenPeerID == peerID { pendingScreenPeerID = nil }
+
+        /* peer 建好之前到达的共享态必须在这一次补上，否则屏幕舞台永远不会出现。 */
+        if screenOn {
+            delegate?.rtcDidReceiveRemoteScreen(session.makeRemoteVideoView(), for: peerID)
+        }
+
         publishParticipants()
         syncTeardownBox()
     }
 
     func signaling(_ signaling: TianqiongSignaling, peerLeft peerID: String, name: String, reason: String) {
+        if pendingScreenPeerID == peerID { pendingScreenPeerID = nil }
         guard let peer = remotePeers.removeValue(forKey: peerID) else { return }
         peer.session.close()
         delegate?.rtcDidLoseRemoteMedia(for: peerID)
@@ -1368,7 +1827,19 @@ extension RealRTCClient: TianqiongSignalingDelegate {
 
     func signaling(_ signaling: TianqiongSignaling, screenState peerID: String, on: Bool, resumed: Bool) {
         if peerID == selfPeerID { return }
-        guard let peer = remotePeers[peerID] else { return }
+
+        /* 竞态：新成员加入的瞬间，服务端的 screen:state 可能先于 peer:joined
+           到达。之前这里直接 return，屏幕共享就永远不出现；先挂起，等
+           peerJoined 建好连接再补。 */
+        guard let peer = remotePeers[peerID] else {
+            if on {
+                pendingScreenPeerID = peerID
+            } else if pendingScreenPeerID == peerID {
+                pendingScreenPeerID = nil
+            }
+            return
+        }
+
         peer.screen = on
         let view = peer.session.makeRemoteVideoView()
         if on {
@@ -1472,15 +1943,100 @@ extension RealRTCClient: PeerSessionDelegate {
     func peerSession(_ session: PeerSession, didChangeConnectionState state: RTCPeerConnectionState) {
         switch state {
         case .connected:
-            if let peer = remotePeers[session.peerID] {
-                _ = peer
-            }
+            // 连接通了 ≠ 麦克风在发。真机诊断出现过"收 451 包、发 0 包"：
+            // 界面一切正常，对方完全听不见。连接建立后核一次上行音频。
+            scheduleOutboundAudioWatchdog(for: session)
         case .failed:
             // 交给 PeerSession 自己的 ICE restart / 重建逻辑。
             break
         default:
             break
         }
+    }
+
+    // MARK: - 上行音频看门狗
+
+    /// 连接建立后核对 `outbound-rtp.packetsSent`。
+    ///
+    /// 三级处置：
+    ///  1. 0 包 → 先判断是"设备不出帧"还是"sender 没挂上"：
+    ///     设备级问题（音频会话被按停、AudioUnit 停摆）重挂 sender 是没用的，
+    ///     必须整条音频链路重启；
+    ///  2. 仍有轨道但 0 包 → 直接重挂当前轨道，再协商一次；
+    ///  3. 两轮都失败 → 重建整条 PeerConnection。
+    ///
+    /// 之所以必须在运行时查：SDP 协商结果、音频会话状态、track 生命周期
+    /// 这三件事在真机上都会漂移，任何一次判断失误都必须能自愈，
+    /// 而不是让用户带着一个"哑巴麦克风"开完会。
+    private func scheduleOutboundAudioWatchdog(for session: PeerSession, delay: TimeInterval = 3) {
+        let peerID = session.peerID
+        outboundAudioWatchdogs[peerID]?.cancel()
+
+        let item = DispatchWorkItem { [weak self, weak session] in
+            Task { @MainActor in
+                guard let self, let session else { return }
+                guard session === self.remotePeers[peerID]?.session else { return }
+
+                session.peerConnection.statistics { report in
+                    var sent = 0
+                    for (_, stat) in report.statistics where stat.type == "outbound-rtp" {
+                        if (stat.values["kind"] as? String) == "audio" {
+                            sent = (stat.values["packetsSent"] as? NSNumber)?.intValue ?? 0
+                        }
+                    }
+                    Task { @MainActor in
+                        self.handleOutboundAudioProbe(
+                            peerID: peerID,
+                            session: session,
+                            packetsSent: sent
+                        )
+                    }
+                }
+            }
+        }
+        outboundAudioWatchdogs[peerID] = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func handleOutboundAudioProbe(peerID: String, session: PeerSession, packetsSent: Int) {
+        guard session === remotePeers[peerID]?.session else { return }
+        guard packetsSent == 0 else {
+            outboundAudioProbeCounts.removeValue(forKey: peerID)
+            return
+        }
+        // 用户自己静音着：0 包是正确状态，不是故障。
+        guard localAudioTrack?.isEnabled == true else { return }
+
+        let attempt = (outboundAudioProbeCounts[peerID] ?? 0) + 1
+        outboundAudioProbeCounts[peerID] = attempt
+
+        // 最多两轮补救：再往下就是无限重建，对用户没有任何好处。
+        guard attempt <= 2 else { return }
+
+        if attempt == 1 {
+            /* 关键判断：如果有 audio sender、SDP 是 sendrecv、轨道也 live，
+               那 0 包就不是"挂错了"，而是音频设备根本没在出帧。
+               这时先把设备整条重启；重启函数内部会重建轨并重挂所有 peer，
+               不需要再单独 forceReattach。 */
+            let trackLive = localAudioTrack?.readyState == .live
+            if trackLive {
+                restartAudioPipeline(reason: "peer \(peerID) 连接 3 秒 0 包")
+            } else {
+                let track = rebuildAudioTrack()
+                track?.isEnabled = true
+                if let track = track {
+                    session.forceReattachAudio(track)
+                } else {
+                    session.ensureLocalSenders()
+                }
+            }
+            scheduleOutboundAudioWatchdog(for: session, delay: 4)
+            return
+        }
+
+        // 第二轮仍 0 包：这条连接上的音频通道已经不可信，换一条。
+        outboundAudioProbeCounts.removeValue(forKey: peerID)
+        peerSessionNeedsRebuild(session)
     }
 
     func peerSession(_ session: PeerSession, didReceiveRemoteVideo track: RTCVideoTrack) {
@@ -1491,6 +2047,41 @@ extension RealRTCClient: PeerSessionDelegate {
             delegate?.rtcDidReceiveRemoteScreen(view, for: session.peerID)
         } else {
             delegate?.rtcDidReceiveRemoteVideo(view, for: session.peerID)
+        }
+    }
+
+    /// 远端音频轨到达（含共享扩展退出、音频会话重建后的重挂）。
+    ///
+    /// 这里必须**每次**都确认播放链路，而不只是第一次：
+    /// 真机诊断里出现过"收 451 包、电平恒 0.00、听不见"——包在进、播放没启动。
+    /// WebRTC 的 `inbound-rtp.audioLevel` 由播放线程更新，播放没启动电平就永远是 0，
+    /// 于是"谁在说话"也不会亮。
+    func peerSession(_ session: PeerSession, didReceiveRemoteAudio track: RTCAudioTrack) {
+        track.isEnabled = true
+        ensureAudioSessionActive()
+
+        guard !didHandleFirstRemoteAudio else { return }
+        didHandleFirstRemoteAudio = true
+
+        // 首次：把输出抢回扬声器。用户已经插了耳机 / 连了蓝牙时不要覆盖——
+        // 那会把声音从用户预期的设备里抢走。
+        let route = RTCAudioSession.sharedInstance().currentRoute
+        let hasExternal = route.outputs.contains {
+            [.headphones, .bluetoothA2DP, .bluetoothLE, .bluetoothHFP, .airPlay].contains($0.portType)
+        }
+        if !hasExternal {
+            try? RTCAudioSession.sharedInstance().overrideOutputAudioPort(.speaker)
+        }
+    }
+
+    /// 轻量确认：只在会话确实掉了的时候才重配，避免每次收包都碰系统。
+    private func ensureAudioSessionActive() {
+        let session = RTCAudioSession.sharedInstance()
+        if !session.isActive || !session.isAudioEnabled {
+            reactivateAudioSession()
+            if !session.isAudioEnabled {
+                session.isAudioEnabled = true
+            }
         }
     }
 

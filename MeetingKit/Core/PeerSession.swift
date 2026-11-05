@@ -39,8 +39,18 @@ protocol PeerSessionDelegate: AnyObject {
     /// 因为 Web 端共享走 replaceTrack，链路里是同一条视频轨道）。
     func peerSession(_ session: PeerSession, didReceiveRemoteVideo track: RTCVideoTrack)
 
+    /// 收到远端音频轨。用来把音频会话抢回 playAndRecord + 扬声器：
+    /// 屏幕共享扩展退出后系统可能把 route 留在 videoRecording（听筒、无播放），
+    /// 表现就是"收到了包但没有声音"。
+    func peerSession(_ session: PeerSession, didReceiveRemoteAudio track: RTCAudioTrack)
+
     /// 本地 ICE 彻底失败（多次 restart 无效），请求重建连接。
     func peerSessionNeedsRebuild(_ session: PeerSession)
+}
+
+extension PeerSessionDelegate {
+    /// 默认空实现：不是每个实现方都关心音频轨到达。
+    func peerSession(_ session: PeerSession, didReceiveRemoteAudio track: RTCAudioTrack) {}
 }
 
 // MARK: - 会话
@@ -72,6 +82,18 @@ final class PeerSession: NSObject {
     /// 就再也找不到它，第二次开共享直接推不上去——这正是"关了重新开就不行"的成因。
     private var videoSender: RTCRtpSender?
 
+    /// 本端音频发送通道。
+    ///
+    /// 与 videoSender 同理必须缓存：麦克风轨因设备切换 / 音频会话重建被整体替换时，
+    /// 只能靠这个引用做 replaceTrack；靠 `senders.first(where: track?.kind == "audio")`
+    /// 在 track 短暂为 nil 的瞬间会找不到 sender，声音就再也回不来。
+    private var audioSender: RTCRtpSender?
+
+    /// 本地轨道引用（与 sender 无关）。连接重建、sender 被移除后，
+    /// 靠它把同一条麦克风轨重新挂回去。
+    private var localAudio: RTCAudioTrack?
+    private var localVideo: RTCVideoTrack?
+
     // MARK: 协商状态
 
     private var makingOffer = false
@@ -83,6 +105,16 @@ final class PeerSession: NSObject {
     private var isRestartingIce = false
     /// ICE restart 请求到达时恰好在协商中：等回到 stable 再补发。
     private var needsRestartAfterStable = false
+    /// 有轨道要挂、但当时正在协商：等回到 stable 再补一次。
+    ///
+    /// 少了这一条，`negotiate()` 的 `guard !isNegotiating` 会把这次 addTrack
+    /// 静默吞掉：本地轨永远没有对应的 m-line，answer 里 audio 是 recvonly，
+    /// 表现就是"收得到对方的包，自己一个包都发不出去"。
+    private var needsNegotiateAfterStable = false
+    /// 正在处理远端 offer（setRemoteDescription → answer 之间）。
+    /// 这段时间里 addTrack 触发的 negotiationneeded 不能立刻发 offer，
+    /// 否则又造一次 glare；等 answer 落地后由 needsNegotiateAfterStable 收尾。
+    private var isAcceptingRemoteOffer = false
 
     private static let maxIceRestarts = 3
 
@@ -136,14 +168,62 @@ final class PeerSession: NSObject {
     /// 加入本地收发轨道。重复调用安全（先移除旧 sender 再重加）。
     /// 屏幕共享不走单独轨道：与 Web 端一致，共享时 replaceTrack 替换 video sender。
     func attachLocalTracks(audio: RTCAudioTrack?, video: RTCVideoTrack?) {
-        let streamID = "tq-\(peerID)"
+        // 记住轨道本身：PeerConnection 重建换的是连接，不是麦克风。
+        // 没有这两个引用，重建后的新连接就只能空着——人还在，声音没了。
+        if let audio = audio { localAudio = audio }
+        if let video = video { localVideo = video }
 
-        if let audio = audio {
-            ensureSender(for: audio, streamID: streamID)
+        ensureLocalSenders()
+        /* addTrack 之后主动推一次协商。
+           WebRTC 的 negotiationNeeded 在部分版本/时序下不会回调
+           （尤其是刚 new 出来的 pc 第一次 addTrack），只赌它就会两边互等。 */
+        negotiate()
+    }
+
+    /// 让本地音视频轨一定挂在当前连接上。
+    ///
+    /// 必须在 `setRemoteDescription` **之前**调用：远端 offer 一旦落地，
+    /// 应答里的 m-line 方向就定死了。此时本地还没有 audio sender，
+    /// answer 就是 recvonly——之后 addTrack 只能靠重新协商补救，
+    /// 而重新协商一旦被协商状态吞掉，就再也不会发生。
+    func ensureLocalSenders() {
+        let streamID = "tq-\(peerID)"
+        if let audio = localAudio { ensureSender(for: audio, streamID: streamID) }
+        if let video = localVideo { ensureSender(for: video, streamID: streamID) }
+    }
+
+    /// 诊断用：当前挂着几条上行音频、轨道是什么状态。
+    var audioSenderCount: Int {
+        peerConnection.senders.filter { $0.track?.kind == "audio" }.count
+    }
+
+    var localAudioStateText: String {
+        guard let track = localAudio else { return "无轨道" }
+        let state: String
+        switch track.readyState {
+        case .live: state = "live"
+        case .ended: state = "ended"
+        @unknown default: state = "unknown"
         }
-        if let video = video {
-            ensureSender(for: video, streamID: streamID)
+        return "\(track.isEnabled ? "开启" : "静音")/\(state)"
+    }
+
+    /// 上行音频发不出去时的补救：把 sender 拆了重挂，再走一次协商。
+    ///
+    /// 只替换 `sender.track` 不够——如果这个 sender 所在的 transceiver
+    /// 方向已经被 answer 定成 recvonly，换轨也不会让它开始发送。
+    /// removeTrack + addTrack 会把这个 transceiver 的方向重新谈成 sendrecv。
+    func forceReattachAudio(_ track: RTCAudioTrack) {
+        guard !isClosed else { return }
+        localAudio = track
+
+        if let sender = audioSender ?? peerConnection.senders.first(where: { $0.track?.kind == "audio" }) {
+            peerConnection.removeTrack(sender)
         }
+        audioSender = nil
+        peerConnection.add(track, streamIds: ["tq-\(peerID)"])
+        audioSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
+        negotiate()
     }
 
     /// 屏幕共享：用 screen 替换当前的 video sender（Web 端同款 replaceTrack 策略）。
@@ -201,12 +281,51 @@ final class PeerSession: NSObject {
             if track.kind == "video", videoSender == nil {
                 videoSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
             }
+            if track.kind == "audio", audioSender == nil {
+                audioSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
+            }
+            forceSendRecvIfNeeded(for: track)
             return
         }
         peerConnection.add(track, streamIds: [streamID])
         if track.kind == "video" {
             videoSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
         }
+        if track.kind == "audio" {
+            audioSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
+        }
+        forceSendRecvIfNeeded(for: track)
+    }
+
+    /// 把挂着这条轨的 transceiver 方向钉成 sendrecv。
+    ///
+    /// `addTrack` 默认就是 sendrecv，但当这条 m-line 之前被 answer 谈成
+    /// recvonly（例如本端先应答、后挂轨）时，方向会一直留在 recvonly：
+    /// 轨道 live、sender 也在，却一个包都不发。诊断里看到"SDP 本端 recvonly"
+    /// 就是这种状态。
+    private func forceSendRecvIfNeeded(for track: RTCMediaStreamTrack) {
+        guard let tx = peerConnection.transceivers.first(where: {
+            $0.sender.track?.trackId == track.trackId
+        }) else { return }
+        if tx.direction == .recvOnly {
+            tx.direction = .sendRecv
+        }
+    }
+
+    /// 用新麦克风轨替换当前上行音频（不重建 PeerConnection、不重新协商）。
+    /// 这是 Jitsi `replaceTrack` 在音频侧的对应实现：设备切换、权限刚放开、
+    /// 音频会话重建导致旧轨失效时，调用方 rebuild 后从这里把声音接回去。
+    func replaceAudioTrack(with track: RTCAudioTrack?) {
+        guard let track = track else { return }
+        if let sender = audioSender ?? peerConnection.senders.first(where: { $0.track?.kind == "audio" }) {
+            audioSender = sender
+            sender.track = track
+            return
+        }
+        /* 一个 audio sender 都没有：对端接入时本端还没建过音频 sender
+           （极少见，例如入会时完全无麦克风权限）。补一条，走一次重新协商。 */
+        peerConnection.add(track, streamIds: ["tq-\(peerID)"])
+        audioSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
     }
 
     // MARK: - 远端信号
@@ -337,7 +456,12 @@ final class PeerSession: NSObject {
         isNegotiating = false
         isRestartingIce = false
         needsRestartAfterStable = false
+        needsNegotiateAfterStable = false
+        isAcceptingRemoteOffer = false
         pendingRemoteCandidates.removeAll()
+        // 只放引用，不 stop 轨道：同一条麦克风轨还要给别的 peer 用。
+        localAudio = nil
+        localVideo = nil
 
         if let track = remoteVideoTrack, let view = remoteVideoView {
             track.remove(view)
@@ -366,6 +490,10 @@ final class PeerSession: NSObject {
     }
 
     private func handleRemoteOffer(_ description: RTCSessionDescription) {
+        /* 先把本地轨挂上，再让对端的 offer 落地。
+           顺序反过来，answer 里 audio 就是 recvonly——本端从此只收不发。 */
+        ensureLocalSenders()
+
         // Perfect Negotiation 的 glare 处理（与 Web 端一致）：
         //  · 非礼貌方（impolite）在冲突时丢弃对方 offer；
         //  · 礼貌方 rollback 自己的 offer 后接受对方 offer。
@@ -376,6 +504,7 @@ final class PeerSession: NSObject {
         }
 
         isNegotiating = true
+        isAcceptingRemoteOffer = true
 
         if collision && polite {
             let rollback = RTCSessionDescription(type: .rollback, sdp: "")
@@ -397,6 +526,7 @@ final class PeerSession: NSObject {
                 guard let self = self else { return }
                 if error != nil {
                     self.isNegotiating = false
+                    self.isAcceptingRemoteOffer = false
                     // setRemoteDescription 失败通常意味着远端描述与本地状态冲突，
                     // 重建连接比继续纠缠更快恢复。
                     self.delegate?.peerSessionNeedsRebuild(self)
@@ -412,11 +542,21 @@ final class PeerSession: NSObject {
                     Task { @MainActor in
                         guard let self = self else { return }
                         self.isNegotiating = false
+                        self.isAcceptingRemoteOffer = false
                         guard let answer = answer, error == nil else {
                             self.delegate?.peerSessionNeedsRebuild(self)
                             return
                         }
-                        self.applyLocalDescriptionAndSignal(answer, restart: false)
+                        self.applyLocalDescriptionAndSignal(answer, restart: false) { [weak self] in
+                            Task { @MainActor in
+                                guard let self = self else { return }
+                                // answer 期间又有轨道变更（极少见）：补一轮协商。
+                                if self.needsNegotiateAfterStable {
+                                    self.needsNegotiateAfterStable = false
+                                    self.negotiate()
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -469,11 +609,25 @@ final class PeerSession: NSObject {
         }
     }
 
-    /// 触发协商：polite 方的新 offer。onNegotiationNeeded 到达时调用。
+    /// 触发协商：由 `peerConnectionShouldNegotiate` 调用。
+    /// 双方都可能发 offer，glare 由 polite 方回滚（见 handleRemoteOffer）。
     private func negotiate() {
         guard !isClosed else { return }
-        guard !makingOffer, !isNegotiating else { return }
-        guard peerConnection.signalingState == .stable else { return }
+        guard !isAcceptingRemoteOffer else {
+            // 正在应答对端的 offer。这一轮的 m-line 由 answer 承载，
+            // 不能再发一个 offer——否则两端会陷入"你答我、我答你"的乒乓协商。
+            return
+        }
+        guard !makingOffer, !isNegotiating else {
+            // 协商正在进行。直接 return 会让这次 addTrack 永远没有对应的 offer，
+            // 记下来，等回到 stable 再补——这是"本地轨挂上了却一个包都不发"的根因之一。
+            needsNegotiateAfterStable = true
+            return
+        }
+        guard peerConnection.signalingState == .stable else {
+            needsNegotiateAfterStable = true
+            return
+        }
 
         makingOffer = true
         isNegotiating = true
@@ -518,6 +672,10 @@ extension PeerSession: RTCPeerConnectionDelegate {
                 if self.needsRestartAfterStable {
                     self.needsRestartAfterStable = false
                     self.performIceRestart()
+                } else if self.needsNegotiateAfterStable {
+                    // 协商回到稳定态：把之前被吞掉的那次轨道变更补上。
+                    self.needsNegotiateAfterStable = false
+                    self.negotiate()
                 }
             }
         }
@@ -529,6 +687,7 @@ extension PeerSession: RTCPeerConnectionDelegate {
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {}
 
+    /// WebRTC 认为"需要重新协商"时（addTrack / replaceTrack / 方向变化）的回调。
     func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {
         Task { @MainActor in
             self.negotiate()
@@ -590,6 +749,7 @@ extension PeerSession: RTCPeerConnectionDelegate {
                 if let audio = track as? RTCAudioTrack {
                     self.remoteAudioTrack = audio
                     audio.isEnabled = true
+                    self.delegate?.peerSession(self, didReceiveRemoteAudio: audio)
                 }
             case "video":
                 if let video = track as? RTCVideoTrack {

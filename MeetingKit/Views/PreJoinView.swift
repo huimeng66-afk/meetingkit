@@ -35,9 +35,18 @@ struct PreJoinView: View {
     @State private var passwordText = ""
     /// 校验 / 入会的错误提示。
     @State private var joinError: String?
-    /// 0.6s 的入会 loading。离开页面必须取消，否则用户返回首页后
-    /// 半秒后会被一个"幽灵任务"强行拉进会议室。
-    @State private var joinWorkItem: DispatchWorkItem?
+    /// 入会前的权限申请 + 转场任务。离开页面必须取消，否则用户返回首页后
+    /// 几秒后会被一个"幽灵任务"强行拉进会议室。
+    @State private var joinTask: Task<Void, Never>?
+    /// 系统录音授权状态。
+    ///
+    /// 这里**不再**用 AVAudioRecorder 做"入会前电平演示"。教训很直接：
+    /// AVAudioRecorder 会真正占住麦克风，而 SwiftUI 的页面切换是异步的——
+    /// 点下"加入会议"后，PreJoinView 的 onDisappear 往往晚于 WebRTC 启动音频设备，
+    /// 那次迟到的 `setActive(false)` 会把刚拉起来的 AudioUnit 一起按停。
+    /// 表现就是"一进会议就没有麦克风"，且所有界面状态都还是正常的。
+    /// 所以门外只负责"授权"，采集一律交给会议内的 WebRTC。
+    @State private var micGranted: Bool = RealRTCClient.micPermissionGranted
 
     private let pagePadding: CGFloat = 20
 
@@ -72,8 +81,19 @@ struct PreJoinView: View {
                 .padding(.bottom, 40)
             }
         }
+        .onAppear {
+            // 门外只做一件事：把授权问清楚。真正的采集从入会后由 WebRTC 接管，
+            // 这里绝不打开任何录音设备（原因见 micGranted 的注释）。
+            guard isMicOn, !micGranted else { return }
+            Task { @MainActor in
+                let granted = await RealRTCClient.requestMicPermission()
+                micGranted = granted
+                if !granted { isMicOn = false }
+            }
+        }
         .onDisappear {
-            joinWorkItem?.cancel()
+            joinTask?.cancel()
+            joinTask = nil
         }
         .sheet(isPresented: $isLoginPresented) {
             LoginView(displayName: $displayName)
@@ -179,13 +199,22 @@ struct PreJoinView: View {
                 HStack(spacing: 12) {
                     Spacer(minLength: 0)
 
-                    previewToggle(
-                        isOn: isMicOn,
-                        onSymbol: "mic.fill",
-                        offSymbol: "mic.slash.fill",
-                        accessibilityLabel: isMicOn ? "关闭麦克风" : "开启麦克风"
-                    ) {
-                        isMicOn.toggle()
+                    // 麦克风钮外圈：开麦时缓慢呼吸，表达"已就绪"。
+                    // 不假装是实时电平——门外没有任何采集，画一条会动的波形
+                    // 只会掩盖真正的问题（要么权限没给，要么设备被别的 App 占着）。
+                    ZStack {
+                        if isMicOn {
+                            MicReadyHalo(diameter: 44)
+                        }
+
+                        previewToggle(
+                            isOn: isMicOn,
+                            onSymbol: "mic.fill",
+                            offSymbol: "mic.slash.fill",
+                            accessibilityLabel: isMicOn ? "关闭麦克风" : "开启麦克风"
+                        ) {
+                            toggleMic()
+                        }
                     }
 
                     previewToggle(
@@ -197,6 +226,12 @@ struct PreJoinView: View {
                         isCameraOn.toggle()
                     }
                 }
+
+                HStack {
+                    Spacer(minLength: 0)
+                    micStatusHint
+                }
+                .padding(.top, 8)
             }
             .padding(16)
         }
@@ -255,6 +290,43 @@ struct PreJoinView: View {
         }
         .buttonStyle(BrandPressStyle())
         .accessibilityLabel(accessibilityLabel)
+    }
+
+    // MARK: - 麦克风
+
+    /// 麦克风开关：只管理授权与意图，不碰录音设备。
+    ///
+    /// 权限在这里自己申请，不留给 proceedToRoom：用户点了麦克风却看不到
+    /// 任何反馈，是"点了没反应"最典型的来源。
+    private func toggleMic() {
+        if isMicOn {
+            isMicOn = false
+            return
+        }
+        isMicOn = true
+        Task { @MainActor in
+            let granted = await RealRTCClient.requestMicPermission()
+            micGranted = granted
+            if !granted { isMicOn = false }
+        }
+    }
+
+    /// 开关下方的一行状态。宁可多一句话，也不要让用户靠猜——
+    /// 这一页是他判断"我的麦克风到底行不行"的唯一机会。
+    @ViewBuilder
+    private var micStatusHint: some View {
+        Group {
+            if !isMicOn {
+                Text("麦克风已关闭 · 对方听不到你的声音").opacity(0.72)
+            } else if !micGranted {
+                Text("麦克风权限未开启 · 请到系统设置里允许").foregroundColor(Theme.Palette.danger)
+            } else {
+                Text("麦克风已就绪 · 入会后自动开启").opacity(0.72)
+            }
+        }
+        .font(.system(size: 11))
+        .foregroundColor(.white)
+        .animation(.easeInOut(duration: 0.18), value: isMicOn)
     }
 
     // MARK: - 表单
@@ -516,21 +588,44 @@ struct PreJoinView: View {
         }
     }
 
-    /// 校验通过后：0.6s 过渡 → 进入会议室。
+    /// 校验通过后：先在这张页面把麦克风/摄像头权限要完，再进入会议室。
+    ///
+    /// 为什么不在会议室里等 `rtc.join` 去要权限：
+    ///   1. `AVAudioApplication.requestRecordPermission` 在 fullScreenCover 转场
+    ///      期间调用时，系统弹窗可能被延迟甚至吞掉，用户只看到"正在连接会议…"；
+    ///   2. 权限弹窗属于"入会前检查"，放在门外比放在门里更符合预期；
+    ///   3. 用户拒绝后直接以静音/关摄像头入会，会议室不会再出现一次授权等待。
     private func proceedToRoom() {
+        guard !isJoining else { return }
         isJoining = true
+        joinError = nil
 
         let targetRouter = router
-        let payload = buildJoinInfo()
-        let work = DispatchWorkItem {
-            // DispatchWorkItem 的闭包是 nonisolated 的，AppRouter 却是 @MainActor；
-            // 显式跳一次主线程，避免 Swift 6 并发检查把它判成跨 actor 同步调用。
-            Task { @MainActor in
-                targetRouter.join(payload)
+        let wantsCamera = isCameraOn
+        let task = Task { @MainActor in
+            // 1. 麦克风：入会必问。已授权/已拒绝时系统会立即返回，不会重复弹窗。
+            let granted = await RealRTCClient.requestMicPermission()
+            if Task.isCancelled { return }
+            self.micGranted = granted
+            if !granted { self.isMicOn = false }
+
+            // 2. 摄像头：只在本次真的要开摄像头时问，避免多余弹窗。
+            if wantsCamera {
+                let cameraGranted = await RealRTCClient.requestCameraPermission()
+                if Task.isCancelled { return }
+                if !cameraGranted { self.isCameraOn = false }
             }
+
+            // 3. 权限结果已经写进 @State，重新构造一次入会参数再导航。
+            if Task.isCancelled { return }
+            let payload = self.buildJoinInfo()
+
+            // 给系统权限弹窗收起留一点时间，避免它和全屏转场叠在一起。
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            if Task.isCancelled { return }
+            targetRouter.join(payload)
         }
-        joinWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+        joinTask = task
     }
 
     /// "发起新会议"：真实链路向服务端创建即时会议（需要登录）。
@@ -642,5 +737,38 @@ struct PreJoinView: View {
             joinInfo.title = title
         }
         return joinInfo
+    }
+}
+
+// MARK: - 就绪光环
+
+/// 麦克风钮外圈的"已就绪"呼吸环。
+///
+/// 它只表达一件事：麦克风已授权、入会后会被打开。
+/// 故意不做成随音量跳动的电平条——门外没有采集，任何跳动都是演出来的，
+/// 反而会掩盖"权限被拒 / 设备被占用"这类真问题。
+private struct MicReadyHalo: View {
+
+    var diameter: CGFloat
+
+    @State private var breathing = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+
+            Circle()
+                .stroke(Theme.Palette.accent.opacity(breathing ? 0.42 : 0.18), lineWidth: 1.4)
+                .scaleEffect(breathing ? 1.16 : 1.0)
+        }
+        .frame(width: diameter, height: diameter)
+        .animation(
+            .easeInOut(duration: 1.8).repeatForever(autoreverses: true),
+            value: breathing
+        )
+        .onAppear { breathing = true }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }

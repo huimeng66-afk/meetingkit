@@ -221,7 +221,7 @@ struct MeetingRoomView: View {
         // 聊天需要尽量高的输入区，两者都走大档。
         case .participants, .chat:
             return .large
-        case .more, .sharePicker, .invite, .safety, .settings:
+        case .more, .sharePicker, .invite, .safety, .settings, .diagnostics:
             return .medium
         }
     }
@@ -256,6 +256,8 @@ struct MeetingRoomView: View {
             SafetyPanel(viewModel: viewModel)
         case .settings:
             SettingsPanel(viewModel: viewModel)
+        case .diagnostics:
+            DiagnosticsPanel(viewModel: viewModel)
         }
     }
 

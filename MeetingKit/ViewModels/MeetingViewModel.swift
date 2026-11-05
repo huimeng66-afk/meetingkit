@@ -40,6 +40,11 @@ final class MeetingViewModel: ObservableObject {
     // MARK: - 本机状态
 
     @Published private(set) var isMicOn: Bool = true
+
+    /// 正在等麦克风就绪（权限弹窗 / 设备重建）。
+    /// UI 据此把按钮切成"开启中"并禁用，避免连点触发两路采集。
+    /// 对照 Jitsi 的 GUM pending 状态：这段时间既不能假装成功，也不能让用户以为卡死。
+    @Published private(set) var isMicPending: Bool = false
     /// 麦克风授权是否已在入会后对账过（只对账一次，重连不重复提示）。
     private var hasReconciledMicPermission = false
     @Published private(set) var isCameraOn: Bool = true
@@ -48,6 +53,11 @@ final class MeetingViewModel: ObservableObject {
 
     /// 本地麦克风实时电平（0...1）。底栏的说话脉冲读它。
     @Published private(set) var localAudioLevel: Float = 0
+
+    /// 音视频诊断文本。只在打开诊断面板时采集，
+    /// 用户反馈"听不见/看不到"时靠它一次定位卡在哪一段。
+    @Published private(set) var diagnosticsText: String = "正在采集…"
+
     /// 音频路由：true = 扬声器，false = 听筒。默认外放，与入会后的常规预期一致。
     /// didSet 直接下发 RTC：真实链路改的是 RTCAudioSession 的输出端口。
     @Published var isSpeakerOn: Bool = true {
@@ -124,7 +134,7 @@ final class MeetingViewModel: ObservableObject {
             return "你正在共享屏幕"
         }
         if remoteScreenPeerID != nil {
-            let name = remoteScreenPeerName.isEmpty ? "参会成员" : remoteScreenPeerName
+            let name = DisplayName.clean(remoteScreenPeerName, fallback: "参会成员")
             return "\(name) 正在共享屏幕"
         }
         return ""
@@ -345,6 +355,9 @@ final class MeetingViewModel: ObservableObject {
 
         connectionState = .connecting
         participants = []
+        /* 重新入会要重新对账一次权限：用户可能刚去系统设置里改过麦克风授权，
+           不能因为上一场已经对过账就把新的授权状态吞掉。 */
+        hasReconciledMicPermission = false
         hasJoined = true
         joinSession()
     }
@@ -352,6 +365,9 @@ final class MeetingViewModel: ObservableObject {
     func onDisappear() {
         hasJoined = false
         stopTicker()
+        /* 离会时把 pending 清掉：麦克风重建的异步回调可能晚于离会到达，
+           不清会让下一次入会的按钮一进来就转圈。 */
+        isMicPending = false
 
         // 离开会议必须结束系统录屏，否则扩展成孤儿进程：会议室已经销毁，
         // ReplayKit 广播却还在后台采集屏幕、持续往 App Group 写帧，用户完全无感知。
@@ -370,6 +386,7 @@ final class MeetingViewModel: ObservableObject {
     // MARK: - 本机设备
 
     func toggleMic() {
+        if isMicPending { return }
         guard !isMicOn else {
             applyMicState(false)
             return
@@ -380,20 +397,31 @@ final class MeetingViewModel: ObservableObject {
         // 原因是麦克风权限被拒时，WebRTC 的 audio track 依然能 isEnabled = true，
         // 它只是采不到任何一点数据——界面全绿，实际是哑的。
         switch micPermission {
-        case .granted:
-            applyMicState(true)
         case .denied:
             // denied 状态下系统不会再弹窗，只能引导用户自己去设置里改。
             showToast(.micPermissionDenied())
-        case .undetermined:
-            // 首次授权：这里弹系统弹窗，回来再决定要不要真的开麦。
-            Task { @MainActor [weak self] in
-                let granted = await RealRTCClient.requestMicPermission()
+        case .granted, .undetermined:
+            /* 统一走 ensureMicEnabled：它内部会处理"轨不存在/已失效"的情况，
+               并在必要时弹系统授权。比起这里只改一个布尔值，多的是自愈能力：
+               设备被拔出、音频会话被来电打断、用户刚在设置里放开权限，
+               这些场景下旧实现都会静默失败。 */
+            isMicPending = true
+            rtc.ensureMicEnabled(true) { [weak self] ok, reason in
                 guard let self = self else { return }
-                if granted {
+                self.isMicPending = false
+                if ok {
                     self.applyMicState(true)
                 } else {
-                    self.showToast(.micPermissionDenied())
+                    self.isMicOn = false
+                    if let reason = reason, !reason.isEmpty {
+                        self.showToast(ToastMessage(
+                            text: reason,
+                            systemImage: "mic.slash.fill",
+                            style: .warning
+                        ))
+                    } else {
+                        self.showToast(.micPermissionDenied())
+                    }
                 }
             }
         }
@@ -402,6 +430,9 @@ final class MeetingViewModel: ObservableObject {
     /// 把麦克风状态同时落到 RTC 轨、本地成员和界面上。
     /// 集中在一处，避免"改了 isMicOn 忘了通知 RTC"这类不一致。
     private func applyMicState(_ enabled: Bool) {
+        /* 双保险：正常路径由 ensureMicEnabled 的回调复位；
+           若回调因视图销毁/超时未到达，这里落定状态时也必须解除转圈。 */
+        isMicPending = false
         isMicOn = enabled
         rtc.setMicEnabled(enabled)
         updateLocalParticipant { $0.isMicOn = enabled }
@@ -569,12 +600,27 @@ final class MeetingViewModel: ObservableObject {
 
     // MARK: - 面板
 
+    /// 采集一份诊断文本。真实 RTC 才有 RTP 计数，Mock 直接给一句说明。
+    func refreshDiagnostics() {
+        diagnosticsText = "正在采集…"
+        if let real = rtc as? RealRTCClient {
+            real.collectDiagnostics { [weak self] text in
+                self?.diagnosticsText = text
+            }
+        } else {
+            diagnosticsText = "模拟连接，没有真实 RTP 数据。"
+        }
+    }
+
     func openPanel(_ panel: MeetingPanel) {
         // 面板会盖住底栏，如果此刻 chrome 是隐藏态，用户点完按钮会觉得"点了没反应"。
         isChromeVisible = true
         activePanel = panel
         if panel == .chat {
             markChatRead()
+        }
+        if panel == .diagnostics {
+            refreshDiagnostics()
         }
     }
 
@@ -789,6 +835,7 @@ final class MeetingViewModel: ObservableObject {
         case invite
         case safety
         case settings
+        case diagnostics
 
         var id: String { rawValue }
     }
@@ -824,8 +871,8 @@ extension MeetingViewModel: RTCClientDelegate {
         // 否则共享条会一直停在占位文案上。
         if let sharingID = remoteScreenPeerID,
            let sharer = self.participants.first(where: { $0.id == sharingID }),
-           remoteScreenPeerName != sharer.name {
-            remoteScreenPeerName = sharer.name
+           remoteScreenPeerName != DisplayName.clean(sharer.name) {
+            remoteScreenPeerName = DisplayName.clean(sharer.name)
         }
 
         guard let local = self.participants.first(where: { $0.isLocal }) else { return }
@@ -956,7 +1003,10 @@ extension MeetingViewModel: RTCClientDelegate {
             remoteShareStartedAt = Date()
             remoteShareDurationText = "00:00"
         }
-        remoteScreenPeerName = participants.first(where: { $0.id == userID })?.name ?? remoteScreenPeerName
+        let sharerName = DisplayName.clean(participants.first(where: { $0.id == userID })?.name)
+        if !sharerName.isEmpty {
+            remoteScreenPeerName = sharerName
+        }
         // 切到共享展示时收起面板，保证画面完整。
         activePanel = nil
         // 有人开始共享时把控件收起来：共享内容是全场焦点，

@@ -112,7 +112,7 @@ struct SharePickerPanel: View {
                 .font(Theme.Typography.sectionTitle)
                 .foregroundColor(Theme.Palette.textPrimary)
 
-            Text("选择要共享的内容，系统会请求录屏权限")
+            Text("iOS 只能共享整个屏幕，不能只投某一个 App")
                 .font(Theme.Typography.caption)
                 .foregroundColor(Theme.Palette.textTertiary)
         }
@@ -128,7 +128,7 @@ struct SharePickerPanel: View {
         HStack(spacing: Theme.Metrics.space3) {
             sourceCard(
                 title: "共享屏幕",
-                subtitle: "整个屏幕或某个 App",
+                subtitle: "整屏 · 你切到哪个 App 就播哪个",
                 systemImage: SymbolCompat.name(
                     "rectangle.inset.filled.and.person.filled",
                     "rectangle.on.rectangle",
@@ -229,6 +229,7 @@ struct SharePickerPanel: View {
             stepRow(index: 1, text: "点击下方「开始共享屏幕」")
             stepRow(index: 2, text: "在系统弹窗中选择「\(AppGroupConfig.displayName) 屏幕共享」")
             stepRow(index: 3, text: "点击「开始直播」，共享画面会出现在会议里")
+            stepRow(index: 4, text: "回到桌面、切到要展示的 App —— 你切到哪儿，对面就看到哪儿（包括通知和横竖屏切换）")
         }
         .padding(Theme.Metrics.space3)
         .frame(maxWidth: .infinity, alignment: .leading)

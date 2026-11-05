@@ -233,9 +233,7 @@ struct ScreenShareStage: View {
             }
 
             VStack(spacing: 6) {
-                Text(viewModel.remoteScreenPeerName.isEmpty
-                     ? "正在接收共享画面"
-                     : "\(viewModel.remoteScreenPeerName) 正在共享")
+                Text("\(DisplayName.clean(viewModel.remoteScreenPeerName, fallback: "参会成员")) 正在共享")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(Theme.Palette.textPrimary)
                     .multilineTextAlignment(.center)

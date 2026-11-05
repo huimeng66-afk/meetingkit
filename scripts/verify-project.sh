@@ -212,6 +212,17 @@ else:
         match = re.search(r'static\s+let\s+' + name + r'\s*=\s*"([^"]+)"', swift_text)
         if match:
             values[name] = match.group(1)
+        elif name == "identifier":
+            # identifier 是运行时探测出来的（free 账号没有 App Groups 时会降级），
+            # 源码里写成 `static let identifier: String = resolveIdentifier()`，
+            # 字面量只存在于 preferredIdentifier。这里回退取它做校验，
+            # 否则每次都会误报 FAIL。
+            fallback = re.search(r'static\s+let\s+preferredIdentifier\s*=\s*"([^"]+)"', swift_text)
+            if fallback:
+                values[name] = fallback.group(1)
+                emit("PASS", "AppGroupConfig.identifier 为运行时解析，按 preferredIdentifier 校验 (%s)" % fallback.group(1))
+            else:
+                emit("FAIL", "AppGroupConfig.identifier 与 preferredIdentifier 均未找到", "期望 static let preferredIdentifier = \"group.xxx\"")
         else:
             emit("FAIL", "AppGroupConfig.%s 未找到" % name, "期望形如 static let %s = \"...\"" % name)
 

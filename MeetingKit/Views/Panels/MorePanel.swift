@@ -143,6 +143,14 @@ struct MorePanel: View {
                 ) {
                     // 云录制尚未接入服务端，禁用并标注"即将上线"，避免假开关误导用户。
                 }
+
+                MoreActionTile(
+                    title: "诊断",
+                    systemImage: SymbolCompat.name("waveform.path.ecg", "stethoscope", "info.circle"),
+                    isOn: nil
+                ) {
+                    viewModel.openPanel(.diagnostics)
+                }
             }
             .padding(.horizontal, Theme.Metrics.horizontal)
 

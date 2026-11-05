@@ -217,6 +217,13 @@ protocol RTCClient: AnyObject {
     func setMicEnabled(_ enabled: Bool)
     func setCameraEnabled(_ enabled: Bool)
 
+    /// 确保麦克风落到期望状态，轨缺失时由实现方异步重建后再回调。
+    ///
+    /// 必须声明在协议里（而不是只放 extension）：Swift 的协议扩展方法
+    /// 只有声明为 requirement 才走 witness table 动态派发；只写在 extension 里
+    /// 会静态绑定到默认实现，`RealRTCClient` 的同名方法永远不会被调用。
+    func ensureMicEnabled(_ enabled: Bool, completion: ((Bool, String?) -> Void)?)
+
     /// 切换前后摄像头。
     func switchCamera()
 
@@ -263,6 +270,28 @@ protocol RTCClient: AnyObject {
 
     /// 结束会议（通知服务端收尾）。
     func endMeeting()
+}
+
+// MARK: - 麦克风自愈
+
+extension RTCClient {
+
+    /// 确保麦克风落到期望状态，轨缺失时由实现方异步重建后再回调。
+    ///
+    /// 背景（对照 Jitsi 的 `setTrackMuted` + GUM pending state）：
+    /// 开麦不是把布尔值翻过来就完事——用户可能刚在系统设置里放开权限、
+    /// 麦克风可能被其他 App 抢占、音频会话可能被来电打断，
+    /// 这些情况下 `localAudioTrack` 要么不存在、要么已经失效。
+    /// 同步版本只能静默 return，表现就是“按钮亮了、对方没声音”。
+    ///
+    /// 默认实现走同步方法，保持 Mock 与旧实现零改动。
+    /// - Parameters:
+    ///   - enabled: true 开麦，false 关麦。
+    ///   - completion: `(是否成功, 失败原因)`。成功时 reason 为 nil。
+    func ensureMicEnabled(_ enabled: Bool, completion: ((Bool, String?) -> Void)? = nil) {
+        setMicEnabled(enabled)
+        completion?(enabled, nil)
+    }
 }
 
 // MARK: - 远端媒体描述
