@@ -170,8 +170,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
             handleVideoSampleBuffer(sampleBuffer)
 
         case .audioApp, .audioMic:
-            // 音频不在这里处理：屏幕共享期间的声音由主 App 侧的 RTC SDK 直接从麦克风采集，
-            // 系统混音轨（audioApp）后续通过 SDK 的 ReplayKit 音频通道接入，本阶段不上行。
+            /* 共享内的 App 声音（audioApp）当前不上行，这是能力边界，不是漏写：
+               官方 WebRTC iOS SDK 的 RTCAudioSource 只有 volume 属性，
+               没有喂 PCM 的公开接口（buffer / capture 都不存在），
+               ReplayKit 的 audioApp 采样无法送进编码器。
+               要支持"共享视频带声音"，只能换自编译 WebRTC + 自定义
+               AudioDeviceModule，属于换 SDK，不是打补丁。
+
+               audioMic 更不能在这里采：主 App 的麦克风已经在采，
+               这里再采一份就是双份音轨 + 回声。 */
             break
 
         @unknown default:

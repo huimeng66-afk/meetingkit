@@ -221,7 +221,7 @@ idle ──开始直播──▶ active ──暂停──▶ paused ──恢�
 2. 选中扩展并点「开始直播」→ 系统启动 `MeetingBroadcast` 进程
 3. `broadcastStarted` 写 `state = .active` + `startedAt` + 首次心跳，post `stateChanged`
 4. 主 App `ScreenShareBridge` 收到 → `isScreenSharing = true` → 红条 + 底栏红色 + 画布切共享态
-5. 每帧：节流 4fps → 缩放到 800px 宽 → JPEG(0.5) → 写共享容器 → post `frameUpdated`
+5. 每帧：节流 24fps → 短边缩到 1080 → JPEG(0.78) → 写共享容器 → post `frameUpdated`
 6. 主 App 按 10fps 上限读取 + 解码（`readIfNewer` 去重）→ `sharedFrame` 更新
 7. 扩展每 2 秒刷心跳；主 App 每 4 秒 `validateLiveness()`，12 秒无心跳判死并清脏状态
 8. 停止：主 App post `stopRequested` → 扩展先清状态再 `finishBroadcastWithError` → UI 复位
@@ -310,7 +310,7 @@ iOS 应用必须链接 Apple 的 iOS SDK，并用 `codesign` 做代码签名，�
 
 | 项 | 说明 |
 |---|---|
-| 共享画面清晰度 | 采集端短边压到 800px 再编码，文档演示够用；追求 1080p 可把 `maxPixelEdge` 调大并观察扩展内存 |
+| 共享画面清晰度 | 采集端短边压到 1080（等价 1080p）、JPEG 0.78；再往上内存与落盘先成为瓶颈 |
 | 跨网段连通 | 依赖服务端 `/api/rtc/ice` 下发的 TURN；TURN 不可达时只能同网段直连 |
 | 扩展内存上限 | 约 50MB。CIContext 复用 + 单帧在途 + autoreleasepool；接 SDK 后需重估 |
 | `voip` 未启用 | 没有 PushKit 实现就声明会被审核问询，接入后再加到 `UIBackgroundModes` |

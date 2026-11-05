@@ -144,6 +144,17 @@ final class RealRTCClient: NSObject, RTCClient {
 
     private var screenPusher: ScreenFramePusher?
 
+    /// 扬声器偏好。路由看守要按它判断，否则用户手动切到听筒后
+    /// 会被每 2 秒一次的看守强行顶回扬声器。
+    private var speakerOn = true
+
+    /// 共享期间的音频路由看守（ReplayKit 会在起播时重配一次 AVAudioSession）。
+    private var routeGuardTimer: DispatchSourceTimer?
+
+    /// 音频会话恢复失败后的重试节流。失败时（例如正在通话中）每 0.6 秒
+    /// 重试一次会白白耗电，2 秒一次足够。
+    private var lastAudioRecoveryAt = Date.distantPast
+
     /// join 是否已经走完（防止重复 join）。
     private var hasCompletedJoin = false
 
@@ -355,21 +366,35 @@ final class RealRTCClient: NSObject, RTCClient {
         let av = AVAudioSession.sharedInstance()
         let session = RTCAudioSession.sharedInstance()
 
+        /* 不能只比对 category 和 mode：
+           ReplayKit 起播时会用同一个 .playAndRecord 重设一次，但把
+           .defaultToSpeaker 抹掉——category/mode 看起来全对，声音却从听筒出来。
+           所以说话人选项也要参与判断（两个方向都要查：用户选了听筒，
+           ReplayKit 也可能反过来把 defaultToSpeaker 加回来）。 */
+        let speakerOptionMismatch = speakerOn
+            ? !av.categoryOptions.contains(.defaultToSpeaker)
+            : av.categoryOptions.contains(.defaultToSpeaker)
         let needsRoute = force
             || av.category != .playAndRecord
             || av.mode != .voiceChat
+            || speakerOptionMismatch
 
         session.lockForConfiguration()
         do {
             if needsRoute {
-                try session.setCategory(
-                    .playAndRecord,
-                    with: [.allowBluetooth, .defaultToSpeaker]
-                )
+                let options: AVAudioSession.CategoryOptions = speakerOn
+                    ? [.allowBluetooth, .defaultToSpeaker]
+                    : [.allowBluetooth]
+                try session.setCategory(.playAndRecord, with: options)
                 try session.setMode(.voiceChat)
             }
             if force || !session.isActive {
                 try session.setActive(true)
+            }
+            /* 强制恢复时把输出口也钉到用户选的设备上。
+               接着耳机/蓝牙时不动——override 会把人家的路由抢走。 */
+            if force, !hasExternalAudioRoute(av) {
+                try session.overrideOutputAudioPort(speakerOn ? .speaker : .none)
             }
             /* 自动音频模式下 WebRTC 会自行 start/stop audio unit；
                这里只需确认它没被上一次中断留在 stop 状态。 */
@@ -380,12 +405,72 @@ final class RealRTCClient: NSObject, RTCClient {
             print("[rtc] audio session activate failed: \(error.localizedDescription)")
             // 一次失败多半是设备被别的进程占着：稍后再试一次，
             // 不把错误抛给用户——真正的兜底是上行看门狗。
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                guard let self, self.isJoined else { return }
-                self.reactivateAudioSession(force: true)
+            let now = Date()
+            if now.timeIntervalSince(lastAudioRecoveryAt) > 2 {
+                lastAudioRecoveryAt = now
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                    guard let self, self.isJoined else { return }
+                    self.reactivateAudioSession(force: true)
+                }
             }
         }
         session.unlockForConfiguration()
+    }
+
+    /// 当前是否接着耳机 / 蓝牙 / AirPlay / USB 声卡。
+    private func hasExternalAudioRoute(_ session: AVAudioSession) -> Bool {
+        let external: Set<AVAudioSession.Port> = [
+            .headphones, .bluetoothA2DP, .bluetoothHFP, .bluetoothLE,
+            .airPlay, .usbAudio
+        ]
+        return session.currentRoute.outputs.contains { external.contains($0.portType) }
+    }
+
+    // MARK: - 共享期间的音频路由看守
+
+    /// 共享期间每 2 秒核对一次音频会话。
+    ///
+    /// ReplayKit 在广播真正起播时（用户点完"开始直播"后 200~800ms）会重配一次
+    /// AVAudioSession：不发 routeChange 通知，也不保证保留 .defaultToSpeaker。
+    /// 结果就是主 App 的 audio unit 被顺手掐掉——共享画面起来了，声音却躺下了。
+    ///
+    /// 为什么不能只在 beginScreenFramePush 里同步抢一次：那个时间点常常
+    /// 早于 ReplayKit 的第二次重配，抢了等于没抢。
+    private func startRouteGuard() {
+        guard routeGuardTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(
+            queue: DispatchQueue(label: "com.tianqiong.meetingkit.routeguard", qos: .utility)
+        )
+        timer.schedule(deadline: .now() + 0.3, repeating: 2.0, leeway: .milliseconds(300))
+        timer.setEventHandler { [weak self] in
+            Task { @MainActor in self?.checkAudioRoute() }
+        }
+        routeGuardTimer = timer
+        timer.resume()
+    }
+
+    private func stopRouteGuard() {
+        routeGuardTimer?.cancel()
+        routeGuardTimer = nil
+    }
+
+    private func checkAudioRoute() {
+        guard isJoined, isScreenSharing else { return }
+        let av = AVAudioSession.sharedInstance()
+        let speakerOptionMismatch = speakerOn
+            ? !av.categoryOptions.contains(.defaultToSpeaker)
+            : av.categoryOptions.contains(.defaultToSpeaker)
+        let fellBackToEarpiece = speakerOn
+            && !hasExternalAudioRoute(av)
+            && av.currentRoute.outputs.contains { $0.portType == .builtInEarpiece }
+        let wrongRoute = av.category != .playAndRecord
+            || av.mode != .voiceChat
+            || speakerOptionMismatch
+            || fellBackToEarpiece
+        guard wrongRoute else { return }
+
+        print("[rtc] route guard: category=\(av.category.rawValue) mode=\(av.mode.rawValue) → 抢回")
+        reactivateAudioSession(force: true)
     }
 
     private func endBackgroundTask() {
@@ -440,6 +525,7 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 释放本地采集与音频会话（入会失败 / 主动离开共用）。
     private func teardownLocalMedia() {
         stopLifecycleObservers()
+        stopRouteGuard()
         screenPusher?.stop()
         screenPusher = nil
         isScreenSharing = false
@@ -605,6 +691,9 @@ final class RealRTCClient: NSObject, RTCClient {
     }
 
     func setSpeakerEnabled(_ enabled: Bool) {
+        // 先记偏好：路由看守下一次检查就会按新值判断，
+        // 不会把用户刚切好的听筒又顶回扬声器。
+        speakerOn = enabled
         let session = RTCAudioSession.sharedInstance()
         session.lockForConfiguration()
         defer { session.unlockForConfiguration() }
@@ -663,43 +752,74 @@ final class RealRTCClient: NSObject, RTCClient {
         isScreenSharing = true
 
         let profile = Self.screenEncodingProfile
-        // 画质档位必须在这里落到采集格式上：只改 setVideoEncoding 的码率，
-        // 源仍是 1080p/20，弱网下"流畅"档并不会真的更流畅。
-        source.adaptOutputFormat(toWidth: profile.width, height: profile.height, fps: profile.fps)
+        let pusher = ScreenFramePusher(source: source)
+        screenPusher = pusher
+        /* 格式切换必须和 tick() 的解码走同一个串行队列：
+           RTCVideoSource.adaptOutputFormat 内部会重建 video adapter，
+           主线程和 decodeQueue 同时调，偶发崩在 AdaptedVideoTrackSource::OnFrame。
+           而且这一步必须赶在 start() 之前，否则前几帧会按旧画布推。 */
+        pusher.applyOutputFormat(width: profile.width, height: profile.height, fps: profile.fps)
 
         // 用共享轨替换每条连接的 video sender（Web 端同款 replaceTrack）。
         for peer in remotePeers.values {
             peer.session.replaceVideoTrack(with: track)
+        }
+        applyScreenEncodingBudget()
+
+        pusher.start()
+        /* ReplayKit 真正起播会晚于这里 200~800ms，并重配一次音频会话。
+           先强制抢一次，再由 routeGuard 每 2 秒兜底——
+           只靠这一次同步调用，经常正好打在 ReplayKit 改配置之前。 */
+        reactivateAudioSession(force: true)
+        startRouteGuard()
+        syncTeardownBox()
+    }
+
+    /// 按当前人数重新分配共享上行码率。
+    ///
+    /// Mesh 下每条连接都是独立编码：不按人数分，3 个人共享 1080p
+    /// 就是 3×8Mbps 上行，家庭宽带和 4G 都扛不住。
+    private func applyScreenEncodingBudget() {
+        guard isScreenSharing, !remotePeers.isEmpty else { return }
+        let profile = Self.screenEncodingProfile
+        let perPeer = UplinkBudget.shared.perPeer(
+            preferred: profile.bitrate,
+            peers: remotePeers.count
+        )
+        for peer in remotePeers.values {
             peer.session.setVideoEncoding(
-                maxBitrateBps: profile.bitrate,
+                maxBitrateBps: perPeer,
                 maxFramerate: Int(profile.fps),
-                keepResolution: true
+                // 低于 1.5Mbps 还硬保 1080p，编码器只能狂丢帧或加大 QP；
+                // 让 WebRTC 降到 720p，滚动文字反而更顺。
+                keepResolution: perPeer >= 1_500_000
             )
         }
+    }
 
-        let pusher = ScreenFramePusher(source: source)
-        screenPusher = pusher
-        pusher.start()
-        /* ReplayKit 刚开始广播时会重配一次系统音频路由，主 App 的 audio unit
-           经常被顺手掐掉。共享和通话是两条独立链路，画面起来不能让声音躺下。 */
-        reactivateAudioSession()
-        syncTeardownBox()
+    /// 共享结束/中断后把摄像头档位恢复回来（同样按人数分摊）。
+    private func applyCameraEncodingBudget() {
+        guard !remotePeers.isEmpty else { return }
+        let perPeer = UplinkBudget.shared.perPeer(preferred: 2_500_000, peers: remotePeers.count)
+        for peer in remotePeers.values {
+            peer.session.setVideoEncoding(maxBitrateBps: perPeer, maxFramerate: 30)
+        }
     }
 
     /// Broadcast 扩展确认停止共享后调用：恢复摄像头轨。
     func endScreenFramePush() {
+        stopRouteGuard()
         screenPusher?.stop()
         screenPusher = nil
         isScreenSharing = false
         let back = localVideoTrack
         for peer in remotePeers.values {
             peer.session.replaceVideoTrack(with: back)
-            // 恢复摄像头档位：2.5Mbps / 30fps，把上行让回给实时画面。
-            peer.session.setVideoEncoding(maxBitrateBps: 2_500_000, maxFramerate: 30)
         }
+        applyCameraEncodingBudget()
         /* 广播结束同样会切一次路由：不抢回来，用户会遇到
            "共享停了以后反而听不见人说话"。 */
-        reactivateAudioSession()
+        reactivateAudioSession(force: true)
         syncTeardownBox()
     }
 
@@ -709,14 +829,15 @@ final class RealRTCClient: NSObject, RTCClient {
             delegate?.rtcDidScreenShareRejected(reason: reason)
             return
         }
+        stopRouteGuard()
         isScreenSharing = false
         screenPusher?.stop()
         screenPusher = nil
         let back = localVideoTrack
         for peer in remotePeers.values {
             peer.session.replaceVideoTrack(with: back)
-            peer.session.setVideoEncoding(maxBitrateBps: 2_500_000, maxFramerate: 30)
         }
+        applyCameraEncodingBudget()
         signaling?.sendMediaState(audio: nil, video: nil, screen: false)
         delegate?.rtcDidScreenShareRejected(reason: reason)
         syncTeardownBox()
@@ -1775,6 +1896,10 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         remotePeers[peerID] = remote
         if pendingScreenPeerID == peerID { pendingScreenPeerID = nil }
 
+        /* 人数变了，共享码率要重新分摊：3 人共享和 2 人共享，
+           每路能分到的上行预算不是一回事。 */
+        if isScreenSharing { applyScreenEncodingBudget() }
+
         /* peer 建好之前到达的共享态必须在这一次补上，否则屏幕舞台永远不会出现。 */
         if screenOn {
             delegate?.rtcDidReceiveRemoteScreen(session.makeRemoteVideoView(), for: peerID)
@@ -1789,6 +1914,8 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         guard let peer = remotePeers.removeValue(forKey: peerID) else { return }
         peer.session.close()
         delegate?.rtcDidLoseRemoteMedia(for: peerID)
+        // 少一个人，剩下的人可以分到更多上行。
+        if isScreenSharing { applyScreenEncodingBudget() }
         publishParticipants()
         syncTeardownBox()
     }
@@ -2184,7 +2311,7 @@ final class ScreenFramePusher {
     /// 只在 decodeQueue 上读写。
     private var canvasLandscape = true
 
-    /// 与扩展侧的 20fps 对齐：轮询比生产慢就会积压旧帧，比生产快则空转。
+    /// 与扩展侧的 24fps 对齐：轮询比生产慢就会积压旧帧，比生产快则空转。
     private static let pollInterval: TimeInterval = 1.0 / 24.0
     private static let decodeQueue = DispatchQueue(
         label: "com.tianqiong.meetingkit.screenpush",
@@ -2206,6 +2333,18 @@ final class ScreenFramePusher {
     init(source: RTCVideoSource) {
         self.source = source
         self.frameCapturer = RTCVideoCapturer(delegate: source)
+    }
+
+    /// 切换输出画布。必须在 decodeQueue 上执行。
+    ///
+    /// `RTCVideoSource.adaptOutputFormat` 不是线程安全的：内部会重建
+    /// video adapter，和 didCapture 并发就会崩在 OnFrame。beginScreenFramePush
+    /// 过去是从主线程直接调的，而 tick() 在横竖屏切换时也会从 decodeQueue 调。
+    func applyOutputFormat(width: Int32, height: Int32, fps: Int32) {
+        Self.decodeQueue.sync {
+            self.source.adaptOutputFormat(toWidth: width, height: height, fps: fps)
+            self.canvasLandscape = width >= height
+        }
     }
 
     private var isRunning: Bool {

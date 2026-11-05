@@ -32,7 +32,7 @@ iOS 的系统级屏幕共享（共享其他 App、共享桌面）只能由 **Bro
 |---|---|---|---|---|
 | 共享状态 | 扩展 → App | `UserDefaults(suiteName:)`：`screenShare.state` / `screenShare.startedAt` | 状态跃迁时 | `ScreenShareStore` |
 | 心跳 | 扩展 → App | 同上：`screenShare.heartbeat` | 2 秒 / 次 | `ScreenShareStore.touchHeartbeat()` |
-| 画面帧 | 扩展 → App | 共享容器文件 `screen-share-latest.jpg`（原子写） | 4 fps 写，App 侧 10 fps 读上限 | `SharedFrameStore` |
+| 画面帧 | 扩展 → App | 共享容器文件 `screen-share-latest.jpg`（原子写） | 24 fps 写；小窗预览 10 fps 读上限；上行推流 24 fps 轮询 | `SharedFrameStore` |
 | 停止指令 | App → 扩展 | Darwin 通知 `...screenshare.stopRequested` | 用户点击时 | `ScreenShareBridge.requestStop()` |
 
 Darwin 通知名（三端必须逐字一致）：
@@ -65,7 +65,7 @@ com.example.meetingkit.screenshare.stopRequested
                  │         └─ MeetingViewModel.applyScreenSharing(true)
                  │              ├─ 顶栏红条 + 底栏红色 + 画布切共享态
                  │              └─ rtc.startScreenShare()
-                 └─ 每帧视频样本 → 节流 4fps → JPEG → 写文件 → post(frameUpdated)
+                 └─ 每帧视频样本 → 节流 24fps → JPEG → 写文件 → post(frameUpdated)
                       └─ App 读文件（modificationDate 去重）→ UIImage → sharedFrame
 ```
 
@@ -122,10 +122,10 @@ com.example.meetingkit.screenshare.stopRequested
 processSampleBuffer(.video)
   ├─ 心跳（2s 节流，与帧节流解耦）        ← 只要系统还在回调，就说明进程活着
   └─ 帧处理
-       ├─ 4fps 节流（画面预览够用，省 CPU / 内存）
+       ├─ 24fps 节流（1080p 文字滚动不拖影；单帧 210~300KB，跨进程落盘的上限）
        ├─ isEncoding 防重入（同时只有 1 帧在编码）
        ├─ 串行队列 encodeQueue
-       ├─ CVPixelBuffer → CIImage → 缩放到 800px 宽
+       ├─ CVPixelBuffer → CIImage → 短边缩到 1080（横屏 1920×1080 / 竖屏 1080×1920）
        ├─ 复用 CIContext（创建昂贵，不能每帧 new）
        ├─ CGImage → UIImage → JPEG(0.5)
        ├─ SharedFrameStore.write（queue.sync，写完才算数）
@@ -136,7 +136,7 @@ processSampleBuffer(.video)
 
 1. **不能用 `queue.async` 写帧**：必须先落盘再发通知，否则 App 收到通知时读到的还是上一帧，画面永远慢一拍
 2. **不能在采样回调里做编码**：`processSampleBuffer` 是高频回调，阻塞它会直接导致丢帧甚至被系统降级
-3. **扩展内存上限约 50MB**：800px 宽的位图约 5.5MB/帧，必须保证同一时刻只有一帧在内存里（`autoreleasepool` + `isEncoding` + 复用 `CIContext`）
+3. **扩展内存上限约 50MB**：1080p BGRA 位图约 8.3MB/帧，必须保证同一时刻只有一帧在内存里（`autoreleasepool` + `isEncoding` + 复用 `CIContext`）
 
 > 这套 JPEG 通道只服务于**App 内预览**，不是推流方案。生产环境把 `CVPixelBuffer` 直接交给 WebRTC / SDK 的自定义采集接口，预览链路可以整段删掉。
 
@@ -152,7 +152,7 @@ processSampleBuffer(.video)
 | 停止共享后红条不消失 | 扩展没收到 `stopRequested`（通知名不一致）| 断点 `SampleHandler` 的观察者回调 |
 | 共享 10 秒后自动"结束" | 心跳停了（扩展被挂起 / 采样停了）| 打印 `ScreenShareStore.heartbeat` 时间差 |
 | 重开 App 显示"正在共享"但实际没有 | 上次残留状态（进程被强杀）| 等 12s 看是否自动复位；否则查 `broadcastFinished` 是否被调用 |
-| 共享画面卡顿 | 扩展编码跟不上（4fps 都做不到）| Instruments 看扩展 CPU；降低分辨率 / 质量 |
+| 共享画面卡顿 | 扩展编码跟不上（24fps 都做不到）| Instruments 看扩展 CPU；降低分辨率 / 质量 |
 
 ---
 

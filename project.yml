@@ -21,7 +21,7 @@ options:
   # Xcode 26 的部署目标下限就是 iOS 15（Apple 支持表：iOS 15~26）。
   # 原来写 14.0 在 Xcode 16 上只是 warning，换到 Xcode 26 会直接报
   # "range of supported deployment target versions is 15.0 to 26.x"。
-  # 本项目真机只有 iOS 27，抬到 15 不损失任何用户。
+  # 本项目真机是 iOS 26，抬到 15 不损失任何用户。
   deploymentTarget:
     iOS: "15.0"
   createIntermediateGroups: true
@@ -68,8 +68,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: MeetingKit/MeetingKit.entitlements
         # 没有这一行，Assets 里的 AppIcon 不会被真正用上，提审时是"图标缺失"。
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: "1.5.0"
-        CURRENT_PROJECT_VERSION: "15"
+        MARKETING_VERSION: "1.5.1"
+        CURRENT_PROJECT_VERSION: "16"
 
   MeetingBroadcast:
     type: app-extension
@@ -91,8 +91,8 @@ targets:
         # 扩展进程禁止调用 application-only 的 API，打开这个开关能让编译器提前拦住误用。
         APPLICATION_EXTENSION_API_ONLY: "YES"
         SKIP_INSTALL: "YES"
-        MARKETING_VERSION: "1.5.0"
-        CURRENT_PROJECT_VERSION: "15"
+        MARKETING_VERSION: "1.5.1"
+        CURRENT_PROJECT_VERSION: "16"
 
 # XcodeGen 默认不会生成共享 scheme，CI 里的 `xcodebuild -scheme MeetingKit`
 # 会因为找不到 scheme 直接失败（本地 Xcode 打开工程时会自动补，所以只在 CI 暴露）。

@@ -47,7 +47,20 @@ final class ScreenShareBridge: ObservableObject {
     private var lastFrameDate: Date?
     private var lastFramePullTime: CFTimeInterval = 0
 
-    /// 主线程解码上限 10fps。扩展侧是 4fps，这里留余量防止突发抖动时连续解码拖慢主线程。
+    /// 预览解码令牌：后台解码完成时只有"最新一帧"允许上屏，
+    /// 否则慢的旧帧后到，会把已经显示的新帧盖回去（画面倒退一拍）。
+    private var previewToken = 0
+
+    /// 预览解码队列。1080p JPEG 解一次 10~20ms，10fps 就吃掉主线程
+    /// 10%~20% 的预算；主线程正在跑 SwiftUI 重绘时，这就是可见的掉帧。
+    private static let previewDecodeQueue = DispatchQueue(
+        label: "com.tianqiong.meetingkit.screenpreview",
+        qos: .userInitiated
+    )
+
+    /// 预览拉取上限 10fps。扩展侧是 24fps，但主 App 的小窗预览不需要
+    /// 跟满帧；真正上行给远端的是 ScreenFramePusher（24fps 轮询），
+    /// 两条链路互不影响。
     private static let minFramePullInterval: CFTimeInterval = 0.1
 
     /// 心跳超时。扩展最多每 2 秒写一次心跳，12 秒 = 连续漏掉 6 次，
@@ -147,7 +160,19 @@ final class ScreenShareBridge: ObservableObject {
             isBroadcasting = broadcasting
         }
 
-        let storedStart = broadcasting ? ScreenShareStore.startedAt : nil
+        var storedStart = broadcasting ? ScreenShareStore.startedAt : nil
+
+        /* 兜底：状态文件已经被 reset，但扩展在 clear() 之前被系统杀掉，
+           会留下一张 3 秒内的"新鲜帧"。此时 hasFreshFrame() 让 UI 显示共享中，
+           startedAt 却是 nil，计时器就卡在 0:00。
+           帧文件的 mtime 就是这一场共享第一次出帧的时刻，误差 < 1 帧。 */
+        if broadcasting, storedStart == nil,
+           let path = SharedFrameStore.fileURL()?.path,
+           let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+           let modified = attributes[.modificationDate] as? Date {
+            storedStart = modified
+        }
+
         if startedAt != storedStart {
             startedAt = storedStart
         }
@@ -163,6 +188,8 @@ final class ScreenShareBridge: ObservableObject {
             pullLatestFrame(force: false)
         } else {
             // 共享结束就清空预览：否则用户下次进会还能看到上一场的最后一帧，像是个 bug。
+            // 令牌自增，让还在后台解码的那一帧作废。
+            previewToken &+= 1
             if latestFrame != nil {
                 latestFrame = nil
             }
@@ -231,9 +258,17 @@ final class ScreenShareBridge: ObservableObject {
         guard let data = SharedFrameStore.readIfNewer(than: &lastFrameDate) else { return }
         // 收到新帧就先记一笔：诊断面板据此区分"扩展没出帧"与"出了帧但没推上去"。
         ScreenShareRuntime.noteFrameWritten()
-        // JPEG 只有几十 KB，主线程解码耗时在毫秒级，比跨线程往返 + 图片对象传递更划算。
-        guard let image = UIImage(data: data) else { return }
-        latestFrame = image
+        /* 解码挪到后台：1080p JPEG 是 10~20ms 的活，放在主线程会和
+           SwiftUI 重绘抢同一个 runloop，预览越顺、会中 UI 越卡。 */
+        previewToken &+= 1
+        let token = previewToken
+        Self.previewDecodeQueue.async { [weak self] in
+            guard let image = UIImage(data: data) else { return }
+            DispatchQueue.main.async {
+                guard let self, self.previewToken == token else { return }
+                self.latestFrame = image
+            }
+        }
     }
 
     /// 生成一次共享链路诊断快照。面板每次展开时调用一次即可。
