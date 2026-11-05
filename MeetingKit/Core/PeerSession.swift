@@ -245,7 +245,7 @@ final class PeerSession: NSObject {
                把共享轨塞进同一个 sender，本地看"挂了轨、在推帧"，
                对端却一个包都收不到——浏览器就永远停在"正在接收共享画面…"。
                这种情况必须拆了重挂，让 addTrack 把方向重新谈成 sendrecv。 */
-            if !canSend(on: sender) {
+            if !localVideoSendsUpstream {
                 forceReattachVideo(track)
                 return
             }
@@ -261,13 +261,35 @@ final class PeerSession: NSObject {
         negotiate()
     }
 
-    /// 这条 sender 所在 transceiver 协商后的实际方向是否允许发送。
-    private func canSend(on sender: RTCRtpSender) -> Bool {
-        guard let tx = peerConnection.transceivers.first(where: { $0.sender === sender }) else {
-            // 找不到 transceiver（极少见）：当作不可发，走重挂兜底。
-            return false
+    /// 本端 SDP 里的视频方向是否允许发送。
+    ///
+    /// 不用 `transceiver.currentDirection`：这个 SDK 把它导入成了一个
+    /// 带 UnsafeMutablePointer 参数的方法引用，直接和枚举比较编译不过。
+    /// SDP 是同一份事实的字符串形态，判起来反而更直接。
+    private var localVideoSendsUpstream: Bool {
+        guard let sdp = peerConnection.localDescription?.sdp, !sdp.isEmpty else {
+            // 还没协商出本地描述：先按可发处理，看门狗会在 4 秒后复核。
+            return true
         }
-        return tx.currentDirection == .sendRecv || tx.currentDirection == .sendOnly
+        var inVideo = false
+        var sawVideo = false
+        for raw in sdp.split(whereSeparator: { $0.isNewline }) {
+            let line = String(raw)
+            if line.hasPrefix("m=video") {
+                inVideo = true
+                sawVideo = true
+                continue
+            }
+            if line.hasPrefix("m=") {
+                inVideo = false
+                continue
+            }
+            guard inVideo else { continue }
+            if line.hasPrefix("a=sendrecv") || line.hasPrefix("a=sendonly") { return true }
+            if line.hasPrefix("a=recvonly") || line.hasPrefix("a=inactive") { return false }
+        }
+        // 有 m=video 但没写方向：RFC 4566 默认 sendrecv。
+        return sawVideo
     }
 
     /// 拆掉旧 sender 再挂一次，强制把方向谈回 sendrecv。
