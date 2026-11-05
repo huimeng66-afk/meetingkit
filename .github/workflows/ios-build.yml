@@ -39,8 +39,11 @@ concurrency:
   group: ios-build-${{ github.ref }}
   cancel-in-progress: true
 
+# 为什么是 write：构建失败时要把编译错误写成 commit comment
+#（见 "Report build failure to commit"）。本工作流不提交任何代码，
+# 这份写权限只用于把日志回写到 commit，方便在看不到 Actions 页面的地方排错。
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -98,16 +101,85 @@ jobs:
         run: xcodegen generate --spec project.yml
 
       - name: Build unsigned IPA
+        id: build
+        # 失败不立刻中断：下一步要把日志回写到 commit，
+        # 否则唯一能看日志的地方只有 Actions 页面。
+        continue-on-error: true
         env:
           # tag 触发时 inputs 为空，回退到 Release
           CONFIGURATION: ${{ inputs.configuration || 'Release' }}
         run: |
-          set -euo pipefail
-          bash scripts/build-ipa-unsigned.sh --configuration "$CONFIGURATION"
+          set -o pipefail
+          mkdir -p build
+          # 全量日志落到 build/ 下，供失败回写步骤读取。
+          # 脚本内部还有一份 build/archive.log（仅 xcodebuild 输出）。
+          bash scripts/build-ipa-unsigned.sh --configuration "$CONFIGURATION" 2>&1 \
+            | tee build/build-full.log
           echo "--- 产物 ---"
           ls -lh build/*.ipa
 
+      - name: Report build failure to commit
+        # outcome 而不是 conclusion：continue-on-error 下 conclusion 仍是 success，
+        # 只有 outcome 会如实反映「这一步本身失败了」。
+        if: steps.build.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LOG="build/build-full.log"
+          [ -f "$LOG" ] || LOG="build/archive.log"
+          {
+            echo "<!-- build-failure-log -->"
+            echo "### 构建失败日志"
+            echo ""
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo ""
+            echo '#### 错误行'
+            echo '```'
+            grep -nE "error:|fatal error|错误：|\*\* ARCHIVE FAILED|The following build commands failed|Compiling .*\.swift" "$LOG" \
+              | tail -80 || echo "(未匹配到 error: 行)"
+            echo '```'
+            echo ""
+            echo '#### 日志末尾 150 行'
+            echo '```'
+            tail -150 "$LOG"
+            echo '```'
+          } > /tmp/build-comment.md
+
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+          body = open('/tmp/build-comment.md', encoding='utf-8', errors='replace').read()
+          # commit comment 上限 65536 字符，留出余量
+          body = body[:60000]
+          url = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/commits/{os.environ['GITHUB_SHA']}/comments"
+          req = urllib.request.Request(
+              url,
+              data=json.dumps({"body": body}).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "User-Agent": "ios-build-workflow",
+              },
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  print("commit comment created:", resp.status)
+          except urllib.error.HTTPError as e:
+              print("commit comment failed:", e.code, e.read().decode("utf-8", "replace")[:300])
+          except Exception as e:
+              print("commit comment failed:", e)
+          PY
+
+      - name: Fail job after reporting
+        if: steps.build.outcome == 'failure'
+        run: |
+          echo "::error::构建失败，日志已回写到 commit comment"
+          exit 1
+
       - name: Upload unsigned IPA
+        if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: MeetingKit-unsigned-ipa
@@ -117,7 +189,7 @@ jobs:
           compression-level: 0
 
       - name: Upload dSYM (if any)
-        if: ${{ hashFiles('build/MeetingKit.xcarchive/dSYMs/**') != '' }}
+        if: steps.build.outcome == 'success' && hashFiles('build/MeetingKit.xcarchive/dSYMs/**') != ''
         uses: actions/upload-artifact@v4
         with:
           name: MeetingKit-dSYM
