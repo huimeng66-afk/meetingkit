@@ -45,6 +45,35 @@ com.example.meetingkit.screenshare.stopRequested
 
 > 通知名里带 Bundle ID 是为了避免与其他 App 的 Darwin 通知撞名——Darwin 通知是**全系统广播**，不加前缀可能收到别人的事件。
 
+### 2.1 App Group 的名字是"签名的产物"，必须运行时探测
+
+工程里写的是 `group.com.tianqiong.meetingkit`，但这只是**用自己的开发者账号签名时**生效的名字。
+侧载 / 代签工具重签后，实际生效的 group 由那张证书的 provisioning profile 决定，
+往往长成 `group.e2904eee920f2ee6.3` 这样。写死名字的后果不是报错，而是
+`containerURL(forSecurityApplicationGroupIdentifier:)` 返回 `nil`——扩展一句话都写不出来。
+
+`AppGroupConfig` 因此按三层探测（每一层都只是**候选**，最终仍由 `containerURL` 实测把关）：
+
+```
+① Bundle.main 自己的 embedded.mobileprovision
+② 从 .appex 往上两级 → 主 App 根目录的 embedded.mobileprovision   ← 重签工具只放这一份
+③ SecTaskCreateFromSelf + SecTaskCopyValueForEntitlement（读本进程代码签名）
+```
+
+> **1.5.4 的真机根因就在这里**：① 对扩展永远失败（`.appex` 里没有 profile），
+> ② 在 1.5.3 里不存在，于是扩展回退到未授权的 `group.com.tianqiong.meetingkit`，
+> `broadcastStarted` 第一道 guard 直接结束广播。诊断表现为
+> "App 侧 App Group 可用、扩展 idle、心跳无、出帧却是上一场的旧文件"。
+
+排查只需要看诊断里这两行：
+
+```
+App Group（App）：可用（group.e2904eee920f2ee6.3）
+App Group（扩展）：group.e2904eee920f2ee6.3 · 一致
+```
+
+不一致 = 签名没给扩展授权，改代码无用。
+
 ---
 
 ## 3. 完整时序
@@ -126,11 +155,16 @@ processSampleBuffer(.video)
        ├─ isEncoding 防重入（同时只有 1 帧在编码）
        ├─ 串行队列 encodeQueue
        ├─ CVPixelBuffer → CIImage → 短边缩到 1080（横屏 1920×1080 / 竖屏 1080×1920）
-       ├─ 复用 CIContext（创建昂贵，不能每帧 new）
-       ├─ CGImage → UIImage → JPEG(0.5)
+       ├─ 复用 CIContext（创建昂贵，不能每帧 new；`cacheIntermediates: false` 省内存）
+       ├─ CIContext.jpegRepresentation(quality 0.78)   ← 1.5.4 起不再过 UIImage
        ├─ SharedFrameStore.write（queue.sync，写完才算数）
        └─ post(frameUpdated)
 ```
+
+> 1.5.4 之前是 `CGImage → UIImage → jpegData`，三份大对象同时驻留，1080p 下峰值接近 40MB，
+> 而扩展上限约 50MB —— 表现为"共享十几秒后自己停了"。
+> `jpegRepresentation(of:colorSpace:options:)` 在渲染管线内直接编码，
+> options 的类型是 `[CIImageRepresentationOption: Any]`（不是 `CIContextOption`）。
 
 三个容易踩的点：
 
@@ -147,8 +181,8 @@ processSampleBuffer(.video)
 | 现象 | 最可能的原因 | 排查 |
 |---|---|---|
 | 系统录屏列表里没有扩展 | 扩展 Bundle ID 不是主 App 的前缀；未 embed 到 PlugIns | `xcodebuild -showBuildSettings` 看 `PRODUCT_BUNDLE_IDENTIFIER`；解包 ipa 看 `PlugIns/` |
-| 扩展启动后 App 无反应 | App Group 不一致 / entitlements 未生效 | 两个 target 的 Signing & Capabilities 对比；`defaults read` 共享域 |
-| 红条出现但画面一直"获取中" | 帧文件写入失败（容器路径 nil）或解码失败 | 打印 `SharedFrameStore.fileURL()`；检查扩展内存告警 |
+| 扩展启动后 App 无反应（诊断：`扩展状态 idle`） | 扩展拿到的 App Group 与主 App 不一致 | 看诊断的 `App Group（扩展）` 一行；不一致就是签名没授权 |
+| 扩展启动了但 App 一帧都读不到 | 帧文件写入失败（容器路径 nil）或解码失败 | 看 `主 App 读到` 是否在涨；对比 `扩展出帧` |
 | 停止共享后红条不消失 | 扩展没收到 `stopRequested`（通知名不一致）| 断点 `SampleHandler` 的观察者回调 |
 | 共享 10 秒后自动"结束" | 心跳停了（扩展被挂起 / 采样停了）| 打印 `ScreenShareStore.heartbeat` 时间差 |
 | 重开 App 显示"正在共享"但实际没有 | 上次残留状态（进程被强杀）| 等 12s 看是否自动复位；否则查 `broadcastFinished` 是否被调用 |
