@@ -197,6 +197,119 @@ final class RealRTCClient: NSObject, RTCClient {
         updateNetworkQuality(.good)
         syncTeardownBox()
         startAudioLevelPolling()
+        startLifecycleObservers()
+    }
+
+    // MARK: - 前后台与音频恢复
+
+    /// 后台任务句柄。进入后台时申请一次，回到前台立刻归还。
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+
+    /// 生命周期观察者。只在入会期间有效：出会必须精确摘掉，
+    /// 否则回调会打到已经释放的 audio track 上。
+    private var lifecycleTokens: [NSObjectProtocol] = []
+
+    private func startLifecycleObservers() {
+        guard lifecycleTokens.isEmpty else { return }
+        let center = NotificationCenter.default
+        let main: OperationQueue = .main
+
+        lifecycleTokens.append(center.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleEnterBackground() }
+        })
+
+        lifecycleTokens.append(center.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleEnterForeground() }
+        })
+
+        /* 来电、闹钟、控制中心、开始录屏广播都可能打断音频会话。
+           结束后系统不会替我们把 WebRTC 的 audio unit 抢回来，
+           表现就是"能看见人、就是没声音"。 */
+        lifecycleTokens.append(center.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: main
+        ) { [weak self] note in
+            // 只把 Sendable 的标量带进 actor，Notification 本身不跨线程传。
+            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            Task { @MainActor in self?.handleAudioInterruptionEnded(rawType: raw) }
+        })
+
+        lifecycleTokens.append(center.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: nil,
+            queue: main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.reactivateAudioSession() }
+        })
+    }
+
+    private func stopLifecycleObservers() {
+        let center = NotificationCenter.default
+        lifecycleTokens.forEach { center.removeObserver($0) }
+        lifecycleTokens.removeAll()
+        endBackgroundTask()
+    }
+
+    private func handleEnterBackground() {
+        // 本 App 声明了 audio 后台模式：只要音频单元还在跑，进程就不会被冻住，
+        // Socket.IO 的心跳也就能继续发。这一步是"后台保活"的地基。
+        reactivateAudioSession()
+
+        // 再叠一层 30 秒续命：即使音频被系统掐掉，也足够覆盖
+        // "切出去看一眼网页端再切回来"这种最常见的操作。
+        endBackgroundTask()
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "meeting.keepalive") { [weak self] in
+            Task { @MainActor in self?.endBackgroundTask() }
+        }
+    }
+
+    private func handleEnterForeground() {
+        endBackgroundTask()
+        reactivateAudioSession()
+
+        // 不等 Socket.IO 的指数退避（最多 10 秒一次）：回来立刻拉一次。
+        signaling?.reconnectIfNeeded()
+
+        // 断线期间服务端可能已经清掉了 screenPeerId，回来补一次声明。
+        if isScreenSharing {
+            signaling?.sendMediaState(audio: nil, video: nil, screen: true)
+        }
+    }
+
+    private func handleAudioInterruptionEnded(rawType: UInt?) {
+        guard
+            let raw = rawType,
+            let type = AVAudioSession.InterruptionType(rawValue: raw),
+            type == .ended
+        else { return }
+        // 不检查 shouldResume：共享广播、部分机型来电结束后系统不给这个标记，
+        // 但用户在会议里，声音必须回来。
+        reactivateAudioSession()
+    }
+
+    /// 重新把音频会话抢回 playAndRecord + active。
+    /// 幂等：已经在跑的时候调用只是多一次系统查询。
+    private func reactivateAudioSession() {
+        let session = RTCAudioSession.sharedInstance()
+        session.lockForConfiguration()
+        defer { session.unlockForConfiguration() }
+        try? session.setCategory(.playAndRecord, with: [.allowBluetooth, .defaultToSpeaker])
+        try? session.setActive(true)
+    }
+
+    private func endBackgroundTask() {
+        guard backgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
     }
 
     func leave() {
@@ -242,6 +355,7 @@ final class RealRTCClient: NSObject, RTCClient {
 
     /// 释放本地采集与音频会话（入会失败 / 主动离开共用）。
     private func teardownLocalMedia() {
+        stopLifecycleObservers()
         screenPusher?.stop()
         screenPusher = nil
         isScreenSharing = false
@@ -417,6 +531,9 @@ final class RealRTCClient: NSObject, RTCClient {
         let pusher = ScreenFramePusher(source: source)
         screenPusher = pusher
         pusher.start()
+        /* ReplayKit 刚开始广播时会重配一次系统音频路由，主 App 的 audio unit
+           经常被顺手掐掉。共享和通话是两条独立链路，画面起来不能让声音躺下。 */
+        reactivateAudioSession()
         syncTeardownBox()
     }
 
@@ -431,6 +548,9 @@ final class RealRTCClient: NSObject, RTCClient {
             // 恢复摄像头档位：2.5Mbps / 30fps，把上行让回给实时画面。
             peer.session.setVideoEncoding(maxBitrateBps: 2_500_000, maxFramerate: 30)
         }
+        /* 广播结束同样会切一次路由：不抢回来，用户会遇到
+           "共享停了以后反而听不见人说话"。 */
+        reactivateAudioSession()
         syncTeardownBox()
     }
 
@@ -949,7 +1069,18 @@ final class RealRTCClient: NSObject, RTCClient {
             delegate?.rtcDidReceiveRemoteScreen(peer.session.makeRemoteVideoView(), for: screenPeerID)
         }
         if isScreenSharing {
+            // 断线超过宽限期时服务端已经把 screenPeerId 清掉：重连后必须由本端重新声明，
+            // 否则对端只看到"人回来了"，共享舞台永远不出现——这就是用户说的
+            // "关掉再开就不行"里最典型的一种。
             signaling?.sendMediaState(audio: nil, video: nil, screen: true)
+            // 上一轮收尾可能把推帧器停了：这里重新拉起来（begin 内部幂等）。
+            if screenPusher == nil { beginScreenFramePush() }
+            // 0.8 秒补一次：对端处理 peer:joined 有延迟，第一次 screen:state 到达时
+            // 手里可能还没有这条 peer，绑不上 video。补发一次让它有机会重挂。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self = self, self.isScreenSharing else { return }
+                self.signaling?.sendMediaState(audio: nil, video: nil, screen: true)
+            }
         }
 
         delegate?.rtcDidRoomLockChange(locked: snapshot.locked)
@@ -1110,6 +1241,9 @@ extension RealRTCClient: TianqiongSignalingDelegate {
             password: options.password,
             audio: localAudioTrack?.isEnabled ?? options.audioOn,
             video: localVideoTrack?.isEnabled ?? options.videoOn,
+            /* 把共享状态一起带上：一次 join 就把"人和共享"都恢复好，
+               不用等服务端再回头问一遍，也不会出现"人回来了、共享没了"的空窗。 */
+            screen: isScreenSharing,
             timeout: 12
         ) { [weak self] result in
             guard let self = self else { return }

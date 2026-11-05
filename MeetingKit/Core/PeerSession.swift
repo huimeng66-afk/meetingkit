@@ -65,6 +65,13 @@ final class PeerSession: NSObject {
     /// 远端视频渲染视图（RTCMTLVideoView），收到 track 时创建。
     private(set) var remoteVideoView: RTCMTLVideoView?
 
+    /// 本端唯一的视频发送通道。
+    ///
+    /// 必须缓存引用：共享结束时会 `sender.track = 摄像头轨`，摄像头关闭时会
+    /// `sender.track = nil`；一旦 track 变成 nil，`senders.first(where: { $0.track?.kind == "video" })`
+    /// 就再也找不到它，第二次开共享直接推不上去——这正是"关了重新开就不行"的成因。
+    private var videoSender: RTCRtpSender?
+
     // MARK: 协商状态
 
     private var makingOffer = false
@@ -142,18 +149,34 @@ final class PeerSession: NSObject {
     /// 屏幕共享：用 screen 替换当前的 video sender（Web 端同款 replaceTrack 策略）。
     /// track 为 nil 时移除上行视频（结束共享且本端无摄像头）。
     func replaceVideoTrack(with track: RTCVideoTrack?) {
-        guard let sender = peerConnection.senders.first(where: { $0.track?.kind == "video" }) else {
+        guard let sender = videoSender ?? senderForVideoTrack() else {
+            /* 一条 video sender 都没有（例如对端加入时本端摄像头是关的、
+               共享又刚被停掉）：直接补一条上行轨，让它走一次重新协商。
+               原来的实现这里直接 return，第二次开共享就永远推不上去。 */
+            if let track = track {
+                peerConnection.add(track, streamIds: ["tq-\(peerID)"])
+                videoSender = senderForVideoTrack()
+            }
             return
         }
+        videoSender = sender
         sender.track = track
+    }
+
+    /// 记录并返回当前 video sender。sender.track 可能为 nil（关闭视频时），
+    /// 所以不能只靠 `track?.kind` 反查，必须缓存引用。
+    private func senderForVideoTrack() -> RTCRtpSender? {
+        peerConnection.senders.first(where: { $0.track?.kind == "video" })
     }
 
     /// 调整上行视频编码参数。屏幕共享是"文字优先"，需要比摄像头更高的码率上限，
     /// 否则 1080p 画面会被 WebRTC 按摄像头模型压到 1~2Mbps，文字边缘发糊。
     func setVideoEncoding(maxBitrateBps: Int?, maxFramerate: Int?, keepResolution: Bool = false) {
-        guard let sender = peerConnection.senders.first(where: { $0.track?.kind == "video" }) else {
+        // 同样不能只靠 track.kind 反查：共享结束、摄像头关闭之后 track 可能是 nil。
+        guard let sender = videoSender ?? senderForVideoTrack() else {
             return
         }
+        videoSender = sender
         // RTCRtpSender.parameters 是非可选属性（M140 起），不能做可选绑定。
         let params = sender.parameters
         for encoding in params.encodings {
@@ -175,9 +198,15 @@ final class PeerSession: NSObject {
     private func ensureSender(for track: RTCMediaStreamTrack, streamID: String) {
         // 同一 track 只挂一个 sender，重复 attach 不产生第二个上行流。
         if peerConnection.senders.contains(where: { $0.track?.trackId == track.trackId }) {
+            if track.kind == "video", videoSender == nil {
+                videoSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
+            }
             return
         }
         peerConnection.add(track, streamIds: [streamID])
+        if track.kind == "video" {
+            videoSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
+        }
     }
 
     // MARK: - 远端信号

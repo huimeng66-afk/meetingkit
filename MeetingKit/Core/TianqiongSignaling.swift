@@ -120,8 +120,16 @@ final class TianqiongSignaling {
     func connect() {
         guard manager == nil else {
             // 已在连接流程中：Socket.IO 自己会重试，无需重复建连。
-            if let socket = socket, socket.status == .connected {
+            guard let socket = socket else { return }
+            switch socket.status {
+            case .connected:
                 delegate?.signalingDidConnect(self)
+            case .notConnected, .disconnected:
+                // 从后台回来时连接可能已经被系统掐断，且指数退避可能已经拉到
+                // 10 秒一次。这里立刻拉一次，别让用户对着"正在重连"干等。
+                socket.connect()
+            default:
+                break
             }
             return
         }
@@ -164,6 +172,21 @@ final class TianqiongSignaling {
         isConnected = false
     }
 
+    /// 从后台回到前台时用：只在确实断开时重连，不会重复触发 didConnect。
+    ///
+    /// 为什么不用 `connect()`：它在已连接时会回调 `signalingDidConnect`，
+    /// 上层收到就会再走一遍 room:join + 重建 PeerConnection——
+    /// 用户只是切了个 App，不该付一次全量重连的代价。
+    func reconnectIfNeeded() {
+        guard manager != nil, let socket = socket else { return }
+        switch socket.status {
+        case .notConnected, .disconnected:
+            socket.connect()
+        default:
+            break
+        }
+    }
+
     // MARK: - 上行消息
 
     /// 入会。ack 一定触发（成功或失败），超时也会触发失败回执。
@@ -173,6 +196,7 @@ final class TianqiongSignaling {
         password: String,
         audio: Bool,
         video: Bool,
+        screen: Bool = false,
         timeout: TimeInterval = 12,
         completion: @escaping (Result<JoinSnapshot, JoinFailure>) -> Void
     ) {
@@ -181,8 +205,15 @@ final class TianqiongSignaling {
             return
         }
 
-        let media: [String: Bool] = ["audio": audio, "video": video]
-        var payload: [String: Any] = ["no": no, "name": name, "media": media]
+        let media: [String: Bool] = ["audio": audio, "video": video, "screen": screen]
+        var payload: [String: Any] = [
+            "no": no,
+            "name": name,
+            "media": media,
+            // 稳定设备标识：断线重连时服务端靠它认出"还是同一个人"，
+            // 从而静默接管旧记录，而不是先广播离开再广播加入。
+            "clientId": DeviceIdentity.id,
+        ]
         if !password.isEmpty {
             payload["password"] = password
         }
