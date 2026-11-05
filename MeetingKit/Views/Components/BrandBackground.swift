@@ -2,19 +2,20 @@
 //  BrandBackground.swift
 //  MeetingKit
 //
-//  页面底：深空黑 + 两处极弱的品牌冷光。
+//  页面底：浅灰页面 + 两处极弱的品牌冷光。
 //
-//  ── 为什么删掉了"极光" ──────────────────────────────────────────────
-//  上一版是四团 26 秒漂移的光斑（蓝 / 紫 / 青 / 靛）。它的出发点是"玻璃下面
-//  得有东西可折射"，但做出来的观感是典型的 AI 生成式界面：高饱和、彩色烟雾、
-//  处处发光。真实的高端 App 底色几乎都是**安静的**——光只用来交代一个方向感，
-//  不参与抢注意力。
+//  ── 为什么是浅色 ────────────────────────────────────────────────────
+//  网页端（public/assets/css/base.css）的主色是 --bg #f4f5f7 / --surface #ffffff /
+//  --ink-900 #191c21。App 之前是深空蓝 #04060D，两端截图放在一起完全是两个产品。
+//  现在底色、卡片、文字三级灰全部照搬网页令牌，视觉才是一套。
 //
-//  现在只留两个静态光源：左上一点冷蓝，右上一点靛紫，透明度都压到 0.10 附近，
-//  中间大面积保持接近纯黑。玻璃盖上去时，边缘会折射出一点点颜色变化，足够了；
-//  剩下的层次交给玻璃自己的边缘高光，而不是靠背景硬撑。
+//  ── 光怎么打 ────────────────────────────────────────────────────────
+//  浅色底最怕"脏"：任何一处高饱和光斑都会让白卡片泛灰。所以只留两点极淡的
+//  品牌色（蓝 0.10、紫 0.06），半径都超过半屏，衰减到边缘时几乎为 0。
+//  它们的唯一作用，是让玻璃边缘有一点色相变化，而不是形成看得见的圆形。
 //
-//  性能上也不再需要任何动画：整块背景是一次性的渐变合成，不占帧。
+//  深色版的"顶部/底部压暗"整段删掉了。浅色底压暗会变成脏灰，
+//  换成一整块自上而下的极淡冷灰，让页面下半部分（Dock 区域）略微沉一点。
 //
 
 import SwiftUI
@@ -29,15 +30,15 @@ struct BrandBackground: View {
             ZStack {
                 Theme.Palette.background
 
-                // 左上冷光：方向感来源。半径给到 0.9 屏宽，衰减极缓，
+                // 左上冷蓝：方向感来源。半径给到 0.95 屏宽，衰减极缓，
                 // 这样它不会形成"一个圆"，而是像房间角落的一盏灯。
                 RadialGradient(
                     gradient: Gradient(stops: [
-                        .init(color: Theme.Palette.accent.opacity(0.16), location: 0.0),
-                        .init(color: Theme.Palette.accent.opacity(0.05), location: 0.45),
+                        .init(color: Theme.Palette.accent.opacity(0.10), location: 0.0),
+                        .init(color: Theme.Palette.accent.opacity(0.03), location: 0.45),
                         .init(color: Color.clear, location: 1.0)
                     ]),
-                    center: UnitPoint(x: 0.12, y: -0.06),
+                    center: UnitPoint(x: 0.10, y: -0.08),
                     startRadius: 0,
                     endRadius: width * 0.95
                 )
@@ -45,30 +46,20 @@ struct BrandBackground: View {
                 // 右上冷紫：与左上的蓝拉开一点色相，避免整屏只有一种蓝。
                 RadialGradient(
                     gradient: Gradient(stops: [
-                        .init(color: Theme.Palette.violet.opacity(0.10), location: 0.0),
+                        .init(color: Theme.Palette.violet.opacity(0.06), location: 0.0),
                         .init(color: Color.clear, location: 1.0)
                     ]),
-                    center: UnitPoint(x: 1.02, y: 0.28),
+                    center: UnitPoint(x: 1.02, y: 0.22),
                     startRadius: 0,
-                    endRadius: width * 0.75
+                    endRadius: width * 0.78
                 )
 
-                // 底部压暗：悬浮 Dock 底下的亮度必须低于内容区，
-                // 否则玻璃会跟着变亮、白字对比度掉下去。
+                // 下半部分极淡的冷灰。作用不是"压暗"，是给悬浮 Dock 一点落差：
+                // 白玻璃压在纯 #f4f5f7 上几乎看不出边界。
                 LinearGradient(
                     stops: [
-                        .init(color: Color.clear, location: 0.52),
-                        .init(color: Color.black.opacity(0.36), location: 1.0)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-
-                // 顶部压暗：状态栏与大标题区域需要稳定的对比度底。
-                LinearGradient(
-                    stops: [
-                        .init(color: Color.black.opacity(0.22), location: 0.0),
-                        .init(color: Color.clear, location: 0.22)
+                        .init(color: Color.clear, location: 0.55),
+                        .init(color: Color(hex: 0xDDE3EC).opacity(0.55), location: 1.0)
                     ],
                     startPoint: .top,
                     endPoint: .bottom

@@ -81,6 +81,19 @@ struct MorePanel: View {
                     viewModel.switchCamera()
                 }
 
+                // 本地预览小窗的开关。默认关着——一进会就浮一块自己的画面，
+                // 会挡住共享内容和别人的画面；要看自己时再打开。
+                MoreActionTile(
+                    title: "预览窗",
+                    systemImage: SymbolCompat.name(
+                        "rectangle.inset.filled",
+                        "rectangle.on.rectangle"
+                    ),
+                    isOn: viewModel.showsLocalPreview
+                ) {
+                    viewModel.toggleLocalPreview()
+                }
+
                 MoreActionTile(
                     title: "设置",
                     systemImage: SymbolCompat.name("gearshape", "gear"),

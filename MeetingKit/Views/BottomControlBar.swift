@@ -33,10 +33,14 @@ struct BottomControlBar: View {
 
     /// 本地是否正在说话。
     ///
-    /// 真实链路里服务端的 active speaker 事件会带上本机；Mock 里由假数据驱动。
-    /// 拿不到时退化成"仅开麦"的轻呼吸，不会误报成"正在说话"。
+    /// 主判据是**真实麦克风电平**（WebRTC getStats 的 audioLevel）：
+    /// 服务端不下发音量，只靠 activeSpeakerID 的话，一个人小声说话时
+    /// 服务端还没把他判成"当前发言人"，脉冲就一直不亮。
+    /// activeSpeakerID 作为兜底，覆盖 getStats 还没返回第一帧的瞬间。
     private var isLocalSpeaking: Bool {
-        guard viewModel.isMicOn, let me = viewModel.localUser else { return false }
+        guard viewModel.isMicOn else { return false }
+        if viewModel.localAudioLevel > 0.015 { return true }
+        guard let me = viewModel.localUser else { return false }
         return viewModel.activeSpeakerID == me.id
     }
 
@@ -56,13 +60,17 @@ struct BottomControlBar: View {
         .background(bottomScrim)
     }
 
-    /// 自下而上的压暗层。顶部完全透明，只保证文字与图标有足够对比度。
+    /// 自下而上的承接层。顶部完全透明，只保证按钮与文字有足够对比度。
+    ///
+    /// 浅色主题下不能再用黑色渐变——那会在页面底部拉出一条脏灰。
+    /// 换成页面底色（#f4f5f7）的渐变：底层是实色，往上淡出，
+    /// 玻璃圆钮压在上面时边缘才有落差。
     private var bottomScrim: some View {
         LinearGradient(
             stops: [
-                .init(color: Color.black.opacity(0), location: 0),
-                .init(color: Color.black.opacity(0.26), location: 0.40),
-                .init(color: Color.black.opacity(0.60), location: 1)
+                .init(color: Theme.Palette.background.opacity(0), location: 0),
+                .init(color: Theme.Palette.background.opacity(0.55), location: 0.40),
+                .init(color: Theme.Palette.background.opacity(0.92), location: 1)
             ],
             startPoint: .top,
             endPoint: .bottom
@@ -198,13 +206,15 @@ struct MicPulseRing: View {
 
     @State private var expand: Bool = false
 
-    /// 说话时更亮、更快；仅开麦时只留一层几乎不可见的呼吸。
+    /// 说话时更亮、更快；仅开麦时留一层能看见的呼吸。
+    /// 0.16 是深色主题下的取值，浅色底上那圈几乎不存在——用户的原话是
+    /// "没有脉冲"，所以开麦常态提到 0.30，让它至少能看出在呼吸。
     private var ringOpacity: Double {
-        isSpeaking ? 0.55 : 0.16
+        isSpeaking ? 0.55 : 0.30
     }
 
     private var ringScale: CGFloat {
-        isSpeaking ? 1.75 : 1.22
+        isSpeaking ? 1.75 : 1.30
     }
 
     private var duration: Double {

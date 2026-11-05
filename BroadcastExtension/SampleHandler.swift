@@ -31,9 +31,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     // MARK: - 常量
 
-    /// 目标 20fps。共享的是文档、代码、演示稿：20fps 滚动已跟手，
-    /// 再往上 JPEG 编码与跨进程落盘会先成为瓶颈（1080p 每帧约 250~320KB）。
-    private static let frameInterval: CFTimeInterval = 1.0 / 20.0
+    /// 目标 24fps。共享的是文档、代码、演示稿：20fps 滚动时文字会"拖影"，
+    /// 观感就是"卡"；24 是跨进程落盘还能跟上的上限（1080p 每帧约 210~300KB）。
+    private static let frameInterval: CFTimeInterval = 1.0 / 24.0
 
     /// 心跳最小写入间隔。UserDefaults 每次写入都要经 cfprefsd 做跨进程同步，
     /// 按采样频率（60Hz）写会把扩展的 CPU 与内存拖到 jetsam 边缘；
@@ -44,9 +44,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
     /// 横屏（手机横放）输出 1920×1080，竖屏输出 1080×1920，文字边缘不再糊成一团。
     private static let maxPixelEdge: CGFloat = 1080
 
-    /// 0.7 是 1080p 下清晰度与体积的平衡点：文档类画面约 180~320KB/帧。
-    /// 再高（0.85+）体积接近翻倍，跨进程写入先成为瓶颈，观感提升却很有限。
-    private static let jpegQuality: CGFloat = 0.7
+    /// 0.78：文档类画面的关键是文字边缘。
+    /// 0.7 在 1080p 下已经能看到笔画发虚，再经 H.264 二次压缩就是"糊"；
+    /// 0.78 的可读性提升很明显，体积只涨约 15%（每帧 210~300KB），
+    /// 再高（0.85+）体积接近翻倍，跨进程写入先成为瓶颈。
+    private static let jpegQuality: CGFloat = 0.78
 
     /// 自定义错误域，主 App 可据此区分"用户主动停止"与系统异常中断。
     private static let stopErrorDomain = "com.tianqiong.meetingkit.broadcast"

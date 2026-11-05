@@ -76,13 +76,19 @@ struct MeetingRoomView: View {
 
                 // topInset / bottomInset 必须传进去：小窗的上边界是"顶栏底部 + 8"，
                 // 下边界是"底栏顶部 - 12"，写死常量在刘海/无刘海机型上会盖住按钮或浪费行程（H-7）。
-                LocalVideoFloatingView(
-                    viewModel: viewModel,
-                    containerSize: geo.size,
-                    topInset: insets.top,
-                    bottomInset: insets.bottom
-                )
-                .zIndex(2)
+                //
+                // 默认不显示：用户要的是"别一进来就有块自己的画面挡着"。
+                // 入口在「更多 → 预览浮窗」，每场会议独立，不记忆上次状态。
+                if viewModel.showsLocalPreview {
+                    LocalVideoFloatingView(
+                        viewModel: viewModel,
+                        containerSize: geo.size,
+                        topInset: insets.top,
+                        bottomInset: insets.bottom
+                    )
+                    .zIndex(2)
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                }
 
                 toastLayer(insets: insets)
 

@@ -173,11 +173,19 @@ protocol RTCClientDelegate: AnyObject {
     /// 此时 RTC 层不能默默失败——界面已经乐观地把图标切成了"开"，
     /// 不回调就等于让用户对着一个永远黑屏的格子。
     func rtcDidUpdateLocalCamera(_ enabled: Bool)
+
+    /// 本地麦克风的实时电平（0...1），约每 180ms 一次。
+    ///
+    /// 用于说话脉冲：服务端不下发音量（Web 端也是各自在本地算的），
+    /// 客户端只能从 getStats 的 media-source 统计里拿。
+    func rtcDidUpdateLocalAudioLevel(_ level: Float)
 }
 
 extension RTCClientDelegate {
     /// 默认空实现：Mock 与旧实现不需要为这个回调改动。
     func rtcDidUpdateLocalCamera(_ enabled: Bool) {}
+
+    func rtcDidUpdateLocalAudioLevel(_ level: Float) {}
 }
 
 // MARK: - 客户端能力

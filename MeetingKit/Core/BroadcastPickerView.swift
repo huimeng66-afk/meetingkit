@@ -54,13 +54,17 @@ enum BroadcastPickerPresenter {
         guard let control = findControl(in: picker) else { return false }
 
         Haptics.impact(.medium)
-        // 系统没有暴露点击 API，只能向内部控件派发事件。
-        // 不同 iOS 版本内部实现的 target/action 不同：13~16 对 .allTouchEvents 有响应，
-        // 17 之后部分版本只认 .touchUpInside 或 .primaryActionTriggered。
-        // 三个都发一遍——重复触发是幂等的（面板已经弹出时再次点击会被系统忽略）。
+        // 只派发一次 `.touchUpInside`。
+        //
+        // 这里原来连发三种事件（touchUpInside / allTouchEvents / primaryActionTriggered），
+        // 注释写着"重复触发是幂等的（面板已经弹出时再次点击会被系统忽略）"——
+        // 这个假设是错的。`allTouchEvents` 本身就**包含** `.touchUpInside`，
+        // 于是同一次调用里 UIButton 的 action 被触发了两次，系统面板弹两次。
+        // 用户的观感就是"点一下共享，选择器弹出来、消失、又弹一次"。
+        //
+        // RPSystemBroadcastPickerView 内部就是一个标准 UIButton，
+        // 它的 action 注册在 `.touchUpInside` 上，发这一个就够了。
         control.sendActions(for: .touchUpInside)
-        control.sendActions(for: .allTouchEvents)
-        control.sendActions(for: .primaryActionTriggered)
         return true
     }
 

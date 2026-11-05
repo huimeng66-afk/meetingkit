@@ -42,6 +42,9 @@ final class MeetingViewModel: ObservableObject {
     @Published private(set) var isCameraOn: Bool = true
     @Published private(set) var isFrontCamera: Bool = true
     @Published private(set) var isHandRaised: Bool = false
+
+    /// 本地麦克风实时电平（0...1）。底栏的说话脉冲读它。
+    @Published private(set) var localAudioLevel: Float = 0
     /// 音频路由：true = 扬声器，false = 听筒。默认外放，与入会后的常规预期一致。
     /// didSet 直接下发 RTC：真实链路改的是 RTCAudioSession 的输出端口。
     @Published var isSpeakerOn: Bool = true {
@@ -61,6 +64,13 @@ final class MeetingViewModel: ObservableObject {
     @Published private(set) var remoteScreenPeerID: String?
     /// 本地摄像头预览视图（RTCCameraPreviewView）。Mock 模式下为 nil，UI 回退头像卡。
     @Published private(set) var localPreviewView: UIView?
+
+    /// 是否显示可拖拽的本地预览小窗。
+    ///
+    /// 默认 **false**：一进会就有一块自己的画面浮在别人脸上，
+    /// 既挡住共享内容，也让"主角是共享画面"这件事变模糊。
+    /// 需要看自己时再从不面板里打开，每场会议独立，不记忆上次选择。
+    @Published var showsLocalPreview: Bool = false
 
     // MARK: - 安全设置（本阶段只影响界面状态）
 
@@ -348,6 +358,29 @@ final class MeetingViewModel: ObservableObject {
         rtc.setCameraEnabled(enabled)
         updateLocalParticipant { $0.isCameraOn = enabled }
         showToast(.cameraToggled(enabled))
+    }
+
+    /// 显示/隐藏本地预览小窗。
+    ///
+    /// 摄像头关着时打开没有意义（小窗里只有一张头像卡，还挡着别人的画面），
+    /// 所以这里顺手把摄像头打开——用户的意图就是"我想看看自己"。
+    func toggleLocalPreview() {
+        let willShow = !showsLocalPreview
+
+        if willShow && !isCameraOn {
+            toggleCamera()
+        }
+
+        showsLocalPreview = willShow
+        Haptics.impact(.light)
+
+        showToast(
+            ToastMessage(
+                text: willShow ? "已显示本地预览" : "已隐藏本地预览",
+                systemImage: willShow ? "rectangle.inset.filled" : "rectangle.dashed",
+                style: .info
+            )
+        )
     }
 
     func switchCamera() {
@@ -751,6 +784,13 @@ extension MeetingViewModel: RTCClientDelegate {
                 style: .warning
             )
         )
+    }
+
+    func rtcDidUpdateLocalAudioLevel(_ level: Float) {
+        // 阈值 0.015 是"环境噪声"与"人声"的分界：安静房间里底噪
+        // 通常在 0.005~0.012，正常说话在 0.05 以上。
+        // 不做平滑，脉冲本来就要跟着音量起伏；平滑会让它变成一条迟钝的呼吸。
+        localAudioLevel = level
     }
 
     func rtcDidChangeNetworkQuality(_ quality: NetworkQuality) {

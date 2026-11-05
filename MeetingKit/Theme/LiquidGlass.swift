@@ -318,9 +318,12 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
         case .tinted(let color):
             return color.opacity(0.32)
         case .prominent:
-            // 0.55 是白字在深色底上仍能稳定辨认的下限；
-            // 再淡一档，10pt 的 tab 文字压在视频或品牌光斑上就会糊掉。
-            return Theme.Palette.accent.opacity(0.55)
+            // 深色主题：0.55 是白字在深空底上仍能稳定辨认的下限。
+            // 浅色主题：必须给不透明的 accent。半透明的蓝叠在 #f4f5f7 上只有
+            // 约 2.5:1，白字会糊；网页端的按钮本来就是实色 #1677ff + 白字。
+            return colorScheme == .dark
+                ? Theme.Palette.accent.opacity(0.55)
+                : Theme.Palette.accent
         }
     }
 

@@ -96,6 +96,9 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 摄像头是否正在采集。与 `localVideoTrack.isEnabled` 分开：
     /// 轨可以一直是开的，但采集停了（关摄像头时 stopCapture 会熄灯）。
     private var isCameraCapturing = false
+    /// 本地音频电平轮询。WebRTC 没有公开的"当前麦克风电平"API，
+    /// 只能从 getStats 的 media-source 统计里取 audioLevel。
+    private var audioLevelTimer: Timer?
     private var previewView: RTCCameraPreviewView?
 
     private var screenPusher: ScreenFramePusher?
@@ -198,6 +201,7 @@ final class RealRTCClient: NSObject, RTCClient {
         updateConnectionState(.connected)
         updateNetworkQuality(.good)
         syncTeardownBox()
+        startAudioLevelPolling()
     }
 
     func leave() {
@@ -206,6 +210,7 @@ final class RealRTCClient: NSObject, RTCClient {
             return
         }
         isJoined = false
+        stopAudioLevelPolling()
         hasCompletedJoin = false
         options = nil
         // 先告诉服务端"主动离开"（释放位置，不等断线宽限），
@@ -587,6 +592,15 @@ final class RealRTCClient: NSObject, RTCClient {
         let factory = RTCPeerConnectionFactory()
         self.factory = factory
 
+        // 麦克风权限必须在**入会时**要，不能等到用户点开麦。
+        //
+        // 之前全项目没有一处请求过录音权限：WebRTC 第一次激活音频会话时系统才弹窗，
+        // 而那一刻通常发生在会议进行中——用户点"开麦"，对方看到的是这个人静音了几秒，
+        // 自己看到的是一句"需要麦克风权限"。授权这件事应该发生在门外，不是会议里。
+        //
+        // 被拒绝不阻断入会：可以只听不说，会中再点开麦时系统会引导去设置。
+        _ = await Self.requestMicPermission()
+
         // 麦克风（48kHz 由 WebRTC 内部音频单元保证）。
         let audioSource = factory.audioSource(with: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
         let audioTrack = factory.audioTrack(with: audioSource, trackId: "audio-\(UUID().uuidString)")
@@ -672,6 +686,73 @@ final class RealRTCClient: NSObject, RTCClient {
 
     private static let cameraFPS = 30
 
+    /// 请求麦克风（录音）权限。
+    ///
+    /// iOS 17 起 `AVAudioSession.requestRecordPermission` 被废弃，
+    /// 新入口是 `AVAudioApplication.requestRecordPermission`；
+    /// 部署目标是 15.0，所以两条路都要留。
+    static func requestMicPermission() async -> Bool {
+        await withCheckedContinuation { continuation in
+            if #available(iOS 17.0, *) {
+                AVAudioApplication.requestRecordPermission { granted in
+                    continuation.resume(returning: granted)
+                }
+            } else {
+                AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                    continuation.resume(returning: granted)
+                }
+            }
+        }
+    }
+
+    // MARK: - 本地音频电平
+
+    /// 每 180ms 取一次本地麦克风电平。
+    ///
+    /// 为什么走 getStats 而不是 AVAudioEngine：麦克风被 WebRTC 的
+    /// voice-processing audio unit 独占着，再挂一个 AVAudioEngine 的 tap
+    /// 会和它抢设备（表现为对方听到断续）。getStats 是只读的，
+    /// `media-source` 那组统计里带 `audioLevel`（0...1）。
+    ///
+    /// 180ms 是"看得出说话"和"不浪费 CPU"之间的折中：一次 getStats
+    /// 的代价约 1~2ms，按 20 次/秒算还不到 4% 的单核。
+    private func startAudioLevelPolling() {
+        audioLevelTimer?.invalidate()
+
+        let timer = Timer(timeInterval: 0.18, repeats: true) { [weak self] _ in
+            self?.pollLocalAudioLevel()
+        }
+        // .common：面板/抽屉滚动时 runloop 会切到 tracking 模式，
+        // 用 .default 注册的 timer 在那段时间会停，脉冲就会"卡住"。
+        RunLoop.main.add(timer, forMode: .common)
+        audioLevelTimer = timer
+    }
+
+    private func stopAudioLevelPolling() {
+        audioLevelTimer?.invalidate()
+        audioLevelTimer = nil
+        delegate?.rtcDidUpdateLocalAudioLevel(0)
+    }
+
+    private func pollLocalAudioLevel() {
+        // 任意一条连接拿到的都是同一路本地音频，取第一条即可。
+        guard let pc = remotePeers.values.first?.session.peerConnection else { return }
+
+        pc.statistics { [weak self] report in
+            guard let self = self else { return }
+
+            var peak: Float = 0
+            for (_, stat) in report.statistics where stat.type == "media-source" {
+                guard let value = stat.values["audioLevel"] as? NSNumber else { continue }
+                peak = max(peak, value.floatValue)
+            }
+
+            DispatchQueue.main.async {
+                self.delegate?.rtcDidUpdateLocalAudioLevel(peak)
+            }
+        }
+    }
+
     /// 屏幕共享的编码档位。
     ///
     /// 设置页的两个选项必须落到真实参数上，否则"清晰/流畅"只是一个会弹 Toast 的开关：
@@ -683,9 +764,13 @@ final class RealRTCClient: NSObject, RTCClient {
     static var screenEncodingProfile: (width: Int32, height: Int32, fps: Int32, bitrate: Int) {
         switch AppSettings.shareQualitySnapshot {
         case .sharp:
-            return (1920, 1080, 20, 4_000_000)
+            // 4Mbps 对 1080p 的文档画面是不够的：滚动/翻页时整屏都在变，
+            // 编码器只能保帧率丢细节，落到远端就是"字糊成一片"。
+            // 8Mbps 配 maintainResolution，文字边缘才立得住；网络跟不上时
+            // WebRTC 的带宽估计会自动降码率，不会把连接压死。
+            return (1920, 1080, 24, 8_000_000)
         case .balanced:
-            return (1280, 720, 15, 1_600_000)
+            return (1280, 720, 18, 3_000_000)
         }
     }
 
@@ -1347,7 +1432,7 @@ final class ScreenFramePusher {
     private var canvasLandscape = true
 
     /// 与扩展侧的 20fps 对齐：轮询比生产慢就会积压旧帧，比生产快则空转。
-    private static let pollInterval: TimeInterval = 1.0 / 20.0
+    private static let pollInterval: TimeInterval = 1.0 / 24.0
     private static let decodeQueue = DispatchQueue(
         label: "com.tianqiong.meetingkit.screenpush",
         qos: .userInitiated
@@ -1410,7 +1495,11 @@ final class ScreenFramePusher {
                 self.canvasLandscape = landscape
                 let w = landscape ? 1920 : 1080
                 let h = landscape ? 1080 : 1920
-                self.source.adaptOutputFormat(toWidth: Int32(w), height: Int32(h), fps: 20)
+                self.source.adaptOutputFormat(
+                    toWidth: Int32(w),
+                    height: Int32(h),
+                    fps: RealRTCClient.screenEncodingProfile.fps
+                )
             }
             // 单调时钟（系统校时/休眠不影响帧时间戳连续性）。
             let timestamp = Int64(CACurrentMediaTime() * 1_000_000_000)

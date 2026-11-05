@@ -8,7 +8,9 @@
 //  结束会议文字上，任何一处手写 hex 都会在后续调色时漏改。所有视图只允许读 Theme，
 //  不允许自己写 Color(hex:)，这样换肤（例如白天版）时只需要改这一个文件。
 //
-//  深色是唯一形态（App 入口已 preferredColorScheme(.dark)），因此不提供浅色分支。
+//  主题与网页端（public/assets/css/base.css）同源：浅灰页面 #f4f5f7、
+//  白色卡片 #ffffff、主蓝 #1677ff。属性名一个都不改，只换值——
+//  会议室 20 多个视图都在读这些名字，换肤只能换值，不能换 API。
 //
 
 import SwiftUI
@@ -24,27 +26,29 @@ enum Theme {
         // 天穹令牌（docs/design-tianqiong.md 第 1 节）。属性名一个都不能删：
         // 会议室 20 多个视图都在读这些名字，换肤只能换值，不能换 API。
 
-        /// 页面底色。深空蓝，比纯黑更有层次，也区别于通用黑灰风。
-        static let background = Color(hex: 0x04060D)
-        /// 面板 / 卡片的抬高底。
-        static let backgroundElevated = Color(hex: 0x0A1020)
+        /// 页面底色。与网页端 `--bg` 同一个值，保证两端截图能对上。
+        static let background = Color(hex: 0xF4F5F7)
+        /// 面板 / 卡片的抬高底。浅色下"抬高"是变白，不是变亮。
+        static let backgroundElevated = Color(hex: 0xFFFFFF)
 
-        static let textPrimary = Color(hex: 0xEAF1FF)
-        static let textSecondary = Color(hex: 0x9DB0D4)
-        /// 三级文字（会议号、时间戳）。设计规范要求不得再低，否则深空底上不可读。
-        static let textTertiary = Color(hex: 0x5D6F95)
+        static let textPrimary = Color(hex: 0x191C21)
+        static let textSecondary = Color(hex: 0x545B66)
+        /// 三级文字（会议号、时间戳）。
+        /// 网页端这一档是 --ink-400 #8d95a1，压在 #ffffff 上是 3.4:1，
+        /// 只够大字；正文位置一律用 secondary，这一档只给角标和占位符。
+        static let textTertiary = Color(hex: 0x8D95A1)
 
         /// 一级文字的语义别名，首页等新页面按设计稿用 ink 命名。
-        static let ink = Color(hex: 0xEAF1FF)
-        static let ink2 = Color(hex: 0x9DB0D4)
-        static let ink3 = Color(hex: 0x5D6F95)
+        static let ink = Color(hex: 0x191C21)
+        static let ink2 = Color(hex: 0x545B66)
+        static let ink3 = Color(hex: 0x8D95A1)
 
-        /// 强调蓝。选中态、发言高亮、主操作统一用它。
-        static let accent = Color(hex: 0x4F8CFF)
+        /// 强调蓝。对齐网页端 --blue-600 #1677ff（按钮/链接的主色）。
+        static let accent = Color(hex: 0x1677FF)
         /// 辅助青。加入会议、共享角标。
-        static let accent2 = Color(hex: 0x22D3EE)
-        /// 渐变第二色、联席主持人。与强调蓝拉开色相，避免被当成"选中"。
-        static let violet = Color(hex: 0x7C3AED)
+        static let accent2 = Color(hex: 0x0EA5E9)
+        /// 渐变第二色、联席主持人。网页端 --violet #6e56cf。
+        static let violet = Color(hex: 0x6E56CF)
         /// 品牌渐变 #3B82F6 → #7C3AED。
         static let brandGradient = LinearGradient(
             gradient: Gradient(colors: [Color(hex: 0x3B82F6), Color(hex: 0x7C3AED)]),
@@ -53,29 +57,34 @@ enum Theme {
         )
 
         /// 危险红。共享警示条、麦克风/摄像头关闭、结束会议。
-        static let danger = Color(hex: 0xEF4444)
-        static let success = Color(hex: 0x22C55E)
-        static let warning = Color(hex: 0xF59E0B)
-        static let coHost = Color(hex: 0x7C3AED)
+        static let danger = Color(hex: 0xE5484D)
+        static let success = Color(hex: 0x12A150)
+        static let warning = Color(hex: 0xC77405)
+        static let coHost = Color(hex: 0x6E56CF)
 
-        /// 玻璃描边（1px 高光边）。深色画面上没有这条边，玻璃会和视频糊在一起。
-        static let glassStroke = Color(hex: 0x5A8CFF).opacity(0.16)
-        /// 玻璃底色。叠在模糊层之上，保证亮画面下的文字对比度。
-        static let glassTint = Color.black.opacity(0.32)
+        /// 玻璃描边。浅色底上玻璃靠"压暗的边缘"成形，白描边会完全看不见。
+        static let glassStroke = Color.black.opacity(0.08)
+        /// 玻璃底色。浅色下要把内容提亮而不是压暗，所以是白色而不是黑色。
+        static let glassTint = Color.white.opacity(0.62)
         /// 不透明实色底。玻璃被关掉（低端机 / 录屏降负载）或用户开了
-        /// "降低透明度"时用它，必须完全不透明：半透明实色会和下面的视频混成一块脏色。
-        static let surface = Color(hex: 0x0A1020)
-        /// 浅色模式下的实色底。本项目强制深色，这一档只用于系统深浅切换时不留白块。
-        static let surfaceLight = Color(hex: 0xEDEEF2)
-        /// 控件常态底（底栏圆钮、面板内按钮）。设计稿为白 6%。
-        static let controlFill = Color.white.opacity(0.06)
+        /// "降低透明度"时用它，必须完全不透明：半透明实色会和下面的内容混成一块脏色。
+        static let surface = Color(hex: 0xFFFFFF)
+        /// 浅色模式下的实色底（页面级）。与 surface 的区别：surface 是卡片，
+        /// 这个是贴在页面底色上的整块区域。
+        static let surfaceLight = Color(hex: 0xF9FAFB)
+        /// 控件常态底（底栏圆钮、面板内按钮）。网页端浅灰块 #f4f5f7。
+        static let controlFill = Color(hex: 0xF4F5F7)
         /// 面板内浅色块（说明卡、输入框、他人气泡）。
-        static let surfaceSubtle = Color.white.opacity(0.06)
-        static let bubbleOther = Color.white.opacity(0.1)
-        /// 摄像头关闭时的画面底。比页面底色略亮，避免"像一块洞"。
-        static let tileBackground = Color(hex: 0x0B1220)
-        /// 分割线。
-        static let hairline = Color.white.opacity(0.08)
+        static let surfaceSubtle = Color(hex: 0xF4F5F7)
+        static let bubbleOther = Color(hex: 0xEEF0F3)
+        /// 摄像头关闭时的画面底。浅灰，和白色卡片拉开一档。
+        static let tileBackground = Color(hex: 0xEEF0F3)
+        /// 分割线。网页端 --line #e7e9ed。
+        static let hairline = Color(hex: 0xE7E9ED)
+
+        /// 彩色底（accent / danger / 头像渐变）上的文字色。
+        /// 浅色主题下"白色文字"只剩这一个合法用途，不要再手写 .white。
+        static let onAccent = Color.white
     }
 
     // MARK: 圆角
