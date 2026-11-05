@@ -1328,17 +1328,30 @@ private extension MeetingViewModel {
             )
         }
 
-        // 用户点了开始共享、系统面板也弹了，但 6 秒内扩展一个状态都没写回来：
-        // 多半是在系统面板里点了取消，或者旧广播卡在"停止中"。
-        // 不提示的话，界面看起来就是"点了没反应"。
+        // 用户点了开始共享、系统面板也弹了，但 6 秒内扩展一个状态都没写回来。
+        //
+        // 1.5.5 起分两种说法，对应两种完全不同的处置：
+        //   · 黑匣子里有本次的启动记录 → 扩展起来了，卡在写状态之前（签名/容器/编码）
+        //   · 没有启动记录            → 系统压根没拉起扩展，多半是控制中心里
+        //                               上一场共享还挂着，iOS 不允许同时跑两场
         if !isScreenSharing,
            !didWarnPendingShare,
            let requested = shareBridge.pendingRequestAt,
            now.timeIntervalSince(requested) > 6 {
             didWarnPendingShare = true
+            let launched = shareBridge.extensionLaunchedAt.map {
+                $0 >= requested.addingTimeInterval(-2)
+            } ?? false
+            let text: String
+            if launched {
+                let step = shareBridge.extensionStepDescription ?? "未知"
+                text = "共享扩展已启动，但停在「\(step)」，没有写回状态。共享面板里的诊断可直接看到断点。"
+            } else {
+                text = "共享扩展没有启动。系统里多半还挂着一场旧的屏幕共享：先到控制中心点「停止共享」，或重启手机，再重新开始。"
+            }
             showToast(
                 ToastMessage(
-                    text: "没有收到共享扩展的状态。请确认系统弹窗里点了「开始直播」；若仍无反应，多半是当前签名没有把 App Group 授予扩展，需要重签安装。",
+                    text: text,
                     systemImage: "dot.radiowaves.left.and.right",
                     style: .warning
                 )

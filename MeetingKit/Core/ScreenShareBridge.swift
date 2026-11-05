@@ -35,6 +35,21 @@ final class ScreenShareBridge: ObservableObject {
     /// 面板据此在 6 秒后提示"系统广播没有真正启动"，而不是一直显示空状态。
     @Published private(set) var pendingRequestAt: Date?
 
+    /// 扩展黑匣子里记录的"本次启动时刻"。
+    ///
+    /// 这是区分两种失败的关键：扩展**根本没启动**（系统里还挂着一场旧广播，
+    /// 新扩展收不到 broadcastStarted）vs 启动了但中途停了（App Group / 编码失败）。
+    /// 两者在 App Group 里都表现为"没有状态"，只有这个走宿主容器的探针能分开。
+    @Published private(set) var extensionLaunchedAt: Date?
+
+    /// 扩展最后走到的一步（见 `stepDescription`）。nil 表示本次没有启动记录。
+    @Published private(set) var extensionStep: String?
+
+    /// 给提示文案用的"最后一步"人话版本。
+    var extensionStepDescription: String? {
+        extensionStep.map { ScreenShareDiagnostics.stepDescription($0) }
+    }
+
     // MARK: - 观察者生命周期
 
     /// 为什么用独立的盒子装 token：
@@ -53,6 +68,9 @@ final class ScreenShareBridge: ObservableObject {
 
     /// 本次共享会话的帧新鲜度下界。早于它的文件属于上一场，不能当新帧。
     private var sessionFloor: Date?
+
+    /// 最近一次读到的扩展黑匣子记录。诊断与提示文案共用同一份，避免各读各的。
+    private var extensionProbe: ExtensionProbe.Record?
 
     /// 预览解码令牌：后台解码完成时只有"最新一帧"允许上屏，
     /// 否则慢的旧帧后到，会把已经显示的新帧盖回去（画面倒退一拍）。
@@ -170,10 +188,16 @@ final class ScreenShareBridge: ObservableObject {
 
         ScreenShareRuntime.reset()
         SharedFrameStore.clear()
+        // 黑匣子也要清：否则上一场的"已启动"会被当成本次的启动证据，
+        // 反而掩盖"这次扩展根本没起来"。
+        ExtensionProbe.reset()
         ScreenShareStore.prepareForNewSession()
 
         sessionFloor = ScreenShareStore.sessionFloor
         pendingRequestAt = ScreenShareStore.requestedAt
+        extensionLaunchedAt = nil
+        extensionStep = nil
+        extensionProbe = nil
         startedAt = nil
         failure = nil
         latestFrame = nil
@@ -188,6 +212,19 @@ final class ScreenShareBridge: ObservableObject {
         // 否则跨进程写入正好落在两次读之间，会拼出一个自相矛盾的诊断。
         let snapshot = ScreenShareStore.snapshot()
         let state = ScreenShareState(rawValue: snapshot?.state ?? "") ?? .idle
+
+        /* 扩展黑匣子。走宿主 App 的数据容器，不依赖 App Group，
+           所以"App Group 没授权"时它反而是唯一能读出扩展是否启动过的通道。
+           两个小文件（几百字节）每秒读一次，代价可以忽略。 */
+        let probe = ExtensionProbe.latest()
+        extensionProbe = probe
+        let launchDate = probe.map { Date(timeIntervalSince1970: $0.launchedAt) }
+        if extensionLaunchedAt != launchDate {
+            extensionLaunchedAt = launchDate
+        }
+        if extensionStep != probe?.step {
+            extensionStep = probe?.step
+        }
 
         // 会话下界：扩展写回的 requestedAt 优先级最高，老版本没有就退回 startedAt。
         // 再往前放宽 2 秒，跨过两进程时钟与文件系统 mtime 的毫秒级抖动。
@@ -348,6 +385,10 @@ final class ScreenShareBridge: ObservableObject {
             appGroupAvailable: AppGroupConfig.isAvailable,
             appGroupID: AppGroupConfig.identifier,
             extensionAppGroup: snapshot?.appGroup,
+            extensionProbeAt: extensionProbe.map { Date(timeIntervalSince1970: $0.launchedAt) },
+            extensionProbeStep: extensionProbe?.step,
+            extensionProbeGroup: extensionProbe?.appGroup,
+            extensionProbeNote: extensionProbe?.note,
             state: state,
             startedAt: startedAt,
             heartbeatAge: snapshot?.heartbeat.map { now.timeIntervalSince1970 - $0 },
@@ -362,6 +403,7 @@ final class ScreenShareBridge: ObservableObject {
             videoPacketsSent: video.packetsSent,
             videoFramesEncoded: video.framesEncoded,
             screenTrackAttached: video.screenAttached,
+            videoStatsSampled: video.sampled,
             lastError: snapshot?.lastError
         )
     }
@@ -407,6 +449,11 @@ struct ScreenShareDiagnostics {
     var appGroupAvailable: Bool
     var appGroupID: String
     var extensionAppGroup: String?
+    /// 扩展黑匣子：本次是否真的启动过、停在哪个步骤、它自己解析到的组。
+    var extensionProbeAt: Date?
+    var extensionProbeStep: String?
+    var extensionProbeGroup: String?
+    var extensionProbeNote: String?
     var state: ScreenShareState
     var startedAt: Date?
     var heartbeatAge: TimeInterval?
@@ -421,12 +468,26 @@ struct ScreenShareDiagnostics {
     var videoPacketsSent: Int
     var videoFramesEncoded: Int
     var screenTrackAttached: Bool
+    /// 看门狗是否已经采过一次样。false 时 `screenTrackAttached` 只是默认值，不能当结论。
+    var videoStatsSampled: Bool
     var lastError: String?
 
     /// 扩展与主 App 解析出的 App Group 是否真的不一致。
     var appGroupMismatch: Bool {
         guard let extensionAppGroup = extensionAppGroup else { return false }
         return extensionAppGroup != appGroupID
+    }
+
+    /// 扩展有没有在本次请求之后启动过。
+    ///
+    /// 这是 1.5.5 新增的判据。之前只有 App Group 这一条通道，遇到
+    /// "系统里挂着一场旧广播、新扩展根本没被拉起"时，诊断只能显示"未上报"，
+    /// 和"扩展启动了但写不进容器"完全一样，无法区分。
+    var extensionStartedThisSession: Bool? {
+        guard let probeAt = extensionProbeAt else { return nil }
+        guard let requestedAt = requestedAt else { return true }
+        // 允许 2 秒误差：系统从点"开始直播"到真正拉起扩展有一小段延迟。
+        return probeAt >= requestedAt.addingTimeInterval(-2)
     }
 
     /// 给面板直接展示的多行文本。
@@ -439,6 +500,22 @@ struct ScreenShareDiagnostics {
             lines.append("App Group（扩展）：\(extensionAppGroup)\(suffix)")
         } else {
             lines.append("App Group（扩展）：未上报（扩展未启动，或读不到本容器）")
+        }
+
+        /* 扩展进程：黑匣子走宿主 App 的容器，App Group 没授权时也能读到。
+           它回答的是"扩展到底有没有被系统拉起来"，这是 App Group 内状态永远答不了的。 */
+        if let probeAt = extensionProbeAt {
+            let age = Date().timeIntervalSince(probeAt)
+            var probeLine = String(format: "扩展进程：%.0f 秒前启动", max(0, age))
+            if let step = extensionProbeStep {
+                probeLine += " · 最后一步「\(Self.stepDescription(step))」"
+            }
+            if let group = extensionProbeGroup, group != appGroupID {
+                probeLine += " · ⚠️ 它解析到的组是 \(group)"
+            }
+            lines.append(probeLine)
+        } else {
+            lines.append("扩展进程：本次未启动（系统里可能还挂着一场旧共享）")
         }
 
         var stateLine = "扩展状态：\(state.rawValue)"
@@ -472,16 +549,49 @@ struct ScreenShareDiagnostics {
         }
         lines.append(readLine)
 
+        /* 1.5.5 新增：有帧、但扩展从没上报过会话头。
+           帧只可能由本扩展写入 App Group，可扩展又没写过状态——说明写帧的
+           不是"这一次启动的扩展"，而是上一场仍活着的广播进程。
+           不点破的话，用户只会看到"有画面在动，但对方是黑的"，无从下手。 */
+        if framesWritten > 0, extensionAppGroup == nil {
+            lines.append("⚠️ 有帧但没有扩展状态：写帧的多半是上一场残留的广播进程")
+            if extensionStartedThisSession == false {
+                lines.append("⚠️ 本次扩展没有启动。先到控制中心停止旧的「屏幕共享」，或重启手机，再重新开始")
+            }
+        }
+
         lines.append("已推 RTC：\(framesPushed) 帧" + (lastPushAge.map { String(format: "（%.0f 秒前）", $0) } ?? ""))
-        lines.append(
-            "RTC 视频：发送 \(videoPacketsSent) 包 · 编码 \(videoFramesEncoded) 帧 · "
-            + (screenTrackAttached ? "共享轨已挂" : "共享轨未挂 ⚠️")
-        )
+        if videoStatsSampled {
+            lines.append(
+                "RTC 视频：发送 \(videoPacketsSent) 包 · 编码 \(videoFramesEncoded) 帧 · "
+                + (screenTrackAttached ? "共享轨已挂" : "共享轨未挂 ⚠️")
+            )
+        } else {
+            // 没有采样就没有结论：以前这里用默认值 true 冒充"已挂"，
+            // 于是"0 包 0 帧"和"共享轨已挂"同时出现，反而误导排查。
+            lines.append("RTC 视频：尚未采样（入会后约 4 秒出结果；无对端时不会发包）")
+        }
 
         if let error = lastError {
             lines.append("最近错误：\(error)")
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// 把扩展黑匣子的步骤翻成人话。未知步骤原样显示，方便新版本加了步骤也能看。
+    static func stepDescription(_ step: String) -> String {
+        switch step {
+        case "entered": return "进入 broadcastStarted"
+        case "no-app-group": return "App Group 不可用"
+        case "group-ok": return "App Group 可用"
+        case "frames-cleared": return "已清旧帧"
+        case "session-written": return "已写会话头"
+        case "started": return "已起播"
+        case "first-frame": return "已出首帧"
+        case "finished": return "已结束"
+        case "stopped-by-app": return "用户停止"
+        default: return step
+        }
     }
 }
 

@@ -335,7 +335,10 @@ enum ScreenShareRuntime {
     // 1.5.4：RTP 视频上行统计。用来区分"帧没进编码器"与"编码了但没发出去"。
     private static var _videoPacketsSent = 0
     private static var _videoFramesEncoded = 0
-    private static var _screenTrackAttached = true
+    private static var _screenTrackAttached = false
+    /// 最近一次采样时间。nil 表示看门狗还没跑过——此时"共享轨已挂"是**没有依据**的，
+    /// 诊断必须显示"尚未采样"，而不是拿默认值冒充结论。
+    private static var _videoStatsAt: Double?
 
     /// 扩展写出过多少帧（由主 App 读到新帧时累加）。
     static var framesWritten: Int {
@@ -356,9 +359,17 @@ enum ScreenShareRuntime {
     }
 
     /// 最近一次采样到的视频 RTP 计数。
-    static var videoStats: (packetsSent: Int, framesEncoded: Int, screenAttached: Bool) {
+    /// `sampled` 为 false 时其余字段没有意义，UI 不应把 `screenAttached` 当成结论。
+    static var videoStats: (packetsSent: Int, framesEncoded: Int, screenAttached: Bool, sampled: Bool) {
         lock.lock(); defer { lock.unlock() }
-        return (_videoPacketsSent, _videoFramesEncoded, _screenTrackAttached)
+        return (_videoPacketsSent, _videoFramesEncoded, _screenTrackAttached, _videoStatsAt != nil)
+    }
+
+    /// 最近一次采样的时刻。
+    static var videoStatsAt: Date? {
+        lock.lock(); defer { lock.unlock() }
+        guard let raw = _videoStatsAt else { return nil }
+        return Date(timeIntervalSince1970: raw)
     }
 
     static func noteFrameWritten() {
@@ -379,6 +390,7 @@ enum ScreenShareRuntime {
         _videoPacketsSent = packetsSent
         _videoFramesEncoded = framesEncoded
         _screenTrackAttached = screenAttached
+        _videoStatsAt = Date().timeIntervalSince1970
         lock.unlock()
     }
 
@@ -389,7 +401,8 @@ enum ScreenShareRuntime {
         _lastPushAt = nil
         _videoPacketsSent = 0
         _videoFramesEncoded = 0
-        _screenTrackAttached = true
+        _screenTrackAttached = false
+        _videoStatsAt = nil
         lock.unlock()
     }
 }

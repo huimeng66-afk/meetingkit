@@ -109,11 +109,18 @@ final class SampleHandler: RPBroadcastSampleHandler {
     // MARK: - 生命周期
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
+        /* 黑匣子第一条：在任何可能卡住/崩溃的调用之前落盘。
+           如果设备上这一条都没有，说明系统压根没把控制权交给本扩展——
+           最常见的原因是系统里还挂着一场旧的共享（控制中心的红点没停），
+           此时新扩展收不到 broadcastStarted，界面上却能看到别处写进来的旧帧。 */
+        ExtensionProbe.mark("entered", includeGroup: false, checkContainer: false)
+
         // 第一道也是最后一道防线：扩展与主 App 之间**只有** App Group 这一条通道。
         // 证书没授权任何 group 时（免费 Apple ID 自签、部分代签工具剥离 entitlements），
         // 扩展照样能起播、照样在录屏，但一帧都写不出去，用户看到的是"共享中 + 对面黑屏"。
         // 与其让用户对着黑屏等到自己发现，不如在这里按系统规范立刻结束并给出原因。
         guard AppGroupConfig.isAvailable else {
+            ExtensionProbe.mark("no-app-group", group: AppGroupConfig.identifier)
             // 先把原因落盘再结束：主 App 读不到这条记录时，用户只能看到
             // "共享莫名其妙中断"，没有任何可排查的线索。
             ScreenShareStore.recordError("扩展未获得 App Group（\(AppGroupConfig.identifier)），共享画面无法传回会议")
@@ -128,6 +135,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
             return
         }
 
+        ExtensionProbe.mark("group-ok", group: AppGroupConfig.identifier)
+
         // 每次广播都当作一次全新会话：重置节流、重入、停止标记与出帧计数。
         resetForNewSession()
 
@@ -135,10 +144,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
            顺序反了的话，主 App 可能在新会话开始的一瞬间读到上一场的残留帧，
            把"已结束的共享"重新点亮。 */
         SharedFrameStore.clear()
+        ExtensionProbe.mark("frames-cleared", group: AppGroupConfig.identifier)
+
         ScreenShareStore.beginSession(
             appGroup: AppGroupConfig.identifier,
             extensionVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         )
+        ExtensionProbe.mark("session-written", group: AppGroupConfig.identifier)
         lastHeartbeatTime = CACurrentMediaTime()
         DarwinNotifier.post(ScreenShareSignal.stateChanged)
 
@@ -149,6 +161,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         stopObserver = DarwinNotifier.addObserver(ScreenShareSignal.stopRequested) { [weak self] in
             self?.finishBroadcastBecauseUserStopped()
         }
+        ExtensionProbe.mark("started", group: AppGroupConfig.identifier)
     }
 
     override func broadcastPaused() {
@@ -166,6 +179,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastFinished() {
+        ExtensionProbe.mark("finished", group: AppGroupConfig.identifier)
         // 先置停止标记：编码队列里尚未落盘的那一帧会被 commitFrame 拒绝。
         markStopping()
         stopHeartbeatTimer()
@@ -297,6 +311,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         // 落盘与停止标记在同一把锁里：clear() 之后不可能再冒出旧帧。
         guard commitFrame(jpeg) else { return }
+        // 第一帧只记一次：证明"采样 → 编码 → 落盘"整条链路在本进程里真的通了。
+        if currentFrameCount == 1 {
+            ExtensionProbe.mark("first-frame", group: AppGroupConfig.identifier)
+        }
         // 顺序很重要：先落盘再发信号。写是同步的，主 App 收到通知时文件一定已就绪。
         DarwinNotifier.post(ScreenShareSignal.frameUpdated)
     }
@@ -408,6 +426,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     /// App Group 里的 state 判断"还在不在共享"，如果这里不主动收尾，
     /// 状态会永久停在 .active，UI 冷启动就会一直显示"正在共享"且点了停止也没反应。
     private func finishBroadcastBecauseUserStopped() {
+        ExtensionProbe.mark("stopped-by-app", group: AppGroupConfig.identifier)
         markStopping()
         stopHeartbeatTimer()
         removeStopObserver()
