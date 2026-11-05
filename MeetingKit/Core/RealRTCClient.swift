@@ -462,7 +462,7 @@ final class RealRTCClient: NSObject, RTCClient {
             : av.categoryOptions.contains(.defaultToSpeaker)
         let fellBackToEarpiece = speakerOn
             && !hasExternalAudioRoute(av)
-            && av.currentRoute.outputs.contains(where: { $0.portType == .builtInEarpiece })
+            && av.currentRoute.outputs.contains(where: { $0.portType == .builtInReceiver })
         let wrongRoute = av.category != .playAndRecord
             || av.mode != .voiceChat
             || speakerOptionMismatch
