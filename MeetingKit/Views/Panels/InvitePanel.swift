@@ -20,8 +20,13 @@ struct InvitePanel: View {
     @State private var qrImage: UIImage?
     @State private var didCopyNumber = false
 
+    /// 邀请链接优先用网页地址，而不是 `tianqiong://`。
+    ///
+    /// 自定义 scheme 只有装了 App 的人能打开；把二维码发给还没装 App 的同事，
+    /// 扫出来只会停在"无法打开链接"。网页版本身就能入会，先保证所有人都能进，
+    /// 装没装 App 都不影响。首页通讯录的"邀请链接"用的也是同一个地址。
     private var invitePayload: String {
-        "tianqiong://join/\(viewModel.meetingNumber)"
+        TianqiongAPI.roomLink(number: viewModel.meetingNumber)
     }
 
     private var inviteText: String {

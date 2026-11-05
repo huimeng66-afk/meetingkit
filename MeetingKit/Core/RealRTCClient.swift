@@ -368,11 +368,19 @@ final class RealRTCClient: NSObject, RTCClient {
 
         isScreenSharing = true
 
+        let profile = Self.screenEncodingProfile
+        // 画质档位必须在这里落到采集格式上：只改 setVideoEncoding 的码率，
+        // 源仍是 1080p/20，弱网下"流畅"档并不会真的更流畅。
+        source.adaptOutputFormat(toWidth: profile.width, height: profile.height, fps: profile.fps)
+
         // 用共享轨替换每条连接的 video sender（Web 端同款 replaceTrack）。
         for peer in remotePeers.values {
             peer.session.replaceVideoTrack(with: track)
-            // 1080p 共享按 4Mbps / 20fps 给足码率，与 Web 端 screen 档位（1080P/4Mbps）对齐。
-            peer.session.setVideoEncoding(maxBitrateBps: 4_000_000, maxFramerate: 20, keepResolution: true)
+            peer.session.setVideoEncoding(
+                maxBitrateBps: profile.bitrate,
+                maxFramerate: Int(profile.fps),
+                keepResolution: true
+            )
         }
 
         let pusher = ScreenFramePusher(source: source)
@@ -588,7 +596,12 @@ final class RealRTCClient: NSObject, RTCClient {
 
         // 共享源（帧由 SharedFrameStore 推送）。
         let screenSource = factory.videoSource()
-        screenSource.adaptOutputFormat(toWidth: 1920, height: 1080, fps: 20)
+        let screenProfile = Self.screenEncodingProfile
+        screenSource.adaptOutputFormat(
+            toWidth: screenProfile.width,
+            height: screenProfile.height,
+            fps: screenProfile.fps
+        )
         let screenTrack = factory.videoTrack(with: screenSource, trackId: "screen-\(UUID().uuidString)")
         screenTrack.isEnabled = true
         localScreenSource = screenSource
@@ -618,6 +631,23 @@ final class RealRTCClient: NSObject, RTCClient {
     }
 
     private static let cameraFPS = 30
+
+    /// 屏幕共享的编码档位。
+    ///
+    /// 设置页的两个选项必须落到真实参数上，否则"清晰/流畅"只是一个会弹 Toast 的开关：
+    ///   · 清晰：1080p / 20fps / 4Mbps，与 Web 端 screen 档对齐；
+    ///   · 流畅：720p / 15fps / 1.6Mbps，弱网下优先保帧率。
+    ///
+    /// fps 用 `Int32`：`adaptOutputFormat` 的入参就是 `Int32`，
+    /// 这里跟着它的类型走，调用点不必到处写 `Int32(...)`。
+    static var screenEncodingProfile: (width: Int32, height: Int32, fps: Int32, bitrate: Int) {
+        switch AppSettings.shareQualitySnapshot {
+        case .sharp:
+            return (1920, 1080, 20, 4_000_000)
+        case .balanced:
+            return (1280, 720, 15, 1_600_000)
+        }
+    }
 
     /// 选 720p 档位里最合适的格式：优先 1280x720@30，否则最接近 720p 且不超采。
     /// 设备无任何可用格式时返回 nil。

@@ -410,11 +410,13 @@ struct PreJoinView: View {
                 RoundedRectangle(cornerRadius: Theme.Metrics.buttonRadius, style: .continuous)
                     .fill(Theme.Palette.brandGradient)
             )
-            .opacity(formIsValid ? 1.0 : 0.4)
+            .opacity(formIsValid ? 1.0 : 0.55)
             .contentShape(RoundedRectangle(cornerRadius: Theme.Metrics.buttonRadius, style: .continuous))
         }
         .buttonStyle(BrandPressStyle())
-        .disabled(!formIsValid || isJoining)
+        // 只在提交中禁用。会议号不足 7 位时按钮仍然可点，点下去明确告诉用户差几位，
+        // 而不是变成一块按不动的灰条——那和"登录点不动"是同一类问题。
+        .disabled(isJoining)
         .accessibilityLabel("加入会议")
     }
 
@@ -437,7 +439,16 @@ struct PreJoinView: View {
     // MARK: - 动作
 
     private func startJoin() {
-        guard formIsValid, !isJoining else { return }
+        guard !isJoining else { return }
+
+        guard formIsValid else {
+            let remaining = max(0, 7 - digits.count)
+            joinError = remaining > 0
+                ? "会议号是 7 位数字，还差 \(remaining) 位"
+                : "请输入正确的 7 位会议号"
+            Haptics.notify(.warning)
+            return
+        }
 
         Haptics.impact(.medium)
         Keyboard.dismiss()
@@ -579,8 +590,9 @@ struct PreJoinView: View {
         displayName.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// 设计规范：会议号满 7 位即可入会（名称可空，入会后默认「访客」），
-    /// 不满 7 位时按钮禁用（同时降到 40% 透明度）。
+    /// 设计规范：会议号满 7 位即可入会（名称可空，入会后默认「访客」）。
+    /// 不足 7 位时按钮仍可点，点击会明确提示还差几位；
+    /// 只用透明度表达"还没填完"，不再用 disabled 把点击吞掉。
     private var formIsValid: Bool {
         digits.count == 7
     }
@@ -604,29 +616,31 @@ struct PreJoinView: View {
     }
 
     private func buildJoinInfo() -> JoinInfo {
-        var final = info
-        final.meetingNumber = digits
+        // 变量名不叫 `final`：它是 Swift 关键字，虽然这里能编译，
+        // 但任何语法高亮/静态分析工具都会在它后面的几行集体误判。
+        var joinInfo = info
+        joinInfo.meetingNumber = digits
         // 名称可空入会：空名原样上报，由服务端分配「访客XXXX」。
         // 客户端统一填「访客」会导致所有未命名访客共用同一个踢人键（g:访客），
         // 主持人踢一个会连带封禁其他未命名访客（服务端按名称记踢出名单）。
-        final.displayName = trimmedName
-        final.isHost = isHost
-        final.avatarColorIndex = router.profile.avatarColorIndex
-        final.micOn = isMicOn
-        final.cameraOn = isCameraOn
+        joinInfo.displayName = trimmedName
+        joinInfo.isHost = isHost
+        joinInfo.avatarColorIndex = router.profile.avatarColorIndex
+        joinInfo.micOn = isMicOn
+        joinInfo.cameraOn = isCameraOn
         // 真实链路：入会密码与登录令牌。
-        final.password = passwordText
-        final.token = AuthStore.load()?.token ?? ""
+        joinInfo.password = passwordText
+        joinInfo.token = AuthStore.load()?.token ?? ""
 
         let title = meetingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         if isHost {
-            final.title = title.isEmpty ? "\(final.displayName)的会议" : title
+            joinInfo.title = title.isEmpty ? "\(joinInfo.displayName)的会议" : title
         } else if title.isEmpty || title == "加入会议" {
             // 校验通过后服务端标题已写入 meetingTitle；这里兜底显示会议号。
-            final.title = "会议 \(JoinInfo.groupDigits(digits))"
+            joinInfo.title = "会议 \(JoinInfo.groupDigits(digits))"
         } else {
-            final.title = title
+            joinInfo.title = title
         }
-        return final
+        return joinInfo
     }
 }

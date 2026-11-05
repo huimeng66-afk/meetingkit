@@ -162,7 +162,6 @@ struct BottomControlBar: View {
             title: "更多",
             size: keySize,
             badgeSymbol: viewModel.isHandRaised ? "hand.raised.fill" : nil,
-            badgeDot: !viewModel.isHandRaised && viewModel.isRecording,
             accessibilityText: "更多功能"
         ) {
             togglePanel(.more)

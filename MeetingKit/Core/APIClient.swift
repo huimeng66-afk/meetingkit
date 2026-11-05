@@ -32,6 +32,18 @@ enum TianqiongAPI {
     static let baseURL = origin.appendingPathComponent("api")
 
     static let defaultTimeout: TimeInterval = 15
+
+    /// 网页入会地址。
+    ///
+    /// 会中邀请卡、二维码、首页通讯录的邀请链接共用这一个拼法。
+    /// 之前三处各自写 `origin.absoluteString + "/room?no="`：只要 Info.plist 里的
+    /// `TQServerOrigin` 带了尾部斜杠，就会拼出 `https://host//room`，
+    /// 部分服务端会把双斜杠当成路径的一部分，扫码的人直接 404。
+    static func roomLink(number: String) -> String {
+        let base = origin.absoluteString
+        let trimmed = base.hasSuffix("/") ? String(base.dropLast()) : base
+        return "\(trimmed)/room?no=\(number)"
+    }
 }
 
 // MARK: - 会话模型
@@ -116,18 +128,22 @@ enum AuthStore {
         NotificationCenter.default.post(name: didChangeNotification, object: nil)
     }
 
-    /// 处理服务端的 DEVICE_KICKED。
+    /// 处理所有"令牌已经不能再用"的响应：DEVICE_KICKED、BAD_TOKEN、STALE_TOKEN、
+    /// NO_USER，以及账号被禁用/待审/驳回。
+    ///
+    /// 之前只处理 DEVICE_KICKED：令牌自然过期、改密后旧令牌失效、账号被禁用时，
+    /// 界面还挂着头像与"已登录"，但每个接口都在 401/403——用户只会觉得软件坏了。
     ///
     /// 关键点在 `token` 比较：首页可能同时有几个请求在飞，用户被踢后立刻重新登录，
     /// 旧请求的 401 会晚到。如果不加判断，它会把刚建立的新会话也清掉，
     /// 表现就是"重新登录后又被踢一次"。
-    static func handleDeviceKicked(message: String, token: String?) {
+    static func handleSessionInvalid(message: String, token: String?) {
         guard let current = load() else { return }
         if let token = token, !token.isEmpty, token != current.token {
             return
         }
 
-        let text = message.isEmpty ? "账号已在其他设备登录，本机已退出" : message
+        let text = message.isEmpty ? "登录状态已失效，请重新登录" : message
         clear()
         NotificationCenter.default.post(
             name: deviceKickedNotification,
@@ -146,6 +162,25 @@ enum APIClient {
         let message: String
         var errorDescription: String? { message }
     }
+
+    /// 这些 code 表示"这枚令牌已经不能再用"，而不是"这次操作没权限"。
+    /// 与服务端 auth.js 的 verifyToken / attachUser 一一对应，
+    /// 新增 code 时两边要一起改。
+    ///
+    /// 两个刻意不收的：
+    ///   · `LOGIN_REQUIRED`（会议仅限企业成员）——访客点进企业会议也会收到它，
+    ///     清会话会把本来正常的登录态一起打掉；
+    ///   · `FORBIDDEN` —— 只是这一次操作越权，账号本身还有效。
+    private static let sessionInvalidCodes: Set<String> = [
+        "DEVICE_KICKED",
+        "BAD_TOKEN",
+        "STALE_TOKEN",
+        "NO_TOKEN",
+        "NO_USER",
+        "DISABLED",
+        "PENDING",
+        "REJECTED",
+    ]
 
     /// 登录。成功返回会话（token + 用户信息），失败返回服务端文案或网络提示。
     /// 注意：任何情况下都不在客户端校验账号格式——服务端是唯一事实源，
@@ -388,6 +423,58 @@ enum APIClient {
         }
     }
 
+    /// 更新账号显示名。
+    ///
+    /// 之前首页"编辑资料"只写本地 UserProfile，服务端 users.name 没动；
+    /// 用户改完昵称、退出再登录，LoginView 用服务端 user.name 回填，
+    /// 名字又变回旧的——用户会认为"保存根本没生效"。
+    /// 这个接口只改姓名；头像色是设备偏好，仍留在本地。
+    static func updateProfile(
+        name: String,
+        token: String,
+        completion: @escaping (Result<AuthSession, Error>) -> Void
+    ) {
+        let url = TianqiongAPI.baseURL.appendingPathComponent("auth/profile")
+
+        request(url: url, method: "PATCH", token: token, body: ["name": name]) { result in
+            switch result {
+            case .failure(let error):
+                completion(.failure(error))
+
+            case .success(let json):
+                guard
+                    let user = json["user"] as? [String: Any],
+                    let updatedName = user["name"] as? String
+                else {
+                    completion(.failure(APIError(message: "资料已提交，但响应格式异常")))
+                    return
+                }
+
+                // 只有"请求发出时的会话仍然是当前会话"才写回。
+                // 否则会出现两种坏状态：请求在飞的时候被其他设备踢掉，回来却把
+                // 会话重新写了回去（界面显示已登录，设备信息全是空的）；
+                // 或者期间换了账号，旧账号的昵称盖掉了新账号。
+                guard let current = AuthStore.load(), current.token == token else {
+                    completion(.failure(APIError(message: "登录状态已变更，请重新登录后再试")))
+                    return
+                }
+
+                let session = AuthSession(
+                    token: current.token,
+                    name: updatedName,
+                    account: (user["account"] as? String) ?? current.account,
+                    role: (user["role"] as? String) ?? current.role,
+                    deviceName: current.deviceName,
+                    devicePlatform: current.devicePlatform,
+                    deviceLoginAt: current.deviceLoginAt,
+                    deviceId: current.deviceId
+                )
+                AuthStore.save(session)
+                completion(.success(session))
+            }
+        }
+    }
+
     /// 静默校验当前令牌还能不能用。
     ///
     /// 单设备登录上线后，本地存在 token 不等于还在线：账号可能在别处登录过。
@@ -445,16 +532,33 @@ enum APIClient {
                     return
                 }
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-                if let message = json["error"] as? String {
-                    // 单设备登录：服务端把旧设备的请求判为 DEVICE_KICKED。
-                    // 这里必须顺手清掉本地会话，否则界面还挂着头像，
-                    // 但每个接口都在 401——用户只会觉得"软件坏了"。
-                    if statusCode == 401, (json["code"] as? String) == "DEVICE_KICKED" {
-                        AuthStore.handleDeviceKicked(message: message, token: token)
+                let message = json["error"] as? String
+
+                // 会话失效：清本地登录态并让首页退回入会页。
+                //
+                // 只对"带着凭据发出的请求"生效：登录/注册这类请求本身不带 token，
+                // 它们的 401 是"账号密码不对"，不是"当前会话失效"。
+                // 已登录用户去登录另一个账号时若也走这条分支，会把现有会话误清掉。
+                if statusCode == 401 || statusCode == 403,
+                   let sentToken = token, !sentToken.isEmpty {
+                    let code = json["code"] as? String ?? ""
+                    if Self.sessionInvalidCodes.contains(code) {
+                        AuthStore.handleSessionInvalid(message: message ?? "", token: sentToken)
                     }
+                }
+
+                if let message = message, !message.isEmpty {
                     completion(.failure(APIError(message: message)))
                     return
                 }
+
+                // 非 2xx 又没有 error 字段：绝不能当成功返回，
+                // 否则调用方会拿一个空 JSON 当数据，最后表现为"页面空白但没有报错"。
+                guard (200...299).contains(statusCode) else {
+                    completion(.failure(APIError(message: "服务暂时不可用（\(statusCode)），请稍后再试")))
+                    return
+                }
+
                 completion(.success(json))
             }
         }.resume()

@@ -31,41 +31,74 @@ struct MeetingHistoryItem: Identifiable, Codable {
     }
 }
 
-/// JSON 存 UserDefaults。最多 20 条：首页只展示最近一小段，
-/// 更早的记录对用户没有价值，反而让首次解码变慢。
+/// JSON 存 UserDefaults，**按账号分键**。
+///
+/// 之前所有账号共用 `tianqiong.meetingHistory`：单设备登录下，
+/// A 退出、B 登录后，B 在首页就能看到 A 开过的会和会议号。
+/// 历史里包含"谁在什么时候和谁开会"，属于账号数据，不能跨账号泄漏。
+///
+/// 访客记录单独一档：访客页不展示历史，登录后也不该把访客记录混进账号历史。
 enum MeetingHistoryStore {
 
     private static let storageKey = "tianqiong.meetingHistory"
     private static let limit = 20
 
-    static func load() -> [MeetingHistoryItem] {
-        guard let data = UserDefaults.standard.data(forKey: storageKey) else { return [] }
+    static func load(account: String) -> [MeetingHistoryItem] {
+        let storageKeyForAccount = key(for: account)
+        migrateLegacyIfNeeded(to: storageKeyForAccount, account: account)
+
+        guard let data = UserDefaults.standard.data(forKey: storageKeyForAccount) else { return [] }
         return (try? JSONDecoder().decode([MeetingHistoryItem].self, from: data)) ?? []
     }
 
     /// 新记录置顶；同 id 先移除，保证重复调用不会产生重复行。
-    static func add(_ item: MeetingHistoryItem) {
-        var items = load()
+    static func add(_ item: MeetingHistoryItem, account: String) {
+        var items = load(account: account)
         items.removeAll { $0.id == item.id }
         items.insert(item, at: 0)
         if items.count > limit {
             items = Array(items.prefix(limit))
         }
-        persist(items)
+        persist(items, account: account)
     }
 
-    static func remove(id: String) {
-        var items = load()
+    static func remove(id: String, account: String) {
+        var items = load(account: account)
         items.removeAll { $0.id == id }
-        persist(items)
+        persist(items, account: account)
     }
 
-    static func clear() {
+    static func clear(account: String) {
+        UserDefaults.standard.removeObject(forKey: key(for: account))
+    }
+
+    // MARK: - 私有
+
+    /// 旧版本只有一个全局键。升级后首次以登录账号进入时，
+    /// 把这份数据迁到该账号名下，避免用户以为"历史全没了"。
+    ///
+    /// 只在 account 非空时迁移：访客先打开 App 的话，
+    /// 把旧数据落到 guest 档会让真正的主人登录后看不到。
+    private static func migrateLegacyIfNeeded(to key: String, account: String) {
+        guard !account.isEmpty else { return }
+        guard UserDefaults.standard.data(forKey: key) == nil else { return }
+        guard let legacy = UserDefaults.standard.data(forKey: storageKey) else { return }
+
+        UserDefaults.standard.set(legacy, forKey: key)
         UserDefaults.standard.removeObject(forKey: storageKey)
     }
 
-    private static func persist(_ items: [MeetingHistoryItem]) {
+    private static func key(for account: String) -> String {
+        let normalized = account
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        guard !normalized.isEmpty else { return storageKey + ".guest" }
+        return storageKey + "." + normalized
+    }
+
+    private static func persist(_ items: [MeetingHistoryItem], account: String) {
         guard let data = try? JSONEncoder().encode(items) else { return }
-        UserDefaults.standard.set(data, forKey: storageKey)
+        UserDefaults.standard.set(data, forKey: key(for: account))
     }
 }

@@ -205,6 +205,12 @@ struct ScreenShareStage: View {
             )
             .ignoresSafeArea()
         )
+        // 本机共享没有缩放容器，点击恢复控件只能自己接。
+        // 顶栏"收起控件"之后，这张卡是画面上唯一还能点的东西。
+        .contentShape(Rectangle())
+        .onTapGesture {
+            toggleChrome()
+        }
     }
 
     // MARK: - 接收中占位
@@ -244,6 +250,11 @@ struct ScreenShareStage: View {
         }
         .padding(.horizontal, 32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // 接收中的占位卡同样需要"点一下恢复控件"的逃生口。
+        .contentShape(Rectangle())
+        .onTapGesture {
+            toggleChrome()
+        }
     }
 
     // MARK: - 浮层

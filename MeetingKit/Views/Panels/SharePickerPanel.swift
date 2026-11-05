@@ -350,7 +350,7 @@ struct SharePickerPanel: View {
             return
         }
 
-        let link = "\(TianqiongAPI.origin.absoluteString)/room?no=\(number)"
+        let link = TianqiongAPI.roomLink(number: number)
         UIPasteboard.general.string = link
         Haptics.impact(.light)
         viewModel.showToast(

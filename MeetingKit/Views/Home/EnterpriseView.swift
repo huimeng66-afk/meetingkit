@@ -101,9 +101,9 @@ struct EnterpriseView: View {
                     }
                     .padding(.horizontal, pagePadding)
                     .padding(.top, insets.top + 8)
-                    // 悬浮 Dock 实际占位 86，再留出呼吸位；110 能保证最后一张卡
-                    // 滚到底时完整露出，不被 Dock 压住。
-                    .padding(.bottom, 110 + insets.bottom)
+                    // 悬浮 Dock 实际占位 58 + 10 + 安全区；120 是"刚好露出最后一行
+                    // 再加两指呼吸"的值。少算会卡在玻璃块边缘，像被裁掉。
+                    .padding(.bottom, 120 + insets.bottom)
                 }
                 // GeometryReader 里的子视图从屏幕原点开始，手动吃安全区，
                 // 顶部留白已经由 insets.top + 8 显式给过。
@@ -1188,17 +1188,17 @@ struct EnterpriseView: View {
 
         let trimmedTitle = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // 列表接口不返回 isHost，只能用主持人姓名与本机昵称比对。
-        // 重名时可能误判，但"误判成主持人"会多出结束会议这类危险操作，
-        // 所以只接受完全相等，其余一律按参会人处理。
-        let isHost = !item.hostName.isEmpty && item.hostName == router.profile.displayName
-
+        // 列表接口不返回 isHost。这里一律按参会人入会，真实角色由会议室里的
+        // participants 快照回灌（MeetingViewModel 已在快照里比对 role == .host）。
+        //
+        // 曾经用"主持人姓名 == 本机昵称"来猜，重名时会把普通成员判成主持人，
+        // 让他一进会就看到"结束会议"——多给权限比晚一秒显示权限危险得多。
         onEnterRoom(
             JoinInfo(
                 meetingNumber: item.no,
                 title: trimmedTitle.isEmpty ? "企业会议" : trimmedTitle,
                 displayName: router.profile.displayName,
-                isHost: isHost,
+                isHost: false,
                 token: AuthStore.load()?.token ?? ""
             )
         )

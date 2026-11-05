@@ -37,29 +37,26 @@ struct SettingsPanel: View {
 
                     rowDivider
 
-                    toggleRow(
+                    unavailableRow(
                         symbol: SymbolCompat.name("person.crop.rectangle", "person.crop.square"),
                         title: "虚拟背景",
-                        subtitle: "模糊或替换背景",
-                        isOn: virtualBackgroundBinding
+                        subtitle: "需要视频帧分割，尚未接入"
                     )
 
                     rowDivider
 
-                    toggleRow(
+                    unavailableRow(
                         symbol: SymbolCompat.name("wand.and.stars", "sparkles"),
                         title: "美颜",
-                        subtitle: "轻度磨皮与提亮",
-                        isOn: beautyBinding
+                        subtitle: "需要 GPU 滤镜链，尚未接入"
                     )
 
                     rowDivider
 
-                    toggleRow(
+                    unavailableRow(
                         symbol: SymbolCompat.name("waveform", "waveform.path"),
                         title: "降噪",
-                        subtitle: "抑制键盘与环境噪声",
-                        isOn: noiseBinding
+                        subtitle: "需要音频处理模块，尚未接入"
                     )
                 }
                 .padding(.horizontal, Theme.Metrics.horizontal)
@@ -82,7 +79,7 @@ struct SettingsPanel: View {
 
                 groupTitle("关于")
                 groupCard {
-                    infoRow(title: "版本", value: "1.0.0")
+                    infoRow(title: "版本", value: appVersion)
                     rowDivider
                     infoRow(title: "会议号", value: viewModel.formattedMeetingNumber)
                 }
@@ -156,39 +153,25 @@ struct SettingsPanel: View {
 
     // MARK: - 行
 
-    /// 三个画面开关在 ViewModel 里是 private(set)，视图不能直接写；
-    /// 这里做只读 get + 调用 toggle 的 set，既保留 Toast，也不扩大 ViewModel 的写入口。
-    private var virtualBackgroundBinding: Binding<Bool> {
-        Binding(
-            get: { viewModel.isVirtualBackgroundOn },
-            set: { enabled in
-                if enabled != viewModel.isVirtualBackgroundOn {
-                    viewModel.toggleVirtualBackground()
-                }
-            }
-        )
-    }
-
-    private var beautyBinding: Binding<Bool> {
-        Binding(
-            get: { viewModel.isBeautyOn },
-            set: { enabled in
-                if enabled != viewModel.isBeautyOn {
-                    viewModel.toggleBeauty()
-                }
-            }
-        )
-    }
-
-    private var noiseBinding: Binding<Bool> {
-        Binding(
-            get: { viewModel.isNoiseSuppressionOn },
-            set: { enabled in
-                if enabled != viewModel.isNoiseSuppressionOn {
-                    viewModel.toggleNoiseSuppression()
-                }
-            }
-        )
+    /// 未接入的能力只展示、不给开关。
+    /// 之前这里是三枚真实 Toggle，点一下会弹"已开启"，但画面与声音毫无变化——
+    /// 比灰掉更糟，用户会以为是自己不会用。
+    private func unavailableRow(
+        symbol: String,
+        title: String,
+        subtitle: String
+    ) -> some View {
+        rowContent(symbol: symbol, title: title, subtitle: subtitle) {
+            Text("即将上线")
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundColor(Theme.Palette.textTertiary)
+                .padding(.horizontal, 8)
+                .frame(height: 22)
+                .background(Capsule().fill(Color.white.opacity(0.06)))
+        }
+        .opacity(0.6)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title)，即将上线")
     }
 
     private func actionRow(
@@ -283,6 +266,19 @@ struct SettingsPanel: View {
             .fill(Theme.Palette.hairline)
             .frame(height: 1)
             .padding(.leading, 54)
+    }
+
+    /// 版本号必须从 Bundle 读。上一版写死 "1.0.0"，
+    /// 包已经到 1.2.0 了，用户在会中看到的还是 1.0.0——排查问题时会被这条假信息带偏。
+    private var appVersion: String {
+        let short = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let build = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let short = short, !short.isEmpty else { return "1.0.0" }
+        guard let build = build, !build.isEmpty else { return short }
+        return "\(short) (\(build))"
     }
 }
 

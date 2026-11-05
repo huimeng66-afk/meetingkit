@@ -76,8 +76,8 @@ struct SettingsView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, pagePadding)
                 .padding(.top, topInset + 8)
-                // 悬浮 Dock 实际占位 56 + 10，再留足呼吸位，
-                // 保证"恢复默认设置"滚到底时不会被胶囊压住。
+                // 悬浮 Dock 实际占位 58 + 10，再留足呼吸位，
+                // 保证"恢复默认设置"滚到底时不会被玻璃块压住。
                 .padding(.bottom, 150 + bottomInset)
             }
 

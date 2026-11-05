@@ -34,6 +34,11 @@ struct HomeTabBar: View {
     /// 重复点击当前 tab：宿主用它把列表滚回顶部（系统 tab bar 的既定行为）。
     var onReselect: (HomeTab) -> Void = { _ in }
 
+    /// 是否显示右侧的"发起会议"圆钮。
+    /// 通讯录/企业/设置页没有"在这里开会"的上下文，
+    /// 全局常驻会让用户在别人的企业页里误触，所以由宿主按 tab 决定。
+    var showsStartMeeting: Bool = true
+
     /// 右侧圆形主操作。
     var onStartMeeting: () -> Void = {}
 
@@ -47,9 +52,13 @@ struct HomeTabBar: View {
                     item(tab)
                 }
 
-                startMeetingButton
-                    .padding(.leading, 2)
+                if showsStartMeeting {
+                    startMeetingButton
+                        .padding(.leading, 2)
+                        .transition(.scale.combined(with: .opacity))
+                }
             }
+            .animationCompat(Theme.Motion.standard, value: showsStartMeeting)
         }
         .padding(.horizontal, 14)
         .padding(.bottom, bottomInset + 10)

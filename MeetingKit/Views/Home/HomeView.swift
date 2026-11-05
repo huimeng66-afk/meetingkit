@@ -56,6 +56,12 @@ struct HomeView: View {
     /// 被服务端踢下线时的原因。非 nil 就弹一次系统 alert。
     @State private var kickedMessage: String?
 
+    /// 清空历史前的二次确认。历史是本地唯一一份记录，误触无法恢复。
+    @State private var isConfirmingClearHistory = false
+
+    /// 资料保存中。服务端改名是一次网络请求，重复点击会发出两次 PATCH。
+    @State private var isSavingProfile = false
+
     /// GeometryReader 不会为键盘自动上移，资料卡的昵称输入需要自己抬起来。
     @State private var keyboardHeight: CGFloat = 0
 
@@ -102,6 +108,7 @@ struct HomeView: View {
                         onReselect: { _ in
                             scrollTopToken += 1
                         },
+                        showsStartMeeting: tab == .meetings,
                         onStartMeeting: {
                             startMeetingFromHome()
                         }
@@ -111,12 +118,19 @@ struct HomeView: View {
                         profileEditor(bottomInset: insets.bottom)
                     }
 
+                    if isConfirmingClearHistory {
+                        clearHistoryDialog
+                            .transition(.opacity)
+                            .zIndex(20)
+                    }
+
                     sidebarLayer(insets: insets, width: drawerWidth)
                 }
 
                 toastLayer(
                     bottomInset: insets.bottom,
-                    extraBottom: session == nil ? 24 : 140
+                    // 访客页没有底栏，但键盘弹起时 Toast 不能压在键盘下面。
+                    extraBottom: session == nil ? 24 + keyboardHeight : 140
                 )
 
                 // 登录页用窗口内浮层，不用 `.sheet`。
@@ -396,13 +410,14 @@ struct HomeView: View {
                     }
                     .padding(.horizontal, pagePadding)
                     .padding(.top, insets.top + 8)
-                    // 底部占位 = 导航条 56 + 发起会议按钮 52 + 两段 16 间距。
-                    // 少算任何一截，最后一行历史都会被按钮压住。
+                    // 底部占位 = 悬浮导航 58 + 距底 10 + 呼吸位。
+                    // 导航是悬浮块，不再是一条通栏，所以这里要比"56 + 52"时代多留一点，
+                    // 否则最后一行历史会从玻璃块下面露出一半。
                     //
                     // 首页有两个输入框，键盘弹起时必须能把「加入会议」顶上来：
                     // 根视图整棵忽略了键盘安全区（否则底栏会被顶到键盘上方），
                     // 所以这里手动把键盘高度补进滚动内容底部。
-                    .padding(.bottom, 140 + insets.bottom + keyboardHeight)
+                    .padding(.bottom, 150 + insets.bottom + keyboardHeight)
                     .id(Self.scrollTopID)
                 }
                 // 手动吃安全区：GeometryReader 里的子视图从屏幕原点开始，
@@ -583,7 +598,13 @@ struct HomeView: View {
     }
 
     private func selectTab(_ target: HomeTab) {
-        guard tab != target else { return }
+        guard tab != target else {
+            // 重选当前 tab = 回到顶部，与底部导航的重选行为保持一致。
+            // 侧边栏以前在相同 tab 上直接 return，用户点了"会议"却停在列表中间。
+            scrollTopToken += 1
+            return
+        }
+
         Keyboard.dismiss()
         withAnimation(Theme.Motion.standard) {
             tab = target
@@ -627,10 +648,8 @@ struct HomeView: View {
             .zIndex(40)
     }
 
-    // MARK: - 发起会议悬浮入口
+    // MARK: - Toast 图标
 
-    /// 对齐网页端 `.mobile-fab`：右下角 52pt 圆形，压在导航条上方 16pt。
-    /// 只在会议页出现——其它页面没有"在这里开会"的上下文。
     /// toast 只有文案和样式，图标按语义给一个默认值。
     /// 让上层传图标会让每个调用点多一个必填参数，收益远小于噪音。
     private func toastIcon(for style: ToastStyle) -> String {
@@ -771,7 +790,9 @@ struct HomeView: View {
             .lineLimit(1)
             .minimumScaleFactor(0.8)
 
-            Text("输入会议号即可入会，支持屏幕共享与实时字幕。")
+            // 只写已经能用的能力。"实时字幕"在工程里没有实现，
+            // 把没做的功能写进首屏文案，用户第一次找不到就会认定整页都在吹。
+            Text("输入会议号即可入会，支持屏幕共享与实时聊天。")
                 .font(.system(size: 13))
                 .foregroundColor(Theme.Palette.ink2)
         }
@@ -1066,7 +1087,8 @@ struct HomeView: View {
 
             VStack(alignment: .leading, spacing: 7) {
                 startTip("支持屏幕共享与全员静音")
-                startTip("企业账号可预约会议并邀请成员")
+                // "预约会议"没有实现，不要写在卖点里。
+                startTip("企业账号可使用专属会议室")
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 2)
@@ -1208,7 +1230,14 @@ struct HomeView: View {
                     meetingNumber: item.number,
                     title: item.title,
                     displayName: router.profile.displayName,
-                    isHost: false
+                    isHost: false,
+                    avatarColorIndex: router.profile.avatarColorIndex,
+                    // 历史入口也要沿用首页的音频/视频预置。
+                    // 不传的话会落到 JoinInfo 的默认值（麦克风开、摄像头关），
+                    // 用户在设置里关掉的默认麦克风从历史进来又会被悄悄打开。
+                    micOn: isMicOn,
+                    cameraOn: isCameraOn,
+                    token: session?.token ?? ""
                 )
             )
         } label: {
@@ -1479,7 +1508,7 @@ struct HomeView: View {
             showToast("请先发起或加入一个会议", icon: "calendar")
             return
         }
-        let link = "\(TianqiongAPI.origin.absoluteString)/room?no=\(latest.number)"
+        let link = TianqiongAPI.roomLink(number: latest.number)
         UIPasteboard.general.string = link
         showToast("邀请链接已复制", icon: "link", style: .success)
     }
@@ -1660,17 +1689,27 @@ struct HomeView: View {
                 Button {
                     saveProfile()
                 } label: {
-                    Text("保存")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundColor(.white)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 50)
-                        .background(
-                            RoundedRectangle(cornerRadius: Theme.Metrics.buttonRadius, style: .continuous)
-                                .fill(Theme.Palette.brandGradient)
-                        )
+                    HStack(spacing: 8) {
+                        if isSavingProfile {
+                            ProgressView()
+                                .progressViewStyle(CircularProgressViewStyle(tint: Color.white))
+                                .scaleEffect(0.85)
+                        }
+
+                        Text(isSavingProfile ? "保存中…" : "保存")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundColor(.white)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 50)
+                    .background(
+                        RoundedRectangle(cornerRadius: Theme.Metrics.buttonRadius, style: .continuous)
+                            .fill(Theme.Palette.brandGradient)
+                    )
+                    .opacity(isSavingProfile ? 0.85 : 1.0)
                 }
                 .buttonStyle(BrandPressStyle())
+                .disabled(isSavingProfile)
                 .padding(.top, 2)
             }
             .padding(.horizontal, pagePadding)
@@ -1722,18 +1761,88 @@ struct HomeView: View {
     }
 
     private func saveProfile() {
-        router.updateProfile(displayName: draftName, avatarColorIndex: draftColor)
-        dismissProfileEditor()
-        showToast("资料已保存", icon: "checkmark.circle.fill", style: .success)
+        guard !isSavingProfile else { return }
+
+        let trimmed = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 服务端 /auth/profile 要求姓名至少 2 个字。先拦一次，
+        // 免得用户等一次网络往返才看到"姓名至少 2 个字"。
+        guard trimmed.count >= 2 else {
+            showToast(
+                "昵称至少需要 2 个字",
+                icon: "person.crop.circle.badge.exclamationmark",
+                style: .warning
+            )
+            Haptics.notify(.warning)
+            return
+        }
+
+        // 访客（理论上打不开这个面板）只写本地，不发请求。
+        guard let current = AuthStore.load(), !current.token.isEmpty else {
+            router.updateProfile(displayName: trimmed, avatarColorIndex: draftColor)
+            dismissProfileEditor()
+            showToast("资料已保存", icon: "checkmark.circle.fill", style: .success)
+            return
+        }
+
+        isSavingProfile = true
+        APIClient.updateProfile(name: trimmed, token: current.token) { result in
+            self.isSavingProfile = false
+
+            switch result {
+            case .success(let updated):
+                // 服务端是昵称的唯一事实源：它可能截断超长名字。
+                // 本地用返回值而不是 draftName，避免两个地方显示不同长度。
+                self.session = updated
+                self.router.updateProfile(
+                    displayName: updated.name,
+                    avatarColorIndex: self.draftColor
+                )
+                self.dismissProfileEditor()
+                self.showToast("资料已保存", icon: "checkmark.circle.fill", style: .success)
+
+            case .failure(let error):
+                let message = (error as? APIClient.APIError)?.message
+                    ?? "保存失败，请检查网络后重试"
+                self.showToast(message, icon: "exclamationmark.triangle.fill", style: .danger)
+                Haptics.notify(.error)
+            }
+        }
     }
 
     // MARK: - 动作
 
+    /// 清空历史必须二次确认。
+    /// 之前点一下就把 20 条记录全删了，而这个列表里没有撤销入口，
+    /// 误触之后用户唯一能做的就是再开一次会。
+    private var clearHistoryDialog: some View {
+        GlassConfirmDialog(
+            title: "清空历史会议？",
+            message: "将删除本机保存的 \(router.history.count) 条会议记录，此操作无法撤销。",
+            confirmTitle: "清空",
+            isDestructive: true,
+            onConfirm: {
+                withAnimation(Theme.Motion.standard) {
+                    isConfirmingClearHistory = false
+                }
+                Haptics.impact(.medium)
+                router.clearHistory()
+                showToast("历史记录已清空", icon: "trash", style: .info)
+            },
+            onCancel: {
+                withAnimation(Theme.Motion.standard) {
+                    isConfirmingClearHistory = false
+                }
+            }
+        )
+    }
+
     private func clearHistory() {
         guard !router.history.isEmpty else { return }
-        Haptics.impact(.medium)
-        router.clearHistory()
-        showToast("历史记录已清空", icon: "trash", style: .info)
+        Haptics.impact(.light)
+        withAnimation(Theme.Motion.standard) {
+            isConfirmingClearHistory = true
+        }
     }
 
     // MARK: - 派生

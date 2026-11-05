@@ -74,30 +74,6 @@ struct MorePanel: View {
                 }
 
                 MoreActionTile(
-                    title: "虚拟背景",
-                    systemImage: SymbolCompat.name("person.crop.rectangle", "person.crop.square"),
-                    isOn: viewModel.isVirtualBackgroundOn
-                ) {
-                    viewModel.toggleVirtualBackground()
-                }
-
-                MoreActionTile(
-                    title: "美颜",
-                    systemImage: SymbolCompat.name("wand.and.stars", "sparkles"),
-                    isOn: viewModel.isBeautyOn
-                ) {
-                    viewModel.toggleBeauty()
-                }
-
-                MoreActionTile(
-                    title: "降噪",
-                    systemImage: SymbolCompat.name("waveform", "waveform.path"),
-                    isOn: viewModel.isNoiseSuppressionOn
-                ) {
-                    viewModel.toggleNoiseSuppression()
-                }
-
-                MoreActionTile(
                     title: "翻转",
                     systemImage: SymbolCompat.name("arrow.triangle.2.circlepath", "arrow.clockwise"),
                     isOn: nil
@@ -113,11 +89,44 @@ struct MorePanel: View {
                     viewModel.openPanel(.settings)
                 }
 
+                // 以下四项尚未接入。统一排在网格最后并标注"即将上线"：
+                // 可用功能与灰色功能交错排列时，用户会以为软件一半是坏的。
+                MoreActionTile(
+                    title: "虚拟背景",
+                    systemImage: SymbolCompat.name("person.crop.rectangle", "person.crop.square"),
+                    isOn: nil,
+                    isDisabled: true,
+                    caption: "即将上线"
+                ) {
+                    // 虚拟背景需要视频帧分割，尚未接入；禁用而不是假装生效。
+                }
+
+                MoreActionTile(
+                    title: "美颜",
+                    systemImage: SymbolCompat.name("wand.and.stars", "sparkles"),
+                    isOn: nil,
+                    isDisabled: true,
+                    caption: "即将上线"
+                ) {
+                    // 美颜需要 GPU 滤镜链，尚未接入。
+                }
+
+                MoreActionTile(
+                    title: "降噪",
+                    systemImage: SymbolCompat.name("waveform", "waveform.path"),
+                    isOn: nil,
+                    isDisabled: true,
+                    caption: "即将上线"
+                ) {
+                    // 降噪需要在音频处理模块里开关 NS，尚未接入。
+                }
+
                 MoreActionTile(
                     title: "录制",
                     systemImage: SymbolCompat.name("record.circle", "smallcircle.filled.circle"),
-                    isOn: viewModel.isRecording,
-                    isDisabled: true
+                    isOn: nil,
+                    isDisabled: true,
+                    caption: "即将上线"
                 ) {
                     // 云录制尚未接入服务端，禁用并标注"即将上线"，避免假开关误导用户。
                 }
@@ -186,7 +195,7 @@ struct MorePanel: View {
         .opacity(viewModel.canEndMeeting ? 1.0 : 0.4)
         .padding(.horizontal, Theme.Metrics.horizontal)
         .padding(.bottom, Theme.Metrics.space2)
-        .accessibilityLabel("结束会议")
+        .accessibilityLabel(viewModel.isCurrentUserHost ? "结束会议" : "离开会议")
     }
 }
 
@@ -202,6 +211,10 @@ struct MoreActionTile: View {
 
     /// 未接入的功能（录制等）置灰禁用。
     var isDisabled: Bool = false
+
+    /// 禁用原因。只给禁用项用，例如"即将上线"。
+    /// 只置灰不解释，用户会反复点，最后当成"软件坏了"。
+    var caption: String? = nil
 
     var action: () -> Void
 
@@ -237,14 +250,21 @@ struct MoreActionTile: View {
                     .foregroundColor(Theme.Palette.textSecondary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
+
+                if let caption = caption {
+                    Text(caption)
+                        .font(.system(size: 9))
+                        .foregroundColor(Theme.Palette.textTertiary)
+                        .lineLimit(1)
+                }
             }
             .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
         }
         .buttonStyle(ControlButtonPressStyle())
         .disabled(isDisabled)
-        .opacity(isDisabled ? 0.45 : 1.0)
-        .accessibilityLabel(title)
+        .opacity(isDisabled ? 0.55 : 1.0)
+        .accessibilityLabel(caption.map { "\(title)，\($0)" } ?? title)
     }
 }
 

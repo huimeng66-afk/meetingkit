@@ -10,6 +10,7 @@
 //  也避开了 iOS 16 才有的导航栈容器。
 //
 
+import Combine
 import Foundation
 import SwiftUI
 
@@ -34,10 +35,36 @@ final class AppRouter: ObservableObject {
     private var roomEnteredAt: Date?
     /// 本次进会议室是否真正连上过会议（由 MeetingRoomView 确认）。
     private var roomJoinConfirmed = false
+    /// 当前历史数据属于哪个账号。历史按账号分键存储，换号必须重新载入。
+    private var historyAccount: String = ""
+    /// 登录 / 退出时同步切换历史。首页是常驻视图，不能等它 onAppear 再补。
+    private var authObserver: AnyCancellable?
 
     init() {
+        let account = AuthStore.load()?.account ?? ""
+        historyAccount = account
         profile = UserProfileStore.load()
-        history = MeetingHistoryStore.load()
+        history = MeetingHistoryStore.load(account: account)
+
+        authObserver = NotificationCenter.default
+            .publisher(for: AuthStore.didChangeNotification)
+            .sink { [weak self] _ in
+                // 通知的投递线程跟着写入方走；显式回主线程再改 @Published，
+                // 避免后台线程写 history 触发 SwiftUI 的运行时警告。
+                Task { @MainActor in
+                    self?.reloadHistoryForCurrentAccount()
+                }
+            }
+    }
+
+    /// 账号变化时把历史切到新账号名下。
+    /// 只比对 account：改昵称、换头像色同样会触发登录态通知，不该重载历史。
+    private func reloadHistoryForCurrentAccount() {
+        let account = AuthStore.load()?.account ?? ""
+        guard account != historyAccount else { return }
+
+        historyAccount = account
+        history = MeetingHistoryStore.load(account: account)
     }
 
     // MARK: 路由动作
@@ -81,13 +108,23 @@ final class AppRouter: ObservableObject {
 
     // MARK: 历史维护
 
+    /// 历史读写永远以"此刻登录的账号"为准，而不是上面那个缓存值。
+    ///
+    /// `historyAccount` 只用于"账号是否变了"的比对；登录通知经 `Task` 回到主线程，
+    /// 与"刚登录就开会并结束"之间存在极短窗口。用缓存值会把这唯一一条记录
+    /// 写进上一个账号（甚至访客档）里，用户看到的就是"这次会议没记上"。
+    private var currentHistoryAccount: String {
+        AuthStore.load()?.account ?? ""
+    }
+
     func removeHistory(id: String) {
-        MeetingHistoryStore.remove(id: id)
-        history = MeetingHistoryStore.load()
+        let account = currentHistoryAccount
+        MeetingHistoryStore.remove(id: id, account: account)
+        history = MeetingHistoryStore.load(account: account)
     }
 
     func clearHistory() {
-        MeetingHistoryStore.clear()
+        MeetingHistoryStore.clear(account: currentHistoryAccount)
         history = []
     }
 
@@ -122,8 +159,9 @@ final class AppRouter: ObservableObject {
             startedAt: startedAt,
             duration: Date().timeIntervalSince(startedAt)
         )
-        MeetingHistoryStore.add(item)
-        history = MeetingHistoryStore.load()
+        let account = currentHistoryAccount
+        MeetingHistoryStore.add(item, account: account)
+        history = MeetingHistoryStore.load(account: account)
     }
 }
 

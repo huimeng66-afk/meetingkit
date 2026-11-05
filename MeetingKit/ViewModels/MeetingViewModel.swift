@@ -42,10 +42,6 @@ final class MeetingViewModel: ObservableObject {
     @Published private(set) var isCameraOn: Bool = true
     @Published private(set) var isFrontCamera: Bool = true
     @Published private(set) var isHandRaised: Bool = false
-    @Published private(set) var isRecording: Bool = false
-    @Published private(set) var isVirtualBackgroundOn: Bool = false
-    @Published private(set) var isBeautyOn: Bool = false
-    @Published private(set) var isNoiseSuppressionOn: Bool = true
     /// 音频路由：true = 扬声器，false = 听筒。默认外放，与入会后的常规预期一致。
     /// didSet 直接下发 RTC：真实链路改的是 RTCAudioSession 的输出端口。
     @Published var isSpeakerOn: Bool = true {
@@ -270,11 +266,14 @@ final class MeetingViewModel: ObservableObject {
         return participants.first
     }
 
-    /// 只有在会议中（已连上或重连中）才有"结束会议"这个语义。
+    /// 离会/结束按钮是否可点。
+    ///
+    /// 只有已经断开（离会遮罩接管）时才禁用。connecting 卡住时也必须能点：
+    /// 网络慢、信令没握手成功的那几十秒，正是用户最想退出的时刻，
+    /// 这里灰掉等于把人锁在一个进不去也出不来的页面里。
     var canEndMeeting: Bool {
-        if case .connected = connectionState { return true }
-        if case .reconnecting = connectionState { return true }
-        return false
+        if case .disconnected = connectionState { return false }
+        return true
     }
 
     /// 当前入会身份是否是主持人。视图用只读别名判断按钮语义，
@@ -431,50 +430,6 @@ final class MeetingViewModel: ObservableObject {
         rtc.setHandRaised(raised)
         updateLocalParticipant { $0.isHandRaised = raised }
         showToast(.handRaised(raised))
-    }
-
-    func toggleRecording() {
-        isRecording.toggle()
-        showToast(
-            ToastMessage(
-                text: isRecording ? "录制已开始，参会人将收到提示" : "录制已结束",
-                systemImage: isRecording ? "record.circle.fill" : "stop.circle",
-                style: isRecording ? .danger : .info
-            )
-        )
-    }
-
-    func toggleVirtualBackground() {
-        isVirtualBackgroundOn.toggle()
-        showToast(
-            ToastMessage(
-                text: isVirtualBackgroundOn ? "虚拟背景已开启" : "虚拟背景已关闭",
-                systemImage: "person.crop.rectangle",
-                style: .info
-            )
-        )
-    }
-
-    func toggleBeauty() {
-        isBeautyOn.toggle()
-        showToast(
-            ToastMessage(
-                text: isBeautyOn ? "美颜已开启" : "美颜已关闭",
-                systemImage: "wand.and.stars",
-                style: .info
-            )
-        )
-    }
-
-    func toggleNoiseSuppression() {
-        isNoiseSuppressionOn.toggle()
-        showToast(
-            ToastMessage(
-                text: isNoiseSuppressionOn ? "降噪已开启" : "降噪已关闭",
-                systemImage: "waveform",
-                style: .info
-            )
-        )
     }
 
     // MARK: - 聊天
@@ -679,6 +634,10 @@ final class MeetingViewModel: ObservableObject {
         activePanel = nil
         isChromeVisible = true
         isLocked = false
+        // 主持人身份必须一起复位。不清的话，主持人结束会议后立刻以参会者身份
+        // 进别人的会，会有一小段时间仍看到"结束会议"和成员管理入口，
+        // 直到服务端快照回来才纠正——这期间点下去会真的去结束别人的会。
+        isHost = false
         // 共享/举手/喇叭等会内状态一并复位：带着上一场的状态"重新入会"
         // 会出现共享红条、举手高亮等错位。
         isScreenSharing = false

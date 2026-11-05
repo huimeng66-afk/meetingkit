@@ -65,13 +65,12 @@ struct MeetingRoomView: View {
                     bottomInset: insets.bottom
                 )
                 .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    // 点画布切换控件显隐，这是全屏视频会议的标准交互。
-                    withAnimation(Theme.Motion.standard) {
-                        viewModel.isChromeVisible.toggle()
-                    }
-                }
+                // 点击切换控件显隐由画布自己按分支处理：
+                //   非共享 → VideoCanvasView 内部的 SwiftUI tap；
+                //   远端共享 → ZoomingScrollView 的单击（它还要区分双击，外层不能再抢）；
+                //   本机共享/接收中 → ScreenShareStage 的占位卡。
+                // 这里再挂一个外层 onTapGesture，会和内层手势竞争，轻则只响一次、
+                // 重则两次 toggle 相互抵消，表现就是"点画面没反应"。
 
                 chromeLayer(insets: insets)
 

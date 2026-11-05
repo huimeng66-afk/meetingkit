@@ -105,11 +105,6 @@ final class AppSettings: ObservableObject {
         didSet { persist(hapticsEnabled, for: Keys.hapticsEnabled) }
     }
 
-    /// 非主持人离开会议时是否二次确认。
-    @Published var confirmBeforeLeave: Bool {
-        didSet { persist(confirmBeforeLeave, for: Keys.confirmBeforeLeave) }
-    }
-
     // MARK: - 初始化
 
     private init() {
@@ -124,10 +119,6 @@ final class AppSettings: ObservableObject {
             fallback: Defaults.autoHideControlsDuringShare
         )
         hapticsEnabled = Self.readBool(Keys.hapticsEnabled, fallback: Defaults.hapticsEnabled)
-        confirmBeforeLeave = Self.readBool(
-            Keys.confirmBeforeLeave,
-            fallback: Defaults.confirmBeforeLeave
-        )
     }
 
     // MARK: - 重置
@@ -144,7 +135,6 @@ final class AppSettings: ObservableObject {
         shareQuality = Defaults.shareQuality
         autoHideControlsDuringShare = Defaults.autoHideControlsDuringShare
         hapticsEnabled = Defaults.hapticsEnabled
-        confirmBeforeLeave = Defaults.confirmBeforeLeave
     }
 
     // MARK: - 非隔离快照
@@ -165,6 +155,13 @@ final class AppSettings: ObservableObject {
             Keys.autoHideControlsDuringShare,
             fallback: Defaults.autoHideControlsDuringShare
         )
+    }
+
+    /// 共享画质的只读快照。屏幕共享的启动路径在 RTC 层，
+    /// 不在主线程的观察链上；这里直接读 UserDefaults，拿到的一定是设置页刚写入的值。
+    nonisolated static var shareQualitySnapshot: ShareQuality {
+        let raw = UserDefaults.standard.string(forKey: Keys.shareQuality) ?? ""
+        return ShareQuality(rawValue: raw) ?? Defaults.shareQuality
     }
 
     /// 入会默认音视频的只读快照。
@@ -192,7 +189,6 @@ final class AppSettings: ObservableObject {
         static let shareQuality = prefix + "shareQuality"
         static let autoHideControlsDuringShare = prefix + "autoHideControlsDuringShare"
         static let hapticsEnabled = prefix + "hapticsEnabled"
-        static let confirmBeforeLeave = prefix + "confirmBeforeLeave"
     }
 
     /// 默认值的唯一来源：初始化读取与"恢复默认"共用，避免两处各维护一份常量。
@@ -210,9 +206,6 @@ final class AppSettings: ObservableObject {
         static let autoHideControlsDuringShare = true
 
         static let hapticsEnabled = true
-
-        /// 默认不二次确认：离开按钮本身就是一次明确点击，再加弹窗会拖慢正常离会。
-        static let confirmBeforeLeave = false
     }
 
     // MARK: - 读写
