@@ -26,7 +26,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECT_NAME="MeetingKit"
 SCHEME="MeetingKit"
 APP_NAME="MeetingKit"
-TOTAL_STEPS=5
+TOTAL_STEPS=6
 
 CONFIGURATION="Release"
 OUTPUT_PATH=""
@@ -226,3 +226,84 @@ printf '  %s签名%s  未签名（需自行重签）\n' "$C_BOLD" "$C_OFF"
 printf '%s────────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF"
 printf '\n安装：用 Sideloadly / AltStore 打开该 .ipa，填自己的 Apple ID 重签。\n'
 printf '      免费账号 7 天过期；App Groups 能力可能不被免费账号支持。\n\n'
+
+# ---------- [附加] CI 环境：把产物推送到 builds 分支 ----------
+#
+# 为什么是 git push，而不是 Release / Actions Artifact：
+#   使用 fine-grained PAT 时，"Actions" 与 "Contents" 是两套独立权限。
+#   只授权 Contents 的令牌能拉代码、能 push，却完全读不到构建产物
+#   （GET /repositories/{id}/actions/artifacts 直接 403 "Resource not
+#   accessible by personal access token"），也读不到 workflow run。
+#   而 actions/checkout 已经把令牌写进了 git 的 http.extraheader，
+#   所以脚本天然具备 push 能力 —— 把包推到专门的 builds 分支，
+#   取包只需要 clone 这一个分支，与 Actions 权限无关。
+#
+# 为什么用临时 index + commit-tree：
+#   1. 不碰工作区，不影响本步之后的任何逻辑；
+#   2. build/ 一般在 .gitignore 里，常规 git add 根本加不进去，
+#      --cacheinfo 可以绕过 ignore 规则；
+#   3. 造出来的是孤立提交，不带历史，分支每次 force push 即可，
+#      仓库体积不会随构建次数线性增长（旧的 blob 会被 gc）。
+publish_to_builds_branch() {
+    [ -n "${GITHUB_ACTIONS:-}" ] || return 0
+    [ -n "${GITHUB_REF_NAME:-}" ] || return 0
+
+    local version build_number asset_name tmp_index info_file
+    local blob info_blob tree commit branch
+    branch="builds"
+
+    version="$(sed -n 's/.*MARKETING_VERSION: *"\([^"]*\)".*/\1/p' "${PROJECT_ROOT}/project.yml" | head -1)"
+    build_number="$(sed -n 's/.*CURRENT_PROJECT_VERSION: *"\([^"]*\)".*/\1/p' "${PROJECT_ROOT}/project.yml" | head -1)"
+    [ -n "$version" ] || version="dev"
+    [ -n "$build_number" ] || build_number="0"
+
+    asset_name="${APP_NAME}-${version}-unsigned.ipa"
+
+    step 6 "发布产物到 ${branch} 分支"
+
+    tmp_index="$(mktemp -t mk-builds-index)"
+    info_file="$(mktemp -t mk-builds-info)"
+    GIT_INDEX_FILE="$tmp_index" git read-tree --empty
+
+    blob="$(git hash-object -w "$OUTPUT_PATH")"
+    GIT_INDEX_FILE="$tmp_index" git update-index --add --cacheinfo "100644,${blob},${asset_name}"
+
+    cat > "$info_file" <<INFO
+{
+  "app": "${APP_NAME}",
+  "version": "${version}",
+  "build": "${build_number}",
+  "configuration": "${CONFIGURATION}",
+  "asset": "${asset_name}",
+  "size_bytes": ${SIZE_BYTES},
+  "signed": false,
+  "commit": "${GITHUB_SHA:-unknown}",
+  "ref": "${GITHUB_REF_NAME}",
+  "run_id": "${GITHUB_RUN_ID:-unknown}",
+  "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+INFO
+    info_blob="$(git hash-object -w "$info_file")"
+    GIT_INDEX_FILE="$tmp_index" git update-index --add --cacheinfo "100644,${info_blob},build-info.json"
+
+    tree="$(GIT_INDEX_FILE="$tmp_index" git write-tree)"
+    commit="$(GIT_AUTHOR_NAME="MeetingKit CI" GIT_AUTHOR_EMAIL="ci@localhost" \
+              GIT_COMMITTER_NAME="MeetingKit CI" GIT_COMMITTER_EMAIL="ci@localhost" \
+              git commit-tree "$tree" -m "build: ${asset_name} (${GITHUB_SHA:-unknown})")"
+
+    if git push --force origin "${commit}:refs/heads/${branch}" 2>&1; then
+        ok "已推送 ${asset_name} → ${branch} 分支"
+    else
+        rm -f "$tmp_index" "$info_file"
+        die "推送 ${branch} 分支失败，产物无法取回"
+    fi
+
+    rm -f "$tmp_index" "$info_file"
+}
+
+# 非 CI 环境（本地跑）直接跳过，不能把本地出包当成发布。
+# 用 if 而不是 `|| true`：函数放进条件上下文会让 set -e 失效，
+# 里面任何一条命令失败都会被吞掉，最后推上去一个残缺提交。
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    publish_to_builds_branch
+fi
