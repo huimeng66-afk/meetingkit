@@ -520,6 +520,11 @@ final class MeetingViewModel: ObservableObject {
     /// 并给出"复制网页版链接"的兜底路径——决定权交给用户，
     /// 而不是让一次签名能力探测把整个入口吞掉。
     func toggleScreenShare() {
+        // 打开面板的这一刻就试着收掉系统里残留的旧广播：
+        // 用户从开面板到点「开始共享」通常要几秒，足够上一个扩展进程退出。
+        // 等到点按钮时才发，往往来不及——系统会在 picker 上直接弹
+        // "停止与 (null) 共享屏幕？"，那正是旧广播占着位置。
+        shareBridge.disposeStaleBroadcast()
         openPanel(.sharePicker)
     }
 

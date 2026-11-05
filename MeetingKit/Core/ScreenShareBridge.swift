@@ -45,6 +45,10 @@ final class ScreenShareBridge: ObservableObject {
     /// 扩展最后走到的一步（见 `stepDescription`）。nil 表示本次没有启动记录。
     @Published private(set) var extensionStep: String?
 
+    /// 容器里有新帧，但没有任何扩展会话（appGroup 为空）。
+    /// 说明写帧的是系统里残留的上一场广播，不是本次会话。
+    @Published private(set) var staleBroadcastDetected: Bool = false
+
     /// 给提示文案用的"最后一步"人话版本。
     var extensionStepDescription: String? {
         extensionStep.map { ScreenShareDiagnostics.stepDescription($0) }
@@ -174,6 +178,24 @@ final class ScreenShareBridge: ObservableObject {
         DarwinNotifier.post(ScreenShareSignal.stopRequested)
     }
 
+    /// 收掉系统里可能残留的上一场广播。
+    ///
+    /// ReplayKit 在"重装 App / 扩展被强杀"时不会补发 `broadcastFinished`，
+    /// 系统会一直认为有一场共享在跑：控制中心红点不灭，新的扩展收不到
+    /// `broadcastStarted`，于是界面显示"未上报 / idle"，却还能读到旧进程写的帧。
+    ///
+    /// 旧版本的扩展同样监听这个 Darwin 通知名（它由 bundle id 组成，重装后不变），
+    /// 所以一条停止请求就能让残留进程自己走完结束流程。
+    /// 只在确认没在共享时发——正在共享时发出去等于替用户点了停止。
+    func disposeStaleBroadcast() {
+        // 判据只认状态文件里的 state，**不能**用 isBroadcasting：
+        // 后者包含"有没有新鲜帧"，而残留进程恰恰在持续写帧——用它当闸门，
+        // 真正需要清理的时候反而会被拦下来。
+        let state = ScreenShareStore.state
+        guard state != .active, state != .paused else { return }
+        DarwinNotifier.post(ScreenShareSignal.stopRequested)
+    }
+
     /// 用户点"开始共享"、系统面板弹出**之前**调用。
     ///
     /// 做三件事：
@@ -186,6 +208,9 @@ final class ScreenShareBridge: ObservableObject {
     func prepareForNewShare() {
         guard !isBroadcasting else { return }
 
+        /* 残留广播的清理放在**打开面板**那一刻（disposeStaleBroadcast），
+           不放在这里：这里紧接着就要写 requestedAt，而残留进程收到停止请求后
+           会 reset 共享状态，晚一步落盘就会把刚写的 requestedAt 抹掉。 */
         ScreenShareRuntime.reset()
         SharedFrameStore.clear()
         // 黑匣子也要清：否则上一场的"已启动"会被当成本次的启动证据，
@@ -198,6 +223,7 @@ final class ScreenShareBridge: ObservableObject {
         extensionLaunchedAt = nil
         extensionStep = nil
         extensionProbe = nil
+        staleBroadcastDetected = false
         startedAt = nil
         failure = nil
         latestFrame = nil
@@ -242,7 +268,19 @@ final class ScreenShareBridge: ObservableObject {
         // 1.5.4 起还必须晚于 sessionFloor：容器里可能躺着上一场的 JPEG，
         // 它的 mtime 也可能很新（例如扩展被系统杀掉前刚写的一帧），
         // 不加下界就会把一场已经结束的共享重新点亮。
-        let broadcasting = Self.isBroadcasting(state) || hasFreshFrame(since: sessionFloor)
+        //
+        // 1.5.5 再补一条：**有帧 ≠ 我们在共享**。
+        // 重装 App 后系统里可能还挂着一场旧广播，它照样往同一个容器写 JPEG，
+        // 可它的状态文件早就不在了（appGroup 为 nil）。把这种帧当成"正在共享"，
+        // 会让界面卡在"共享中"：停不掉、也开不了新的——正是 1.5.4 真机的死锁态。
+        let extensionReported = Self.isBroadcasting(state)
+        let hasFrame = hasFreshFrame(since: sessionFloor)
+        let staleFrames = hasFrame && !extensionReported && snapshot?.appGroup == nil
+        let broadcasting = extensionReported || (hasFrame && !staleFrames)
+
+        if staleBroadcastDetected != staleFrames {
+            staleBroadcastDetected = staleFrames
+        }
 
         if isBroadcasting != broadcasting {
             isBroadcasting = broadcasting
@@ -404,6 +442,7 @@ final class ScreenShareBridge: ObservableObject {
             videoFramesEncoded: video.framesEncoded,
             screenTrackAttached: video.screenAttached,
             videoStatsSampled: video.sampled,
+            staleBroadcastDetected: staleBroadcastDetected,
             lastError: snapshot?.lastError
         )
     }
@@ -470,6 +509,8 @@ struct ScreenShareDiagnostics {
     var screenTrackAttached: Bool
     /// 看门狗是否已经采过一次样。false 时 `screenTrackAttached` 只是默认值，不能当结论。
     var videoStatsSampled: Bool
+    /// 有新鲜帧、但没有任何扩展会话——写帧的是残留的旧广播进程。
+    var staleBroadcastDetected: Bool
     var lastError: String?
 
     /// 扩展与主 App 解析出的 App Group 是否真的不一致。
@@ -553,7 +594,7 @@ struct ScreenShareDiagnostics {
            帧只可能由本扩展写入 App Group，可扩展又没写过状态——说明写帧的
            不是"这一次启动的扩展"，而是上一场仍活着的广播进程。
            不点破的话，用户只会看到"有画面在动，但对方是黑的"，无从下手。 */
-        if framesWritten > 0, extensionAppGroup == nil {
+        if staleBroadcastDetected || (framesWritten > 0 && extensionAppGroup == nil) {
             lines.append("⚠️ 有帧但没有扩展状态：写帧的多半是上一场残留的广播进程")
             if extensionStartedThisSession == false {
                 lines.append("⚠️ 本次扩展没有启动。先到控制中心停止旧的「屏幕共享」，或重启手机，再重新开始")
