@@ -54,8 +54,13 @@ final class UplinkBudget: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard isSatisfied else { return 4_000_000 }
-        if isWiFi { return 12_000_000 }
-        if isCellular { return 5_000_000 }
+        /* 1.7.7 起 Wi-Fi 从 12M 提到 20M。
+           12M 是按"家里宽带上行打对折"估的，但手机连 5GHz Wi-Fi 的
+           上行普遍 30~50Mbps，这个值把共享卡在 6Mbps（2 人）上不去。
+           这个数字只是**上限**：真正的发送速率由 GCC 按丢包和 RTT 自己探，
+           上限给低了等于人为压低画质，给高了 GCC 也不会真按上限发。 */
+        if isWiFi { return 20_000_000 }
+        if isCellular { return 6_000_000 }
         return 8_000_000
     }
 

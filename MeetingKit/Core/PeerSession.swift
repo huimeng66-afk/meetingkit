@@ -266,6 +266,20 @@ final class PeerSession: NSObject {
             _ = screenTransceiver?.setDirection(.sendOnly, error: nil)
             return
         }
+        /* transceiver 还在、只是轨道对象换了（setup 重跑、断线重连都会换
+           一个新 UUID 的共享轨）：**换轨，不 add**。
+           每次 add 都会往 SDP 里多一条 video m-line；真机上 `SDP video 3`
+           之后共享被判成"未进SDP"，每开一次共享再补一次协商，m-line 只增不减。
+           带宽也被两条挂在同一路帧上的共享流白吃一份。 */
+        if let transceiver = screenTransceiver, !transceiver.isStopped {
+            if transceiver.sender.track?.trackId != track.trackId {
+                _ = transceiver.sender.replaceTrack(track)
+            }
+            _ = transceiver.setDirection(.sendOnly, error: nil)
+            screenSender = transceiver.sender
+            screenTrackId = track.trackId
+            return
+        }
         /* 1.7.4：直接接住 `add` 的**返回值**，不再回头去 `senders` 里按
            trackId 反查。反查拿到的是另一个包装对象时，后续的编码参数与轨
            状态都作用在这个包装上，帧却推给了没有 VideoSendStream 的底层
@@ -369,8 +383,7 @@ final class PeerSession: NSObject {
            （本地描述里 transceiver 一旦创建就会带上），但 WebRTC 不会为它
            建 VideoSendStream——这正是"已进SDP + 0 帧"的假象来源。 */
         let midValue = screenTransceiver?.mid ?? ""
-        let screenInSDP = Self.containsScreenMSID(localSDP)
-            && Self.lastVideoIsSendOnly(localSDP)
+        let screenInSDP = Self.screenMLineAcceptsSend(localSDP)
             && !midValue.isEmpty
         let remote = Self.videoDirectionAllowsReceive(peerConnection.remoteDescription?.sdp) ? "可收" : "不可收 ⚠️"
         let ice: String
@@ -428,31 +441,37 @@ final class PeerSession: NSObject {
             .count
     }
 
-    /// 本地 SDP 里最后一条 video m-line 是否 sendonly/sendrecv。
-    /// 共享 m-line 最后建，所以它是不是"能发"看这一条就够。
-    private static func lastVideoIsSendOnly(_ sdp: String?) -> Bool {
+    /// 本地 SDP 里**带共享 msid 的那条** video m-line 是否允许本端发送。
+    ///
+    /// 1.7.6 及以前判的是"最后一条 video 是否 sendonly"。这个前提只在
+    /// m-line 顺序固定（audio → camera → screen）时成立。真机上一次
+    /// `SDP video 3` 就把判断带偏：后补的摄像头流排在共享后面、方向 sendrecv，
+    /// 于是共享被误判成"未进SDP"，每开一次共享就补一次协商，m-line 越补越多。
+    /// 现在按 msid 定位到共享那一段再判方向，与顺序无关。
+    private static func screenMLineAcceptsSend(_ sdp: String?) -> Bool {
         guard let sdp, !sdp.isEmpty else { return false }
         var inVideo = false
+        var hasScreenMSID = false
         var allows = false
         for raw in sdp.split(whereSeparator: { $0.isNewline }) {
             let line = String(raw)
-            if line.hasPrefix("m=video") {
-                inVideo = true
+            if line.hasPrefix("m=") {
+                if inVideo, hasScreenMSID, allows { return true }
+                inVideo = line.hasPrefix("m=video")
+                hasScreenMSID = false
                 allows = false
                 continue
             }
-            if line.hasPrefix("m=") {
-                inVideo = false
-                continue
-            }
             guard inVideo else { continue }
-            if line.hasPrefix("a=sendonly") || line.hasPrefix("a=sendrecv") {
+            if line.hasPrefix("a=msid:screen-") {
+                hasScreenMSID = true
+            } else if line.hasPrefix("a=sendonly") || line.hasPrefix("a=sendrecv") {
                 allows = true
             } else if line.hasPrefix("a=recvonly") || line.hasPrefix("a=inactive") {
                 allows = false
             }
         }
-        return allows
+        return inVideo && hasScreenMSID && allows
     }
 
     /// 远端 SDP 里视频 m-line 是否允许本端发送。
@@ -505,8 +524,7 @@ final class PeerSession: NSObject {
         summary.attached = screenSender?.track?.trackId == track.trackId
         // 最后一条 video m-line 就是共享那条（摄像头先建，共享后建）。
         let localSDP = peerConnection.localDescription?.sdp
-        summary.screenInSDP = Self.containsScreenMSID(localSDP)
-            && Self.lastVideoIsSendOnly(localSDP)
+        summary.screenInSDP = Self.screenMLineAcceptsSend(localSDP)
             && !(screenTransceiver?.mid ?? "").isEmpty
         summary.sendsUpstream = summary.screenInSDP
         summary.senderCount = peerConnection.senders.filter { $0.track?.kind == "video" }.count
@@ -611,6 +629,30 @@ final class PeerSession: NSObject {
             if track.kind == "audio", audioSender == nil {
                 audioSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
             }
+            return
+        }
+        /* 同 kind 已经有 sender、只是轨道对象换了（setup 重跑会重建
+           RTCCameraVideoCapturer 的轨），**必须 replaceTrack，不能 add**。
+           add 会往 SDP 里再加一条 m-line：真机上出现 `SDP video 3` 就是这么来的。
+           多出来的那条是 sendrecv 的摄像头，排在共享后面，直接把
+           "最后一条 video 是不是 sendonly" 的判断带偏，共享从此被判成
+           "未进SDP"，每次开共享都补一次协商——越协商 m-line 越多。
+           带宽也被两条摄像头流白吃一份。 */
+        if track.kind == "video",
+           let existing = videoSender ?? peerConnection.senders.first(where: {
+               $0.track?.kind == "video" && $0.senderId != screenSender?.senderId
+           }),
+           existing.track?.trackId != track.trackId,
+           existing.replaceTrack(track) {
+            videoSender = existing
+            if videoTransceiver == nil { videoTransceiver = transceiverForVideoSender() }
+            return
+        }
+        if track.kind == "audio",
+           let existing = audioSender ?? peerConnection.senders.first(where: { $0.track?.kind == "audio" }),
+           existing.track?.trackId != track.trackId,
+           existing.replaceTrack(track) {
+            audioSender = existing
             return
         }
         peerConnection.add(track, streamIds: [streamID])

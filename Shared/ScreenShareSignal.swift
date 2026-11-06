@@ -341,6 +341,12 @@ struct ScreenVideoStats {
     /// 最近一次采样时间。nil 表示看门狗还没跑过——此时"共享轨已挂"是**没有依据**的，
     /// 诊断必须显示"尚未采样"，而不是拿默认值冒充结论。
     var sampledAt: Date?
+    /// 共享这条流上一采样周期的实际上行码率（bps）。
+    /// 糊不糊最终由它决定：880x1920 低于 1.5Mbps 必然糊，跟分辨率设置无关。
+    var bitrateBps = 0
+    /// 摄像头那条流的实际上行码率。它和共享共用同一条连接的带宽预算，
+    /// 摄像头偷偷占 2Mbps 时，共享就只能糊。
+    var cameraBitrateBps = 0
 
     var sampled: Bool { sampledAt != nil }
 }
@@ -454,7 +460,9 @@ enum ScreenShareRuntime {
         screenAttached: Bool,
         trackEnabled: Bool = false,
         sendsUpstream: Bool = true,
-        senders: Int = 0
+        senders: Int = 0,
+        bitrateBps: Int = 0,
+        cameraBitrateBps: Int = 0
     ) {
         lock.lock()
         _video.packetsSent = packetsSent
@@ -463,6 +471,8 @@ enum ScreenShareRuntime {
         _video.trackEnabled = trackEnabled
         _video.sendsUpstream = sendsUpstream
         _video.senders = senders
+        _video.bitrateBps = bitrateBps
+        _video.cameraBitrateBps = cameraBitrateBps
         _video.sampledAt = Date()
         lock.unlock()
     }

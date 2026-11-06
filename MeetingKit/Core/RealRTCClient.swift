@@ -206,6 +206,13 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 上行守护把"已停"的共享拉回来的次数。最多 2 次：
     /// 万一 stop 没真正停掉 SCStream，也不能让用户按了停止却停不下来。
     private var guardReviveCount = 0
+    /// 本轮共享的标识。共享画质的"4 秒后切回保分辨率"是延迟任务，
+    /// 停止后立刻重开时，上一轮的定时器不能把新一轮提前推进保分辨率档。
+    private var screenPhaseToken = UUID()
+    /// 上一次采样时两条流的累计字节数，用来算实际码率。
+    private var lastScreenBytes = 0
+    private var lastCameraBytes = 0
+    private var lastBitrateSampleAt: Date?
 
     /// 上行音频看门狗（peerID → 待执行的探测）。
     private var outboundAudioWatchdogs: [String: DispatchWorkItem] = [:]
@@ -840,7 +847,12 @@ final class RealRTCClient: NSObject, RTCClient {
         for peer in remotePeers.values {
             peer.session.attachScreenTrack(track)
         }
-        applyScreenEncodingBudget()
+        applyScreenEncodingBudget(keepResolution: false)
+        duckCameraForScreenShare()
+        scheduleScreenQualityRamp()
+        lastScreenBytes = 0
+        lastCameraBytes = 0
+        lastBitrateSampleAt = nil
 
         pusher.start()
         /* ReplayKit 真正起播会晚于这里 200~800ms，并重配一次音频会话。
@@ -879,7 +891,12 @@ final class RealRTCClient: NSObject, RTCClient {
         for peer in remotePeers.values {
             peer.session.attachScreenTrack(track)
         }
-        applyScreenEncodingBudget()
+        applyScreenEncodingBudget(keepResolution: false)
+        duckCameraForScreenShare()
+        scheduleScreenQualityRamp()
+        lastScreenBytes = 0
+        lastCameraBytes = 0
+        lastBitrateSampleAt = nil
 
         /* 系统共享同样会切一次音频路由（ReplayKit / SCK 都会把
            AVAudioSession 的 mode 拨到录制侧）。不抢回来，
@@ -929,8 +946,11 @@ final class RealRTCClient: NSObject, RTCClient {
             peer.session.peerConnection.statistics { report in
                 var peerPackets = 0
                 var peerEncoded = 0
+                var peerBytes = 0
+                var cameraBytes = 0
                 var allVideoPackets = 0
                 var allVideoEncoded = 0
+                var allVideoBytes = 0
                 var matchedScreen = false
                 for (_, stat) in report.statistics where stat.type == "outbound-rtp" {
                     /* 只认视频。`kind` 在部分版本里叫 `mediaType`，
@@ -941,8 +961,10 @@ final class RealRTCClient: NSObject, RTCClient {
                     guard kind == "video" else { continue }
                     let packets = (stat.values["packetsSent"] as? NSNumber)?.intValue ?? 0
                     let encoded = (stat.values["framesEncoded"] as? NSNumber)?.intValue ?? 0
+                    let bytes = (stat.values["bytesSent"] as? NSNumber)?.intValue ?? 0
                     allVideoPackets += packets
                     allVideoEncoded += encoded
+                    allVideoBytes += bytes
                     /* 摄像头与共享是两条独立的 send stream。合计会把
                        "共享 0 包、摄像头在发" 掩盖成"共享正常"。
                        字段名在 M100~M140 之间改过（trackIdentifier /
@@ -952,12 +974,14 @@ final class RealRTCClient: NSObject, RTCClient {
                         let reported = (stat.values["trackIdentifier"] as? String)
                             ?? (stat.values["trackId"] as? String)
                         if let reported, !reported.isEmpty, reported != trackID {
+                            cameraBytes += bytes
                             continue
                         }
                     }
                     matchedScreen = true
                     peerPackets += packets
                     peerEncoded += encoded
+                    peerBytes += bytes
                 }
                 /* 一条都没匹配上共享轨：说明统计里没有 trackIdentifier，
                    或者共享这条根本没建 send stream。前者按全部视频兜底，
@@ -965,8 +989,12 @@ final class RealRTCClient: NSObject, RTCClient {
                 if !matchedScreen {
                     peerPackets = allVideoPackets
                     peerEncoded = allVideoEncoded
+                    /* 兜底时把总字节全记给共享，但摄像头那份已经在循环里
+                       按"不匹配"扣走了，这里只补未归类的部分。 */
+                    peerBytes = max(allVideoBytes - cameraBytes, 0)
                 }
                 totals.merge(packets: peerPackets, encoded: peerEncoded)
+                totals.merge(bytes: peerBytes, camera: cameraBytes)
                 group.leave()
             }
         }
@@ -974,13 +1002,32 @@ final class RealRTCClient: NSObject, RTCClient {
         group.notify(queue: .main) { [weak self] in
             guard let self, self.isScreenSharing else { return }
             let snapshot = totals.snapshot()
+            /* 码率按两次采样的字节差算。累计字节是单调的，差值除以
+               时间就是这段时间的真实上行——分辨率、码率上限都只是"允许",
+               这个数字才是浏览器真正收到了多少。 */
+            let now = Date()
+            var screenBps = 0
+            var cameraBps = 0
+            if let last = self.lastBitrateSampleAt {
+                let dt = now.timeIntervalSince(last)
+                if dt >= 0.8 {
+                    screenBps = Int(Double(max(snapshot.screenBytes - self.lastScreenBytes, 0)) * 8 / dt)
+                    cameraBps = Int(Double(max(snapshot.cameraBytes - self.lastCameraBytes, 0)) * 8 / dt)
+                }
+            }
+            self.lastScreenBytes = snapshot.screenBytes
+            self.lastCameraBytes = snapshot.cameraBytes
+            self.lastBitrateSampleAt = now
+
             ScreenShareRuntime.noteVideoStats(
                 packetsSent: snapshot.packets,
                 framesEncoded: snapshot.encoded,
                 screenAttached: snapshot.attached,
                 trackEnabled: trackEnabled,
                 sendsUpstream: sendsUpstream,
-                senders: senderCount
+                senders: senderCount,
+                bitrateBps: screenBps,
+                cameraBitrateBps: cameraBps
             )
             self.reactToUplinkSample(snapshot, trackEnabled: trackEnabled, sendsUpstream: sendsUpstream)
         }
@@ -993,7 +1040,7 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 那条还在路上的 offer。共享 m-line 现在在入会首轮就谈好，链路正常时
     /// 这里没有事情要做；只有"轨被谁关掉了"这种本地状态才值得修。
     private func reactToUplinkSample(
-        _ snapshot: (packets: Int, encoded: Int, attached: Bool),
+        _ snapshot: (packets: Int, encoded: Int, screenBytes: Int, cameraBytes: Int, attached: Bool),
         trackEnabled: Bool,
         sendsUpstream: Bool
     ) {
@@ -1113,7 +1160,7 @@ final class RealRTCClient: NSObject, RTCClient {
                 for peer in remotePeers.values {
                     peer.session.attachScreenTrack(track)
                 }
-                applyScreenEncodingBudget()
+                applyScreenEncodingBudget(keepResolution: false)
             }
             signaling?.sendMediaState(audio: nil, video: nil, screen: true)
             delegate?.rtcDidRestoreScreenShare()
@@ -1142,7 +1189,14 @@ final class RealRTCClient: NSObject, RTCClient {
     ///
     /// Mesh 下每条连接都是独立编码：不按人数分，3 个人共享 1080p
     /// 就是 3×8Mbps 上行，家庭宽带和 4G 都扛不住。
-    private func applyScreenEncodingBudget() {
+    ///
+    /// `keepResolution` 分两个阶段用，这是 1.7.7 的核心改动：
+    ///   · 共享刚开始：**不保分辨率**。GCC 的带宽估计从几百 kbps 起步，
+    ///     这时代码写死 maintainResolution，编码器会"宁可不编码也不降分辨率"，
+    ///     真机表现就是共享前 4 秒浏览器一片黑，之后才动起来——用户体感是"卡"。
+    ///   · 4 秒后：切回 maintainResolution。带宽爬上来以后，屏幕共享的优先级
+    ///     是字要清楚，帧率掉到 12~15fps 可以接受，掉分辨率不行。
+    private func applyScreenEncodingBudget(keepResolution: Bool) {
         guard isScreenSharing, !remotePeers.isEmpty else { return }
         let profile = Self.screenEncodingProfile
         let perPeer = UplinkBudget.shared.perPeer(
@@ -1153,10 +1207,41 @@ final class RealRTCClient: NSObject, RTCClient {
             peer.session.setVideoEncoding(
                 maxBitrateBps: perPeer,
                 maxFramerate: Int(profile.fps),
-                // 低于 1.5Mbps 还硬保 1080p，编码器只能狂丢帧或加大 QP；
-                // 让 WebRTC 降到 720p，滚动文字反而更顺。
-                keepResolution: perPeer >= 1_500_000,
+                keepResolution: keepResolution,
                 forScreen: true
+            )
+        }
+    }
+
+    /// 共享开始 4 秒后，把编码策略从"保帧率"切回"保分辨率"。
+    ///
+    /// 起步阶段带宽估计只有几百 kbps，保分辨率等于让编码器罢工；
+    /// 等 GCC 探到真实上行（通常 3~5 秒），再切回保分辨率，
+    /// 画面就从"能动但糊"变成"清楚但帧率低一点"。屏幕共享里后者才是对的。
+    /// 只做一次，且以"本轮仍在共享"为前提。
+    private func scheduleScreenQualityRamp() {
+        let token = UUID()
+        screenPhaseToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self, self.isScreenSharing, self.screenPhaseToken == token else { return }
+            self.applyScreenEncodingBudget(keepResolution: true)
+            ScreenShareRuntime.note("共享画质：带宽估计已爬升，切回保分辨率")
+        }
+    }
+
+    /// 共享期间把摄像头上行压到最低。
+    ///
+    /// GCC 是"每条连接一份总预算"，摄像头和共享抢的是同一份带宽。
+    /// 共享时摄像头只在角落一个小窗，却按 2.5Mbps / 30fps 在编——
+    /// 真机上就是"共享糊成一片、右上角自己倒是清清楚楚"。
+    /// 压到 250kbps / 10fps 后，让出来的带宽全部归共享。
+    private func duckCameraForScreenShare() {
+        for peer in remotePeers.values {
+            peer.session.setVideoEncoding(
+                maxBitrateBps: 250_000,
+                maxFramerate: 10,
+                keepResolution: false,
+                forScreen: false
             )
         }
     }
@@ -2352,7 +2437,10 @@ extension RealRTCClient: TianqiongSignalingDelegate {
 
         /* 人数变了，共享码率要重新分摊：3 人共享和 2 人共享，
            每路能分到的上行预算不是一回事。 */
-        if isScreenSharing { applyScreenEncodingBudget() }
+        if isScreenSharing {
+            applyScreenEncodingBudget(keepResolution: true)
+            duckCameraForScreenShare()
+        }
 
         /* peer 建好之前到达的共享态必须在这一次补上，否则屏幕舞台永远不会出现。 */
         if screenOn {
@@ -2370,7 +2458,10 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         clearAudioLevelState(for: peerID)
         delegate?.rtcDidLoseRemoteMedia(for: peerID)
         // 少一个人，剩下的人可以分到更多上行。
-        if isScreenSharing { applyScreenEncodingBudget() }
+        if isScreenSharing {
+            applyScreenEncodingBudget(keepResolution: true)
+            duckCameraForScreenShare()
+        }
         publishParticipants()
         syncTeardownBox()
     }
@@ -2760,6 +2851,8 @@ private final class VideoUplinkTotals: @unchecked Sendable {
     private let lock = NSLock()
     private var packets = 0
     private var encoded = 0
+    private var screenBytes = 0
+    private var cameraBytes = 0
     private var attached = true
 
     func merge(packets: Int, encoded: Int) {
@@ -2769,16 +2862,25 @@ private final class VideoUplinkTotals: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// 两条流分开记账。摄像头和共享共用一份带宽时，只看合计会把
+    /// "共享 300kbps、摄像头 2Mbps"读成"上行 2.3Mbps 很正常"。
+    func merge(bytes screen: Int, camera: Int) {
+        lock.lock()
+        self.screenBytes = max(self.screenBytes, screen)
+        self.cameraBytes = max(self.cameraBytes, camera)
+        lock.unlock()
+    }
+
     func markDetached() {
         lock.lock()
         attached = false
         lock.unlock()
     }
 
-    func snapshot() -> (packets: Int, encoded: Int, attached: Bool) {
+    func snapshot() -> (packets: Int, encoded: Int, screenBytes: Int, cameraBytes: Int, attached: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        return (packets, encoded, attached)
+        return (packets, encoded, screenBytes, cameraBytes, attached)
     }
 }
 

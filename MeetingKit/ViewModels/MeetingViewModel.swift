@@ -274,6 +274,16 @@ final class MeetingViewModel: ObservableObject {
                 + (video.screenAttached ? "共享轨已挂" : "共享轨未挂 ⚠️")
                 + " · 轨\(video.trackEnabled ? "开" : "关 ⚠️")"
                 + " · 共享m-line\(video.sendsUpstream ? "已进SDP" : "未进SDP ⚠️")"
+            /* 码率是"糊不糊"的唯一硬指标。880x1920 低于 1.5Mbps 一定糊，
+               WebRTC 的码率上限设得再高也没用——真正发出去多少看这里。
+               摄像头单独列：它和共享抢同一条连接的带宽。 */
+            if video.bitrateBps > 0 || video.cameraBitrateBps > 0 {
+                videoLine += String(
+                    format: " · 上行 %.1fMbps（摄像头 %.1fMbps）",
+                    Double(video.bitrateBps) / 1_000_000,
+                    Double(video.cameraBitrateBps) / 1_000_000
+                )
+            }
             if let sampledAt = video.sampledAt {
                 videoLine += String(format: " · 采样 %.1f 秒前", Date().timeIntervalSince(sampledAt))
             }
