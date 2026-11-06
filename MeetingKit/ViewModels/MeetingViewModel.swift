@@ -197,7 +197,10 @@ final class MeetingViewModel: ObservableObject {
     /// iOS 27 的诊断。没有 App Group 可对账，直接报 SCStream 的帧数与 RTC 发包。
     private var nativeShareDiagnosticsReport: String {
         var lines: [String] = []
-        lines.append("共享通道：ScreenCaptureKit（iOS 27+，本进程内）")
+        lines.append("共享通道：\(screenSharingBackend.displayName)（iOS 27+，本进程内）")
+        if screenSharingBackend == .screenCaptureKit {
+            lines.append("SCK 绑定：\(ScreenCaptureKitRuntime.resolutionLog)")
+        }
 
         if isScreenSharing, let startedAt = nativeShareStartedAt {
             lines.append(String(format: "状态：共享中 · 已 %.0f 秒", Date().timeIntervalSince(startedAt)))
