@@ -1087,6 +1087,20 @@ final class RealRTCClient: NSObject, RTCClient {
                     peerPackets += packets
                     peerEncoded += encoded
                     peerBytes += bytes
+
+                    /* 编码器现场必须先取再拼字符串。
+                       Swift 的 `let` 不是提升声明的：把 impl/keys/fSent 写在
+                       下面、却在上面用，会直接报
+                       "use of local variable 'impl' before its declaration"。
+                       这一段曾经就是这么写的，1.8.7 的 CI 因此整包编不出来
+                       （本地没有任何编译验证，只有 archive 日志能发现）。 */
+                    let impl = (stat.values["encoderImplementation"] as? String) ?? ""
+                    let keys = (stat.values["keyFramesEncoded"] as? NSNumber)?.intValue ?? 0
+                    let fSent = (stat.values["framesSent"] as? NSNumber)?.intValue ?? 0
+                    let fw = (stat.values["frameWidth"] as? NSNumber)?.intValue ?? 0
+                    let fh = (stat.values["frameHeight"] as? NSNumber)?.intValue ?? 0
+                    let retrans = (stat.values["retransmittedPacketsSent"] as? NSNumber)?.intValue ?? 0
+
                     /* 这三个数决定"0 帧"到底断在哪一环：
                          impl 空       → 编码器没建（sender/source 没接上）
                          key=0 尺寸 0  → 帧没进编码器（source 侧就丢了）
@@ -1105,15 +1119,6 @@ final class RealRTCClient: NSObject, RTCClient {
                     if !reason.isEmpty, reason != "none" { peerQuality = reason }
                     else if peerQuality.isEmpty { peerQuality = reason }
 
-                    /* 编码器现场先取出来，等确认是共享这条再落账 ——
-                       放在判断之前会被摄像头那条覆盖，而摄像头恰好是
-                       "能出包"的那条，会把真正的故障掩盖掉。 */
-                    let impl = (stat.values["encoderImplementation"] as? String) ?? ""
-                    let keys = (stat.values["keyFramesEncoded"] as? NSNumber)?.intValue ?? 0
-                    let fSent = (stat.values["framesSent"] as? NSNumber)?.intValue ?? 0
-                    let fw = (stat.values["frameWidth"] as? NSNumber)?.intValue ?? 0
-                    let fh = (stat.values["frameHeight"] as? NSNumber)?.intValue ?? 0
-                    let retrans = (stat.values["retransmittedPacketsSent"] as? NSNumber)?.intValue ?? 0
                 }
                 /* 一条都没匹配上共享轨：说明统计里没有 trackIdentifier，
                    或者共享这条根本没建 send stream。前者按全部视频兜底，
