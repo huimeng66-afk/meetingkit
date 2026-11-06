@@ -110,7 +110,11 @@ struct EnterFromBottom: ViewModifier {
     var index: Int
     var distance: CGFloat
     /// 外部传入的"是否已进场"。nil 时自己 onAppear 触发。
-    var active: Bool?
+    ///
+    /// 必须显式写 `= nil`：Swift 不会为没有默认值的 Optional 属性
+    /// 自动生成 nil 默认参数，漏掉它 `EnterFromBottom(index:distance:)`
+    /// 就是缺参编译失败。
+    var active: Bool? = nil
 
     @State private var shown = false
 
