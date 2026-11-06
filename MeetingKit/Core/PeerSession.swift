@@ -373,32 +373,34 @@ final class PeerSession: NSObject {
     ///
     /// libwebrtc 的 GCC 固定从 300kbps 起步，并且有一条 ALR（应用受限）判定：
     /// 实际发送速率低于估计值 60% 持续一秒，就认为"你没东西要发"，**停止发探测包**。
-    /// 而 GCC 的加性增长按已确认字节数的百分比走——发 36kbps 就只涨 1.8kbps/秒。
     /// 于是形成死锁：码率低 → 不探测 → 估计值不涨 → 码率更低。
     ///
-    /// 真机现场就是这个死锁：`发送 50 包 / 编码 32 帧 / 目标码率 194kbps /
-    /// 可用上行 301kbps / 受限 无 / host→host / RTT 8ms`。局域网直连、
-    /// 8ms、零丢包，估计值却停在起始值 300k 上。
+    /// 这是 SDP 里 `x-google-start-bitrate` 的补充路径：那个只在协商时生效，
+    /// 而共享往往发生在连接已经建好之后，那时 SDP 不会重写。两条路径覆盖
+    /// "先共享后入会"和"先入会后共享"两种时序。
     ///
-    /// `setBweMinBitrateBps:currentBitrateBps:maxBitrateBps:` 是 ObjC 层写
-    /// `PeerConnectionInterface::SetBitrate(BitrateSettings)` 的入口，
-    /// 能把 current 直接抬到真实量级，让估计器从 3Mbps 开始收敛。
+    /// **只传 current，`max_bitrate_bps` 必须留空。** libwebrtc 会把这三个值
+    /// 提升成整条连接的 `RtpBitrateConfigurator` 配置，写 max 等于给整条连接
+    /// 设天花板，并发的摄像头轨会被饿死——LiveKit 在
+    /// `Transport.mungeVideoStartBitrate` 的注释里专门警告过这一点。
+    ///
     /// 用 IMP 调用而不是直接写方法名：这个选择器不在 Swift 伞头文件里，
     /// 直接调用编译不过。`responds(to:)` 先探一次，老版本 SDK 上不会崩。
-    func seedBandwidthEstimate(startBps: Int, maxBps: Int) {
+    func seedBandwidthEstimate(currentBps: Int) {
+        guard currentBps > 0 else { return }
         let selector = NSSelectorFromString("setBweMinBitrateBps:currentBitrateBps:maxBitrateBps:")
         guard peerConnection.responds(to: selector) else { return }
         typealias SeedFn = @convention(c) (AnyObject, Selector, NSNumber?, NSNumber?, NSNumber?) -> Void
         let implementation = peerConnection.method(for: selector)
         let call = unsafeBitCast(implementation, to: SeedFn.self)
-        call(
-            peerConnection,
-            selector,
-            // 下限：抬太高会让估计器在真弱网里也不肯降，压到起点的四分之一。
-            NSNumber(value: max(200_000, startBps / 4)),
-            NSNumber(value: startBps),
-            NSNumber(value: max(maxBps, startBps))
-        )
+        call(peerConnection, selector, nil, NSNumber(value: currentBps), nil)
+    }
+
+    /// 共享那条 track 的目标码率（bps）。没协商出 encodings 时返回 0。
+    var screenTargetBps: Int {
+        (screenSender?.parameters.encodings ?? [])
+            .compactMap { $0.maxBitrateBps?.intValue }
+            .reduce(0, +)
     }
 
     var screenLinkDebug: String {
@@ -716,10 +718,18 @@ final class PeerSession: NSObject {
                 encoding.minBitrateBps = NSNumber(value: minBps)
             }
         }
-        // 共享文档时宁可掉帧也不降分辨率，否则 1080p 会被降成 720p 再放大，文字糊成一片。
-        // 注意：RTCRtpParameters.degradationPreference 是 NSNumber（包 RTCDegradationPreference），
-        // 不是枚举本身，直接赋 .maintainResolution 编译不过。
-        let preference: RTCDegradationPreference = keepResolution ? .maintainResolution : .balanced
+        /* 降级偏好按「轨道来源」定，不是按阶段定。
+           LiveKit 的 `DegradationPreference.resolve(for:)` 就是这么分的：
+             · 屏幕共享 → maintainResolution：字要看得清，掉帧可以接受
+             · 摄像头   → maintainFramerate ：动作要连贯，掉分辨率可以接受
+           之前摄像头沿用 balanced，弱网时会掉分辨率去保帧率，
+           但 balanced 的取舍不确定，实测更像"两样都掉一点"。 */
+        let preference: RTCDegradationPreference
+        if forScreen {
+            preference = keepResolution ? .maintainResolution : .balanced
+        } else {
+            preference = .maintainFramerate
+        }
         params.degradationPreference = NSNumber(value: preference.rawValue)
         sender.parameters = params
     }
@@ -1074,7 +1084,21 @@ final class PeerSession: NSObject {
            那边还是 `42001f`，回程同样要抬——否则屏幕上看到的是"共享那条是 3.1"，
            编码器照样丢帧。`preferH264Only` 幂等，跑两遍不会改坏。 */
         if narrowed, description.type == .offer || description.type == .answer {
-            let filtered = SDPCodecFilter.preferH264Only(description.sdp)
+            var filtered = SDPCodecFilter.preferH264Only(description.sdp)
+            /* 再给这份本地描述写起始码率。
+               libwebrtc 对每条新的视频 send stream 固定从 300kbps 起步，
+               跟 encodings 的 maxBitrate 无关；共享这种整屏内容在 300k 下
+               不是"糊"而是编码器直接丢帧，浏览器看到的就是冻住。
+               LiveKit 四端（swift / js / rust / android）都用这一招：
+               取目标码率的 90% 写进 `x-google-start-bitrate`。
+               这里只在共享 sender 已经有码率上限时写——首轮协商时它还不存在，
+               那条路径由 RealRTCClient.applyScreenEncodingBudget 里的
+               seedBandwidthEstimate 兜。 */
+            let targetBps = screenTargetBps
+            if targetBps > 0 {
+                let kbps = Int((Double(targetBps) / 1000.0 * 0.9).rounded())
+                filtered = SDPCodecFilter.injectStartBitrate(filtered, kbps: kbps)
+            }
             if filtered != description.sdp {
                 target = RTCSessionDescription(type: description.type, sdp: filtered)
             }

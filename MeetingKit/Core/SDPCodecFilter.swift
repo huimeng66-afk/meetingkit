@@ -212,8 +212,8 @@ enum SDPCodecFilter {
     /// 这一项要是 `L3.1`，880×1920 的整屏必被编码器丢弃，看到就该报警。
     static func h264Level(in sdp: String?) -> String {
         guard let sdp, !sdp.isEmpty else { return "-" }
-        for line in sdp.components(separatedBy: sdp.contains("\r\n") ? "\r\n" : "\n")
-        where line.hasPrefix("a=fmtp:") {
+        let lines = sdp.components(separatedBy: sdp.contains("\r\n") ? "\r\n" : "\n")
+        for line in lines where line.hasPrefix("a=fmtp:") {
             guard let range = line.range(of: "profile-level-id=") else { continue }
             let value = String(line[range.upperBound...].prefix(while: { $0 != ";" && $0 != " " }))
             guard value.count == 6,
@@ -221,5 +221,118 @@ enum SDPCodecFilter {
             return String(format: "L%.1f", Double(level) / 10.0)
         }
         return "-"
+    }
+
+    // MARK: - 起始码率
+
+    /// 给每条「能发视频」的 m-line 的 H.264 fmtp 写 `x-google-start-bitrate`。
+    ///
+    /// 这是从 LiveKit 的 `Transport.mungeVideoStartBitrate` 搬过来的做法
+    /// （client-sdk-swift / client-sdk-js / rust-sdks / client-sdk-android 四端一致）：
+    ///
+    /// > libwebrtc 给每条新的视频 send stream 固定 300kbps 起步，跟 encodings 的
+    /// > maxBitrate 无关，所以刚发布的那几秒画面必然糊。
+    ///
+    /// 真机上这就是「目标码率 194kbps / 可用上行 301kbps / 受限 无 / host→host /
+    /// RTT 8ms」的来源：局域网明明有几十兆，估计器却从 300k 起步，再叠加 ALR 死锁
+    /// （发得少 → 不探测 → 涨不上去），永远爬不出来。
+    ///
+    /// 两个必须遵守的细节，都是踩过的坑：
+    ///
+    /// 1. **只写 start，绝不写 `x-google-max-bitrate`**。libwebrtc 会把这两个参数
+    ///    从 m-line 提升到整个 `Call`（`WebRtcVideoSendChannel::ApplyChangedParams`
+    ///    → `SetSdpBitrateParameters`），而 `RtpBitrateConfigurator` 每条连接只有
+    ///    一份配置。写 max 就把"单条轨的上限"变成了"整条连接的总上限"，
+    ///    并发轨道会被饿死。单轨上限只属于 `encodings.maxBitrateBps`。
+    ///
+    /// 2. **所有能发的 video m-line 写同一个值**。同样是 Call 级单份配置，
+    ///    写不同的值等于"按 m-line 顺序后者覆盖前者"，行为不可预期。
+    ///
+    /// `recvonly` / `inactive` 的 m-line 不写：它们不发送，写了只会让同一个
+    /// payload type 在不同 m-line 上参数不一致，libwebrtc 会报
+    /// "A BUNDLE group contains a codec collision"。
+    static func injectStartBitrate(_ sdp: String, kbps: Int) -> String {
+        // 低于 300k 不给提示：LiveKit 的经验是，这个量级下把起点抬高
+        // 付出的代价比省下的爬升时间更大。
+        guard kbps >= 300, sdp.contains("m=video") else { return sdp }
+
+        let eol = sdp.contains("\r\n") ? "\r\n" : "\n"
+        var lines = sdp.components(separatedBy: eol)
+        var index = 0
+        var modified = false
+
+        while index < lines.count {
+            guard lines[index].hasPrefix("m=video") else {
+                index += 1
+                continue
+            }
+            var end = index + 1
+            while end < lines.count, !lines[end].hasPrefix("m=") { end += 1 }
+
+            var sending = true
+            var h264Payloads: Set<String> = []
+            for i in index..<end {
+                let line = lines[i]
+                if line == "a=recvonly" || line == "a=inactive" { sending = false }
+                guard line.hasPrefix("a=rtpmap:") else { continue }
+                let body = line.dropFirst("a=rtpmap:".count)
+                guard let space = body.firstIndex(of: " ") else { continue }
+                let payload = String(body[body.startIndex..<space])
+                let codec = String(body[body.index(after: space)...])
+                if codec.uppercased().hasPrefix("H264") { h264Payloads.insert(payload) }
+            }
+
+            guard sending, !h264Payloads.isEmpty else {
+                index = end
+                continue
+            }
+
+            var patched: Set<String> = []
+            var cursor = index
+            while cursor < end {
+                defer { cursor += 1 }
+                guard lines[cursor].hasPrefix("a=fmtp:") else { continue }
+                let body = lines[cursor].dropFirst("a=fmtp:".count)
+                guard let space = body.firstIndex(of: " ") else { continue }
+                let payload = String(body[body.startIndex..<space])
+                guard h264Payloads.contains(payload) else { continue }
+                let params = String(body[body.index(after: space)...])
+                lines[cursor] = "a=fmtp:" + payload + " " + setFmtp(params, key: "x-google-start-bitrate", value: "\(kbps)")
+                patched.insert(payload)
+                modified = true
+            }
+            /* 只有 rtpmap 没有 fmtp 的 H.264 payload：补一行。
+               少了它，选中的编码就没有起始码率提示。 */
+            var appended: [String] = []
+            for payload in h264Payloads.sorted() where !patched.contains(payload) {
+                appended.append("a=fmtp:\(payload) x-google-start-bitrate=\(kbps)")
+                modified = true
+            }
+            if !appended.isEmpty {
+                lines.insert(contentsOf: appended, at: end)
+                index = end + appended.count
+            } else {
+                index = end
+            }
+        }
+
+        return modified ? lines.joined(separator: eol) : sdp
+    }
+
+    /// 在 `a=fmtp` 的参数串里设置一个键值：有就替换，没有就追加。
+    private static func setFmtp(_ params: String, key: String, value: String) -> String {
+        var parts = params.components(separatedBy: ";")
+        var replaced = false
+        var i = 0
+        while i < parts.count {
+            let trimmed = parts[i].trimmingCharacters(in: .whitespaces)
+            if trimmed.lowercased().hasPrefix(key.lowercased() + "=") {
+                parts[i] = "\(key)=\(value)"
+                replaced = true
+            }
+            i += 1
+        }
+        if !replaced { parts.append("\(key)=\(value)") }
+        return parts.joined(separator: ";")
     }
 }

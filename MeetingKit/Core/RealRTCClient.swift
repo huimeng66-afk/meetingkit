@@ -222,7 +222,6 @@ final class RealRTCClient: NSObject, RTCClient {
     private var guardReviveCount = 0
     /// 本轮共享的标识。共享画质的"4 秒后切回保分辨率"是延迟任务，
     /// 停止后立刻重开时，上一轮的定时器不能把新一轮提前推进保分辨率档。
-    private var screenPhaseToken = UUID()
     /// 上一次采样时两条流的累计字节数，用来算实际码率。
     private var lastScreenBytes = 0
     private var lastCameraBytes = 0
@@ -861,9 +860,8 @@ final class RealRTCClient: NSObject, RTCClient {
         for peer in remotePeers.values {
             peer.session.attachScreenTrack(track)
         }
-        applyScreenEncodingBudget(keepResolution: false)
+        applyScreenEncodingBudget()
         duckCameraForScreenShare()
-        scheduleScreenQualityRamp()
         lastScreenBytes = 0
         lastCameraBytes = 0
         lastBitrateSampleAt = nil
@@ -905,9 +903,8 @@ final class RealRTCClient: NSObject, RTCClient {
         for peer in remotePeers.values {
             peer.session.attachScreenTrack(track)
         }
-        applyScreenEncodingBudget(keepResolution: false)
+        applyScreenEncodingBudget()
         duckCameraForScreenShare()
-        scheduleScreenQualityRamp()
         lastScreenBytes = 0
         lastCameraBytes = 0
         lastBitrateSampleAt = nil
@@ -1258,7 +1255,7 @@ final class RealRTCClient: NSObject, RTCClient {
                 for peer in remotePeers.values {
                     peer.session.attachScreenTrack(track)
                 }
-                applyScreenEncodingBudget(keepResolution: false)
+                applyScreenEncodingBudget()
             }
             signaling?.sendMediaState(audio: nil, video: nil, screen: true)
             delegate?.rtcDidRestoreScreenShare()
@@ -1286,15 +1283,19 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 按当前人数重新分配共享上行码率。
     ///
     /// Mesh 下每条连接都是独立编码：不按人数分，3 个人共享 1080p
-    /// 就是 3×8Mbps 上行，家庭宽带和 4G 都扛不住。
+    /// 就是 3×4Mbps 上行，家庭宽带和 4G 都扛不住。
     ///
-    /// `keepResolution` 分两个阶段用，这是 1.7.7 的核心改动：
-    ///   · 共享刚开始：**不保分辨率**。GCC 的带宽估计从几百 kbps 起步，
-    ///     这时代码写死 maintainResolution，编码器会"宁可不编码也不降分辨率"，
-    ///     真机表现就是共享前 4 秒浏览器一片黑，之后才动起来——用户体感是"卡"。
-    ///   · 4 秒后：切回 maintainResolution。带宽爬上来以后，屏幕共享的优先级
-    ///     是字要清楚，帧率掉到 12~15fps 可以接受，掉分辨率不行。
-    private func applyScreenEncodingBudget(keepResolution: Bool) {
+    /// **只有一档：maintainResolution，从第一秒就是。**
+    ///
+    /// 1.7.7 曾经分两阶段——共享开头 4 秒不保分辨率，等 GCC 爬上来再切回。
+    /// 那是把因果搞反了：带宽上不去不是因为"保了分辨率"，而是因为起始码率
+    /// 只有 300kbps（见 SDPCodecFilter.injectStartBitrate）。现在起始码率
+    /// 直接抬到目标的 90%，就不需要拿分辨率去换时间。
+    ///
+    /// LiveKit 也是这么定的（`DegradationPreference.resolve(for:)`）：
+    /// 屏幕共享 → `maintainResolution`，摄像头 → `maintainFramerate`。
+    /// 共享里"字要看得清"永远优先于"动得顺"。
+    private func applyScreenEncodingBudget() {
         guard isScreenSharing, !remotePeers.isEmpty else { return }
         let profile = Self.screenEncodingProfile
         let perPeer = UplinkBudget.shared.perPeer(
@@ -1302,59 +1303,17 @@ final class RealRTCClient: NSObject, RTCClient {
             peers: remotePeers.count
         )
         for peer in remotePeers.values {
-            /* 起步阶段顺便把带宽估计器的起点抬到真实量级。
-               见 PeerSession.seedBandwidthEstimate：GCC 默认 300kbps 起步，
-               再叠加 ALR 死锁，局域网也会被钉死在 300k。
-               4 秒后那次 ramp 不再 seed——那时估计器已经在正常收敛，
-               再写一次会把刚降下来的估计值顶回去。 */
-            if !keepResolution {
-                peer.session.seedBandwidthEstimate(
-                    startBps: min(perPeer, 3_000_000),
-                    maxBps: max(perPeer, 8_000_000)
-                )
-            }
             peer.session.setVideoEncoding(
                 maxBitrateBps: perPeer,
                 maxFramerate: Int(profile.fps),
-                minBitrateBps: Self.screenMinBitrateBps,
-                keepResolution: keepResolution,
+                keepResolution: true,
                 forScreen: true
             )
-        }
-    }
-
-    /// 共享的"启动助推"码率：600kbps。
-    ///
-    /// 为什么必须有这个下限（1.8.1 的核心修复）：
-    /// libwebrtc 的带宽估计器有一个"应用受限区"（ALR）判定——当实际发送
-    /// 速率低于估计值的 60% 持续一秒，它就认为"你没东西要发"，**停止发探测包**。
-    /// 而 GCC 的加性增长是按"已确认字节数"的百分比涨的：发 36kbps 就只涨
-    /// 36kbps 的 5%，一秒 1.8k。从 300k 爬到 1M 要十几分钟。
-    ///
-    /// 真机日志就是这个死锁的现场：
-    ///   目标码率 194kbps · 可用上行 301kbps · 受限 无 · host→host · RTT 8ms
-    /// 局域网直连、8ms、零丢包，带宽估计却停在起始值 300k，因为编码器
-    /// 被 194k 掐着只产出 36kbps，永远退不出 ALR。
-    ///
-    /// 给一条 600k 的下限，编码器就有足够的东西可发，链路退出 ALR、
-    /// 探测重启，估计值才会真的往上爬。600k 是保守值：pacer 在 300k 估计下
-    /// 按 2.5 倍 pacing 能发 750k，600k 不会在队列里堆出可感知的延迟。
-    /// 等估计值涨过 600k 之后这个下限自动失效，不参与分配。
-    private static let screenMinBitrateBps = 600_000
-
-    /// 共享开始 4 秒后，把编码策略从"保帧率"切回"保分辨率"。
-    ///
-    /// 起步阶段带宽估计只有几百 kbps，保分辨率等于让编码器罢工；
-    /// 等 GCC 探到真实上行（通常 3~5 秒），再切回保分辨率，
-    /// 画面就从"能动但糊"变成"清楚但帧率低一点"。屏幕共享里后者才是对的。
-    /// 只做一次，且以"本轮仍在共享"为前提。
-    private func scheduleScreenQualityRamp() {
-        let token = UUID()
-        screenPhaseToken = token
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
-            guard let self, self.isScreenSharing, self.screenPhaseToken == token else { return }
-            self.applyScreenEncodingBudget(keepResolution: true)
-            ScreenShareRuntime.note("共享画质：带宽估计已爬升，切回保分辨率")
+            /* SDP 里的 `x-google-start-bitrate` 只在协商那一刻被读走。
+               共享发生在连接已经建好之后时 SDP 不会重写，这条路径补上：
+               直接告诉带宽估计器"从 90% 的目标码率起步"。
+               只传 current，不传 max —— 见 PeerSession.seedBandwidthEstimate。 */
+            peer.session.seedBandwidthEstimate(currentBps: Int(Double(perPeer) * 0.9))
         }
     }
 
@@ -2122,13 +2081,17 @@ final class RealRTCClient: NSObject, RTCClient {
     nonisolated static var screenEncodingProfile: (width: Int32, height: Int32, fps: Int32, bitrate: Int) {
         switch AppSettings.shareQualitySnapshot {
         case .sharp:
-            // 4Mbps 对 1080p 的文档画面是不够的：滚动/翻页时整屏都在变，
-            // 编码器只能保帧率丢细节，落到远端就是"字糊成一片"。
-            // 8Mbps 配 maintainResolution，文字边缘才立得住；网络跟不上时
-            // WebRTC 的带宽估计会自动降码率，不会把连接压死。
-            return (1920, 1080, 24, 8_000_000)
+            /* 1080p / 24fps / 4Mbps。
+               档位按 LiveKit 的屏幕共享预设插值（`VideoParameters`）：
+               1080p@15 → 2.5Mbps，1080p@30 → 5Mbps，24fps 落在 4Mbps。
+               之前写 8Mbps 是拍脑袋的：它从来不是"能发多少"，而是
+               `x-google-start-bitrate` 的计算基数——上限给到 8M，
+               起始码率就会按 7.2M 起步，在 4G 上开头两秒必然过冲丢包。
+               screen share 的正确档位是"够清楚 + 起步不过冲"。 */
+            return (1920, 1080, 24, 4_000_000)
         case .balanced:
-            return (1280, 720, 18, 3_000_000)
+            // 720p@15 在 LiveKit 是 1.5Mbps，18fps 取 2Mbps。
+            return (1280, 720, 18, 2_000_000)
         }
     }
 
@@ -2567,7 +2530,7 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         /* 人数变了，共享码率要重新分摊：3 人共享和 2 人共享，
            每路能分到的上行预算不是一回事。 */
         if isScreenSharing {
-            applyScreenEncodingBudget(keepResolution: true)
+            applyScreenEncodingBudget()
             duckCameraForScreenShare()
         }
 
@@ -2588,7 +2551,7 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         delegate?.rtcDidLoseRemoteMedia(for: peerID)
         // 少一个人，剩下的人可以分到更多上行。
         if isScreenSharing {
-            applyScreenEncodingBudget(keepResolution: true)
+            applyScreenEncodingBudget()
             duckCameraForScreenShare()
         }
         publishParticipants()
