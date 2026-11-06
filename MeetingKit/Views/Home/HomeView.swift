@@ -268,6 +268,7 @@ struct HomeView: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
                 .padding(.top, 44)
+                .enterFromBottom(index: 0, distance: 10)
 
                 Text("无需注册。登录后可发起会议、查看会议记录。")
                     .font(.system(size: 13))
@@ -276,9 +277,11 @@ struct HomeView: View {
 
                 guestJoinCard
                     .padding(.top, 26)
+                    .enterFromBottom(index: 1, distance: 16)
 
                 guestLoginHint
                     .padding(.top, 16)
+                    .enterFromBottom(index: 2, distance: 10)
             }
             .padding(.horizontal, pagePadding)
             .padding(.top, insets.top + 8)
@@ -768,11 +771,21 @@ struct HomeView: View {
     /// 顺序与信息密度都照网页来，不做"两个大方块"那种 App 自创布局。
     private var meetingsBody: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // 三块依次入场（0 / 45 / 90ms）。
+            //
+            // 首页是启动动画掀开之后第一眼看到的东西：如果它整块"啪"地出现，
+            // 前面 1.2 秒的品牌铺垫就白做了。逐块上浮 14pt 能让视线从标题
+            // 顺着落到入会卡，再落到历史——这正是用户接下来要做的事的顺序。
             hero
+                .enterFromBottom(index: 0, distance: 10)
+
             joinCard
                 .padding(.top, 22)
+                .enterFromBottom(index: 1, distance: 16)
+
             historySection
                 .padding(.top, 28)
+                .enterFromBottom(index: 2)
         }
     }
 

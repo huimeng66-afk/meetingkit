@@ -99,6 +99,34 @@ struct MeetingRoomView: View {
                 // 离会后遮罩：zIndex 让位给 Toast（4），这样"会议已结束"的提示还是看得见。
                 endedOverlay
 
+                // 「结束会议」的确认框。
+                //
+                // 这个 @State 之前只被赋值、没有任何视图消费它，
+                // 表现就是点顶栏的结束按钮"完全没反应"——主持人以为点了没生效，
+                // 于是连点，最后走的是系统返回把整个房间关掉。
+                if isConfirmingEndMeeting {
+                    GlassConfirmDialog(
+                        title: "结束会议？",
+                        message: "所有参会人都会被移出会议，共享与录制同时停止。",
+                        confirmTitle: "结束会议",
+                        isDestructive: true,
+                        onConfirm: {
+                            withAnimation(Theme.Motion.standard) {
+                                isConfirmingEndMeeting = false
+                            }
+                            Haptics.impact(.heavy)
+                            viewModel.endMeeting()
+                        },
+                        onCancel: {
+                            withAnimation(Theme.Motion.standard) {
+                                isConfirmingEndMeeting = false
+                            }
+                        }
+                    )
+                    .transition(.opacity)
+                    .zIndex(12)
+                }
+
                 broadcastPickerAnchor
             }
         }
@@ -165,9 +193,14 @@ struct MeetingRoomView: View {
         // 顶栏要让红色警示条铺到刘海区、底栏要贴到屏幕最下沿，
         // 所以这一层整体忽略上下安全区，再由两个子视图各自补白。
         .ignoresSafeArea(edges: [.top, .bottom])
+        // 显隐不只改透明度：顶栏往上退到刘海外、底栏往下退到屏幕外。
+        // 只做 opacity 会留下"两块半透明的栏浮在画面上"，用户仍然能看见
+        // 按钮的轮廓，反而比直接隐藏更脏。位移量带一点过冲（snappy），
+        // 让"画面被交还给视频"这个动作有重量。
+        .offset(y: viewModel.isChromeVisible ? 0 : -GlassMotion.offset(insets.top + 30))
         .opacity(viewModel.isChromeVisible ? 1 : 0)
         .allowsHitTesting(viewModel.isChromeVisible)
-        .animationCompat(Theme.Motion.standard, value: viewModel.isChromeVisible)
+        .animationCompat(Theme.Motion.snappy, value: viewModel.isChromeVisible)
         .zIndex(1)
     }
 

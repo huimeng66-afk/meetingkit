@@ -178,14 +178,21 @@ struct ControlButton: View {
 
 // MARK: - 按压回弹
 
-/// 会议里所有圆钮共用这一档手感：按下缩到 0.94，松手弹回。
+/// 会议里所有圆钮共用这一档手感：按下缩到 0.92，松手弹回。
+///
+/// 曲线换成 GlassMotion.press（damping 0.62）：底栏 7 颗圆钮并排，
+/// 用户是"连点"扫过去的，高阻尼的 0.86 会让每一次按压都显得滞后；
+/// 欠阻尼虽然会过冲，但在 40pt 的小圆钮上恰好是"弹一下"的清脆感。
 struct ControlButtonPressStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.94 : 1.0)
-            .opacity(configuration.isPressed ? 0.92 : 1.0)
-            .animationCompat(Theme.Motion.standard, value: configuration.isPressed)
+            .scaleEffect(configuration.isPressed ? GlassMotion.scale(0.92) : 1.0)
+            .opacity(configuration.isPressed ? 0.9 : 1.0)
+            .animation(
+                configuration.isPressed ? GlassMotion.press : GlassMotion.settle,
+                value: configuration.isPressed
+            )
     }
 }
 

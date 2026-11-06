@@ -136,14 +136,39 @@ struct HomeTabBar: View {
     }
 
     /// 选中指示器：实色打底 + 系统玻璃封面。
+    ///
+    /// 拖动时会**横向拉伸、纵向压扁**（stretch/squash），这是参考实现里
+    /// 那颗被拖动的导航胶囊最关键的一笔：真实的软物体被横向拽时会变长变薄，
+    /// 只做位移不形变，看起来就是"一块贴纸在滑动"。
+    /// 形变量按位移占一格的比例算，最多拉长 10pt、压扁 6%，
+    /// 到达半格（切换点）时形变最大，切换后基准重置，立刻回到 1.0。
     private func indicator(slot: CGFloat, width: CGFloat) -> some View {
-        Capsule(style: .continuous)
+        let progress = min(abs(dragOffset) / max(slot, 1), 1)
+        let stretch = progress * 10
+        let squash = 1 - progress * 0.06
+
+        return Capsule(style: .continuous)
             .fill(Theme.Palette.accent)
-            .frame(width: width, height: barHeight - indicatorInset * 2)
+            .frame(width: width + stretch, height: (barHeight - indicatorInset * 2) * squash)
             .overlay(
-                // 封面玻璃只负责"质感"，不承担对比度：
-                // 低版本没有 glassEffect，overlay 自动退化为空。
-                TabThumbGlass()
+                // 两层叠加，职责不同：
+                //   · TabThumbGlass：iOS 26 的系统折射（低版本为空）；
+                //   · 1px 渐变描边：透镜边界。没有它，纯色胶囊在玻璃底座上
+                //     就是一块蓝色，拖动时看不出厚度。
+                ZStack {
+                    TabThumbGlass()
+
+                    Capsule(style: .continuous)
+                        .stroke(
+                            LinearGradient(
+                                colors: [Color.white.opacity(0.42), Color.white.opacity(0.06)],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            ),
+                            lineWidth: 1
+                        )
+                }
+                .allowsHitTesting(false)
             )
             .shadow(
                 color: Theme.Palette.accent.opacity(0.30),
@@ -179,6 +204,10 @@ struct HomeTabBar: View {
             VStack(spacing: 3) {
                 Image(systemName: isSelected ? tab.selectedSymbol : tab.symbol)
                     .font(.system(size: 19, weight: isSelected ? .semibold : .regular))
+                    // 选中时图标放大 6%：切换瞬间有一次可见的"弹一下"，
+                    // 光靠换 symbol（实心/空心）在 19pt 上几乎看不出来。
+                    .scaleEffect(isSelected ? 1.06 : 1.0)
+                    .animation(GlassMotion.settle, value: isSelected)
                     .frame(height: 22)
 
                 Text(tab.tabBarTitle)
@@ -277,12 +306,19 @@ private struct TabThumbGlass: View {
 // MARK: - 样式
 
 /// tab 的按压缩放。玻璃在底座上，这里只管手感，不再叠第二层玻璃。
+///
+/// 用 GlassMotion 的欠阻尼曲线（0.62）而不是 Theme.Motion.snappy（0.9）：
+/// 松手时那一下过冲正是"胶囊被捏了一下"的来源，用高阻尼会变成软塌塌的收缩。
 private struct TabPressStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.94 : 1.0)
-            .animationCompat(Theme.Motion.snappy, value: configuration.isPressed)
+            .scaleEffect(configuration.isPressed ? 0.92 : 1.0)
+            .opacity(configuration.isPressed ? 0.88 : 1.0)
+            .animation(
+                configuration.isPressed ? GlassMotion.press : GlassMotion.settle,
+                value: configuration.isPressed
+            )
     }
 }
 

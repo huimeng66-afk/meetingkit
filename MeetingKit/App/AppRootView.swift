@@ -171,6 +171,9 @@ struct AppRootView: View {
 
     @StateObject private var router = AppRouter()
 
+    /// 启动层是否还在。只在本次进程第一次显示，返回首页不再播。
+    @State private var showsLaunch = true
+
     var body: some View {
         ZStack {
             // 根层只铺纯底色：三个页面各自带一层 BrandBackground，
@@ -181,17 +184,26 @@ struct AppRootView: View {
             switch router.phase {
             case .home:
                 HomeView(router: router, settings: AppSettings.shared)
-                    .transition(.opacity)
+                    .transition(.pagePush)
             case .preJoin(let info):
                 PreJoinView(router: router, info: info)
-                    .transition(.opacity)
+                    .transition(.pagePush)
             case .room(let info):
                 MeetingRoomView(join: info, onExit: {
                     router.leaveRoom()
                 }, onJoined: {
                     router.confirmRoomJoined()
                 })
-                .transition(.opacity)
+                .transition(.pagePush)
+            }
+
+            // 启动层压在一切之上。它不阻塞首页初始化：
+            // 首页在下面照常跑鉴权与拉列表，1.2 秒后掀开时内容已经就位。
+            if showsLaunch {
+                LaunchOverlay {
+                    showsLaunch = false
+                }
+                .zIndex(100)
             }
         }
         .background(Theme.Palette.background.ignoresSafeArea())

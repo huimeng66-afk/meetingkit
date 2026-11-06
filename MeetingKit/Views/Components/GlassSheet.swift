@@ -68,8 +68,13 @@ struct GlassSheet<Content: View>: View {
     var body: some View {
         ZStack(alignment: .bottom) {
             // 遮罩只盖住画面、不参与布局；点它等于关闭。
-            Color.black.opacity(0.45)
+            //
+            // 透明度跟着下拉位移走：往下拖到一半时遮罩已经淡掉一半，
+            // 视觉上"面板正在离开、底下的会议正在回来"。
+            // 固定 0.45 不动的写法会让下拉过程像在拖一块盖着黑布的门。
+            Color.black.opacity(dimOpacity)
                 .ignoresSafeArea()
+                .animation(isVisible ? nil : GlassMotion.exit, value: isVisible)
                 .onTapGesture {
                     onClose()
                 }
@@ -88,6 +93,11 @@ struct GlassSheet<Content: View>: View {
                         //    iOS 14 没有 `.animation(_:value:)`，外层 withAnimation 会作用整棵子树，
                         //    拖拽时每一帧 offset 都被套上弹簧 → 面板追着手指跑（橡皮筋感）。
                         //    用 transaction 清掉后：拖拽 0 延迟。
+                        //
+                        //    缩放与位移同一层、同一个 transaction：下拉时整块面板
+                        //    轻微缩小（最多 8%），像被从桌面上"抽走"而不是平移出去。
+                        //    锚点必须在 .bottom，从中心缩会让面板两侧同时往里收，很怪。
+                        .scaleEffect(panelScale, anchor: .bottom)
                         .offset(y: dragTranslation)
                         .transaction { transaction in
                             transaction.animation = nil
@@ -181,6 +191,29 @@ struct GlassSheet<Content: View>: View {
             endPoint: .bottom
         )
         .frame(height: 34)
+    }
+
+    // MARK: - 下拉联动
+
+    /// 下拉进度（0~1）。260pt 视为"完全拉走"的距离，
+    /// 与 dragGesture 里 120pt 触发关闭的阈值不冲突：阈值是**决定**，
+    /// 这里是**过程**，手指还没松的时候遮罩和缩放就已经在跟着走了。
+    private var dragProgress: CGFloat {
+        min(max(dragTranslation, 0) / 260, 1)
+    }
+
+    /// 遮罩透明度：0.45 → 0.05。
+    private var dimOpacity: Double {
+        Double(0.45 * (1 - dragProgress * 0.88))
+    }
+
+    /// 面板缩放：下拉时最多缩到 0.92。
+    ///
+    /// 这里刻意**不做**进场缩放（0.97 → 1）：这一层被 `.transaction` 关掉了动画，
+    /// 缩放会瞬跳 3%，反而是一次看不见理由的抖动。进场交给下方的位移层负责，
+    /// 位移有 60% 屏高的行程，本身已经足够"被拉起来"。
+    private var panelScale: CGFloat {
+        GlassMotion.scale(1 - dragProgress * 0.08)
     }
 
     private var dragGesture: some Gesture {

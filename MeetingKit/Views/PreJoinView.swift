@@ -70,11 +70,24 @@ struct PreJoinView: View {
 
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 20) {
+                    // 顶栏不参与入场：它承担"返回"，必须第一帧就在正确位置，
+                    // 否则用户从首页点进来时，返回键会先缺一块再浮上来。
                     topBar
+
+                    // 其余四块依次浮入。预览卡承担"这是哪场会"的第一眼识别，
+                    // 给它最大的位移（18pt），表单与按钮依次递减，
+                    // 视觉重量从上到下递减，符合"先确认会议、再确认自己"的顺序。
                     previewCard
+                        .enterFromBottom(index: 0, distance: 18)
+
                     formCard
+                        .enterFromBottom(index: 1, distance: 14)
+
                     joinButton
+                        .enterFromBottom(index: 2, distance: 10)
+
                     createNewMeetingLink
+                        .enterFromBottom(index: 3, distance: 8)
                 }
                 .padding(.horizontal, pagePadding)
                 .padding(.top, 8)
