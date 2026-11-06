@@ -347,6 +347,23 @@ struct ScreenVideoStats {
     /// 摄像头那条流的实际上行码率。它和共享共用同一条连接的带宽预算，
     /// 摄像头偷偷占 2Mbps 时，共享就只能糊。
     var cameraBitrateBps = 0
+    /// 编码器这一路自己的目标码率（bps）。这是 GCC 实际拨给编码器的数字，
+    /// 比我们在 parameters 里写的上限更能说明"允许发多少"。
+    /// 上限 8Mbps、目标 300kbps，就是"带宽不够"，不是"参数没设对"。
+    var targetBitrateBps = 0
+    /// WebRTC 自己给出的受限原因：bandwidth / cpu / other / none。
+    /// 这是"糊"的判决书：bandwidth 要加带宽，cpu 要降分辨率或降帧，
+    /// 两者都没有还糊，才是画布或缩放的问题。
+    var qualityReason = ""
+    /// 候选对的可用上行估计（bps）。走 TURN 中继时它通常远低于物理上行，
+    /// 是被中继服务器卡住的，不是手机的问题。
+    var availableOutgoingBps = 0
+    /// 候选对的往返时延（毫秒）。
+    var rttMs = 0
+    /// 本端 / 远端候选类型：host / srflx / prflx / relay。
+    /// relay = 流量过 TURN，带宽与延迟都由中继服务器决定。
+    var localCandidate = ""
+    var remoteCandidate = ""
 
     var sampled: Bool { sampledAt != nil }
 }
@@ -462,7 +479,13 @@ enum ScreenShareRuntime {
         sendsUpstream: Bool = true,
         senders: Int = 0,
         bitrateBps: Int = 0,
-        cameraBitrateBps: Int = 0
+        cameraBitrateBps: Int = 0,
+        targetBitrateBps: Int = 0,
+        qualityReason: String = "",
+        availableOutgoingBps: Int = 0,
+        rttMs: Int = 0,
+        localCandidate: String = "",
+        remoteCandidate: String = ""
     ) {
         lock.lock()
         _video.packetsSent = packetsSent
@@ -473,6 +496,12 @@ enum ScreenShareRuntime {
         _video.senders = senders
         _video.bitrateBps = bitrateBps
         _video.cameraBitrateBps = cameraBitrateBps
+        _video.targetBitrateBps = targetBitrateBps
+        _video.qualityReason = qualityReason
+        _video.availableOutgoingBps = availableOutgoingBps
+        _video.rttMs = rttMs
+        _video.localCandidate = localCandidate
+        _video.remoteCandidate = remoteCandidate
         _video.sampledAt = Date()
         lock.unlock()
     }

@@ -563,6 +563,56 @@ final class PeerSession: NSObject {
     /// 掩盖成"有包在发"。
     var screenTrackIdentifier: String? { screenTrackId }
 
+    /// 本地 SDP 的 m-line 清单，形如
+    /// `0=audio/sendrecv/- · 1=video/sendrecv/tq-xxx · 2=video/sendonly/screen-xxx`。
+    ///
+    /// 这份清单回答的是「到底有几条视频 m-line、每条是什么方向、挂的哪个流」。
+    /// 真机上出现过 `SDP video 3`：多出来的那条既可能是浏览器的 recvonly 轨，
+    /// 也可能是本端重复 add 出来的僵尸通道。只有把 mid / 方向 / msid 摆在一起，
+    /// 才能分清它是"无害的备用 m-line"还是"正在白吃带宽的第二路共享"。
+    var mLineOverview: String {
+        guard let sdp = peerConnection.localDescription?.sdp, !sdp.isEmpty else { return "-" }
+        var items: [String] = []
+        var kind = ""
+        var mid = "-"
+        var direction = ""
+        var msid = "-"
+        func flush() {
+            guard !kind.isEmpty else { return }
+            items.append("\(mid)=\(kind)/\(direction.isEmpty ? "?" : direction)/\(msid)")
+            kind = ""
+            mid = "-"
+            direction = ""
+            msid = "-"
+        }
+        for raw in sdp.split(whereSeparator: { $0.isNewline }) {
+            let line = String(raw)
+            if line.hasPrefix("m=") {
+                flush()
+                kind = String(line.dropFirst(2).split(separator: " ").first ?? "")
+                continue
+            }
+            guard !kind.isEmpty else { continue }
+            if line.hasPrefix("a=mid:") {
+                mid = String(line.dropFirst(6))
+            } else if line.hasPrefix("a=sendrecv") {
+                direction = "sendrecv"
+            } else if line.hasPrefix("a=sendonly") {
+                direction = "sendonly"
+            } else if line.hasPrefix("a=recvonly") {
+                direction = "recvonly"
+            } else if line.hasPrefix("a=inactive") {
+                direction = "inactive"
+            } else if line.hasPrefix("a=msid:") {
+                /* `a=msid:<stream> <track>`：只留流名，track 名太长且没信息量。 */
+                let rest = String(line.dropFirst(7))
+                msid = String(rest.split(separator: " ").first ?? "-")
+            }
+        }
+        flush()
+        return items.isEmpty ? "-" : items.joined(separator: " · ")
+    }
+
     /// 共享那条 m-line 的 mid。统计里用它把 `outbound-rtp` 分成两路：
     /// `trackIdentifier` 在包装层偶尔读回空，mid 是协商写入的，更稳。
     var screenMid: String {

@@ -127,6 +127,13 @@ final class RealRTCClient: NSObject, RTCClient {
             .map { "\($0.peerID)：\($0.session.screenLinkDebug)" }
             .joined(separator: " · ")
     }
+    /// 本地 SDP 里所有 m-line 的清单。诊断回传用它判断
+    /// "多出来的那条 video" 是无害的 recvonly，还是重复的共享通道。
+    var screenSdpOverview: String {
+        guard let first = remotePeers.values.first else { return "-" }
+        return first.session.mLineOverview
+    }
+
     private var videoCapturer: RTCCameraVideoCapturer?
     /// 摄像头是否正在采集。与 `localVideoTrack.isEnabled` 分开：
     /// 轨可以一直是开的，但采集停了（关摄像头时 stopCapture 会熄灯）。
@@ -948,11 +955,44 @@ final class RealRTCClient: NSObject, RTCClient {
                 var peerPackets = 0
                 var peerEncoded = 0
                 var peerBytes = 0
+                var peerTarget = 0
+                var peerQuality = ""
                 var cameraBytes = 0
                 var allVideoPackets = 0
                 var allVideoEncoded = 0
                 var allVideoBytes = 0
                 var matchedScreen = false
+
+                /* 候选对与候选类型。这一组是"糊"的另一半答案：
+                   `relay` 表示流量走 TURN，带宽和延迟都由中继服务器决定，
+                   手机连的是千兆 Wi-Fi 也救不了。
+                   只有 `succeeded` 的那条在真正传数据，别的都是备选。 */
+                var localTypes: [String: String] = [:]
+                var remoteTypes: [String: String] = [:]
+                for (id, stat) in report.statistics {
+                    guard let type = stat.values["candidateType"] as? String else { continue }
+                    if stat.type == "local-candidate" { localTypes[id] = type }
+                    if stat.type == "remote-candidate" { remoteTypes[id] = type }
+                }
+                var pairAvailable = 0
+                var pairRttMs = 0
+                var pairLocal = ""
+                var pairRemote = ""
+                for (_, stat) in report.statistics where stat.type == "candidate-pair" {
+                    let state = (stat.values["state"] as? String) ?? ""
+                    guard state == "succeeded" else { continue }
+                    let avail = (stat.values["availableOutgoingBitrate"] as? NSNumber)?.intValue ?? 0
+                    if avail > pairAvailable { pairAvailable = avail }
+                    let rttSec = (stat.values["currentRoundTripTime"] as? NSNumber)?.doubleValue ?? 0
+                    let rtt = Int((rttSec * 1000).rounded())
+                    if rtt > 0, pairRttMs == 0 || rtt < pairRttMs { pairRttMs = rtt }
+                    if let id = stat.values["localCandidateId"] as? String, let t = localTypes[id] {
+                        pairLocal = t
+                    }
+                    if let id = stat.values["remoteCandidateId"] as? String, let t = remoteTypes[id] {
+                        pairRemote = t
+                    }
+                }
                 for (_, stat) in report.statistics where stat.type == "outbound-rtp" {
                     /* 只认视频。`kind` 在部分版本里叫 `mediaType`，
                        两个都看：判错一个键就会把"正在发"读成"0 包"，
@@ -998,6 +1038,17 @@ final class RealRTCClient: NSObject, RTCClient {
                     peerPackets += packets
                     peerEncoded += encoded
                     peerBytes += bytes
+                    /* 编码器自己的目标码率，以及 WebRTC 判定的受限原因。
+                       `qualityLimitationReason` 只有四个值：
+                         none       — 没受限，糊就是画布/缩放/内容本身的问题
+                         bandwidth  — GCC 掐的，要加带宽
+                         cpu        — 编码器跑不动，要降分辨率或降帧
+                         other      — 别的（多半是采集侧节流） */
+                    let target = (stat.values["targetBitrate"] as? NSNumber)?.intValue ?? 0
+                    if target > peerTarget { peerTarget = target }
+                    let reason = (stat.values["qualityLimitationReason"] as? String) ?? ""
+                    if !reason.isEmpty, reason != "none" { peerQuality = reason }
+                    else if peerQuality.isEmpty { peerQuality = reason }
                 }
                 /* 一条都没匹配上共享轨：说明统计里没有 trackIdentifier，
                    或者共享这条根本没建 send stream。前者按全部视频兜底，
@@ -1014,6 +1065,14 @@ final class RealRTCClient: NSObject, RTCClient {
                 }
                 totals.merge(packets: peerPackets, encoded: peerEncoded)
                 totals.merge(bytes: peerBytes, camera: cameraBytes)
+                totals.merge(
+                    targetBps: peerTarget,
+                    qualityReason: peerQuality,
+                    availableBps: pairAvailable,
+                    rttMs: pairRttMs,
+                    localCandidate: pairLocal,
+                    remoteCandidate: pairRemote
+                )
                 group.leave()
             }
         }
@@ -1046,9 +1105,22 @@ final class RealRTCClient: NSObject, RTCClient {
                 sendsUpstream: sendsUpstream,
                 senders: senderCount,
                 bitrateBps: screenBps,
-                cameraBitrateBps: cameraBps
+                cameraBitrateBps: cameraBps,
+                targetBitrateBps: snapshot.targetBps,
+                qualityReason: snapshot.qualityReason,
+                availableOutgoingBps: snapshot.availableBps,
+                rttMs: snapshot.rttMs,
+                localCandidate: snapshot.localCandidate,
+                remoteCandidate: snapshot.remoteCandidate
             )
-            self.reactToUplinkSample(snapshot, trackEnabled: trackEnabled, sendsUpstream: sendsUpstream)
+            /* 只把"要不要改本地轨"需要的那三个字段传下去。
+               整个元组传进去会让签名跟着 stats 一起膨胀，
+               以后再加一个字段就要改三处。 */
+            self.reactToUplinkSample(
+                (packets: snapshot.packets, encoded: snapshot.encoded, attached: snapshot.attached),
+                trackEnabled: trackEnabled,
+                sendsUpstream: sendsUpstream
+            )
         }
     }
 
@@ -1059,7 +1131,7 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 那条还在路上的 offer。共享 m-line 现在在入会首轮就谈好，链路正常时
     /// 这里没有事情要做；只有"轨被谁关掉了"这种本地状态才值得修。
     private func reactToUplinkSample(
-        _ snapshot: (packets: Int, encoded: Int, screenBytes: Int, cameraBytes: Int, attached: Bool),
+        _ snapshot: (packets: Int, encoded: Int, attached: Bool),
         trackEnabled: Bool,
         sendsUpstream: Bool
     ) {
@@ -2873,6 +2945,15 @@ private final class VideoUplinkTotals: @unchecked Sendable {
     private var screenBytes = 0
     private var cameraBytes = 0
     private var attached = true
+    /* 画质判决书。这些数字全在 getStats 里，但以前一个都没读——
+       "编码 38 帧 / 出帧 275 帧"到底是带宽不够还是 CPU 编不动，
+       不读 qualityLimitationReason 就只能猜。 */
+    private var targetBps = 0
+    private var qualityReason = ""
+    private var availableBps = 0
+    private var rttMs = 0
+    private var localCandidate = ""
+    private var remoteCandidate = ""
 
     func merge(packets: Int, encoded: Int) {
         lock.lock()
@@ -2890,16 +2971,55 @@ private final class VideoUplinkTotals: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// 画质相关的一组事实。多条 peer 时取"最好的那条"：
+    /// 诊断要回答的是"能不能发清楚"，被某一条差链路拉低没有参考价值。
+    func merge(
+        targetBps: Int,
+        qualityReason: String,
+        availableBps: Int,
+        rttMs: Int,
+        localCandidate: String,
+        remoteCandidate: String
+    ) {
+        lock.lock()
+        self.targetBps = max(self.targetBps, targetBps)
+        self.availableBps = max(self.availableBps, availableBps)
+        if !qualityReason.isEmpty, qualityReason != "none" {
+            self.qualityReason = qualityReason
+        } else if self.qualityReason.isEmpty {
+            self.qualityReason = qualityReason
+        }
+        if rttMs > 0, self.rttMs == 0 || rttMs < self.rttMs { self.rttMs = rttMs }
+        if !localCandidate.isEmpty { self.localCandidate = localCandidate }
+        if !remoteCandidate.isEmpty { self.remoteCandidate = remoteCandidate }
+        lock.unlock()
+    }
+
     func markDetached() {
         lock.lock()
         attached = false
         lock.unlock()
     }
 
-    func snapshot() -> (packets: Int, encoded: Int, screenBytes: Int, cameraBytes: Int, attached: Bool) {
+    func snapshot() -> (
+        packets: Int,
+        encoded: Int,
+        screenBytes: Int,
+        cameraBytes: Int,
+        attached: Bool,
+        targetBps: Int,
+        qualityReason: String,
+        availableBps: Int,
+        rttMs: Int,
+        localCandidate: String,
+        remoteCandidate: String
+    ) {
         lock.lock()
         defer { lock.unlock() }
-        return (packets, encoded, screenBytes, cameraBytes, attached)
+        return (
+            packets, encoded, screenBytes, cameraBytes, attached,
+            targetBps, qualityReason, availableBps, rttMs, localCandidate, remoteCandidate
+        )
     }
 }
 

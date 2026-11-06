@@ -288,6 +288,36 @@ final class MeetingViewModel: ObservableObject {
                 videoLine += String(format: " · 采样 %.1f 秒前", Date().timeIntervalSince(sampledAt))
             }
             lines.append(videoLine)
+
+            /* 画质判决书。`受限` 一项直接区分三种完全不同的病因：
+               bandwidth = 网不够（加带宽才有用）
+               cpu       = 编码器跑不动（要降分辨率/去缩放）
+               none      = 没受限，糊就只能是画布或缩放的问题
+               候选类型补上传输路径：relay 表示走 TURN 中继，
+               带宽和延迟都由服务器决定，跟手机连的是什么网无关。 */
+            if video.targetBitrateBps > 0 || !video.qualityReason.isEmpty {
+                var qualityLine = "画质："
+                qualityLine += String(format: "目标码率 %.1fMbps", Double(video.targetBitrateBps) / 1_000_000)
+                if video.availableOutgoingBps > 0 {
+                    qualityLine += String(format: " · 可用上行 %.1fMbps", Double(video.availableOutgoingBps) / 1_000_000)
+                }
+                let reasonText: String
+                switch video.qualityReason {
+                case "bandwidth": reasonText = "带宽不足"
+                case "cpu": reasonText = "编码器过载"
+                case "other": reasonText = "其他"
+                case "none", "": reasonText = "无"
+                default: reasonText = video.qualityReason
+                }
+                qualityLine += " · 受限 \(reasonText)"
+                if !video.localCandidate.isEmpty || !video.remoteCandidate.isEmpty {
+                    qualityLine += " · 候选 \(video.localCandidate)→\(video.remoteCandidate)"
+                }
+                if video.rttMs > 0 {
+                    qualityLine += " · RTT \(video.rttMs)ms"
+                }
+                lines.append(qualityLine)
+            }
         } else {
             lines.append("RTC 视频：尚未采样（入会后约 3 秒出结果；无对端时不会发包）")
         }
@@ -312,6 +342,50 @@ final class MeetingViewModel: ObservableObject {
             lines.append("最近错误：\(error)")
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// 把当前共享现场推给诊断通道。由一秒心跳驱动，内部按 2 秒节流。
+    ///
+    /// 上报内容 = 诊断面板原文 + 一组结构化指标。原文方便人读；
+    /// 结构化指标方便看趋势——码率、编码帧数、受限原因都是小时序，
+    /// 只看某一秒的截图分不清"一直 200kbps"和"刚掉到 200kbps"。
+    /// 任何失败都静默，这条通道绝不能影响正在进行的通话。
+    private func reportShareDiagnostics() {
+        guard supportsNativeScreenShare else { return }
+        let video = ScreenShareRuntime.videoStats
+        var stats: [String: Any] = [
+            "sharing": isScreenSharing,
+            "sampled": video.sampled,
+            "senders": video.senders,
+            "attached": video.screenAttached,
+            "trackOn": video.trackEnabled,
+            "inSdp": video.sendsUpstream,
+            "encoded": video.framesEncoded,
+            "packets": video.packetsSent,
+            "screenBps": video.bitrateBps,
+            "cameraBps": video.cameraBitrateBps,
+            "targetBps": video.targetBitrateBps,
+            "quality": video.qualityReason,
+            "availBps": video.availableOutgoingBps,
+            "rttMs": video.rttMs,
+            "localCand": video.localCandidate,
+            "remoteCand": video.remoteCandidate,
+        ]
+        if let session = nativeShareSession {
+            stats["pushed"] = session.frameCount
+            stats["idleFrames"] = session.idleFrameCount
+            stats["running"] = session.isRunning
+            stats["source"] = session.captureSummary ?? ""
+        }
+        if let client = rtc as? RealRTCClient {
+            stats["mLines"] = client.screenSdpOverview
+        }
+        DiagReporter.shared.report(
+            room: meetingNumber,
+            uid: localUser?.id ?? "",
+            text: shareDiagnosticsReport,
+            stats: stats
+        )
     }
 
     /// 共享轨当前是否 enabled。
@@ -1689,6 +1763,9 @@ private extension MeetingViewModel {
             // 这里统一用 Task { @MainActor } 显式回到主线程，任何编译器版本都不会有歧义。
             Task { @MainActor in
                 self?.refreshClocks()
+                /* 诊断回传挂在这一拍上：它本来就要每秒算一次现场，
+                   DiagReporter 内部再节流到 2 秒，不多耗一点。 */
+                self?.reportShareDiagnostics()
             }
         }
         ticker = source

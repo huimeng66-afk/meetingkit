@@ -906,11 +906,19 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
            发生在「异常护盾」自己身上：block 用 unsafeBitCast 塞进 C 函数
            指针后 ARC 不认它是对象，编译器提前释放，系统拿到野指针，
            EXC_BAD_ACCESS，@try/@catch 也拦不住。 */
+        /* 1.8.0：把目标画布交给 SCK，而不是留给 WebRTC 每帧去缩。
+           真机现场是「推到 source 275 帧、编码器只吃下 38 帧」——
+           差额全部消耗在 `AdaptedVideoTrackSource::OnFrame` 里的一次
+           1180×2556 → 880×1920 的 CPU 缩放上。SCK 自己有 GPU，
+           直出 880×1920 之后这一层就变成零拷贝。
+           设不进去也无害：ObjC 侧有 @try，失败就退回系统默认分辨率，
+           `adaptCanvasIfNeeded` 仍按真实 buffer 尺寸兜底。 */
+        let canvas = outputSize(for: filter)
         let (built, buildError) = SCKStreamBuilder.makeStream(
             filter: filter,
             delegate: self,
-            width: 0,
-            height: 0
+            width: canvas.width,
+            height: canvas.height
         )
         if let buildError {
             fail("创建屏幕捕获流失败：\(buildError)")
@@ -921,6 +929,9 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
             return
         }
         ShareBreadcrumb.mark("sck:stream-created")
+        /* SCK 真的按 canvas 出帧时，`adaptCanvasIfNeeded` 会因为尺寸已匹配
+           直接 return，那里的 pushInterval 就永远设不上。这里先定好。 */
+        pushInterval = 1.0 / Double(max(Int(RealRTCClient.screenEncodingProfile.fps), 1))
 
         // SCStreamOutputType 的原始值：macOS 上是 screen=0 / audio=1。
         // iOS 27 是这个枚举第一次进手机，顺序没有公开保证，所以两种都订阅：
@@ -986,7 +997,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         }
     }
 
-    /// 输出画布：长边 1280，按内容宽高比缩放，且保证是偶数。
+    /// 输出画布：按内容宽高比缩到编码档位长边以内，宽高 16 对齐。
     ///
     /// 单位换算踩过一次坑：`contentRect` 是**点**，`width/height` 是**像素**。
     /// 3x 屏整屏是 393×852 点，不乘 pointPixelScale 就只编码到 1/3 分辨率，
@@ -999,16 +1010,19 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         let full = screenPixelSize()
         let rawWidth = rect?.width ?? full.width
         let rawHeight = rect?.height ?? full.height
-        let width = sanitize(rawWidth, fallback: 390)
-        let height = sanitize(rawHeight, fallback: 844)
+        let width = sanitize(rawWidth, fallback: full.width)
+        let height = sanitize(rawHeight, fallback: full.height)
 
-        let ratio = width / height
-        let longEdge: CGFloat = 1280
-
-        if ratio >= 1 {
-            return (even(Int(longEdge)), even(Int((longEdge / ratio).rounded())))
-        }
-        return (even(Int((longEdge * ratio).rounded())), even(Int(longEdge)))
+        /* 与 `adaptCanvasIfNeeded` 用同一套算法：长边取编码档位的长边，
+           宽高 16 对齐。两边算出来的必须一模一样，否则 SCK 按 A 尺寸出帧、
+           adapter 又按 B 尺寸再缩一次，白做一层还多一次重建。 */
+        let profile = RealRTCClient.screenEncodingProfile
+        let longEdge = max(Int(profile.width), Int(profile.height))
+        return ScreenOutputSize.fit(
+            width: Int(width.rounded()),
+            height: Int(height.rounded()),
+            maxLongEdge: longEdge
+        )
     }
 
     /// 任何非有限值（NaN / ±Inf）或离谱值都换成安全值。
