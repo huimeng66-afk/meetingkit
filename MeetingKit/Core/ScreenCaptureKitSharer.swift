@@ -735,7 +735,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
                     newStream,
                     output: self,
                     type: outputType,
-                    queue: sampleQueue as AnyObject
+                    queue: self.sampleQueue as AnyObject
                 ) {
                     subscribed = true
                 }

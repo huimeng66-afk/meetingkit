@@ -74,7 +74,8 @@ enum ShareBreadcrumb {
 
     /// 这一次共享正常结束了（停止 / 失败降级），清掉现场。
     static func finish() {
-        try? FileManager.default.removeItem(at: stepURL)
+        guard let url = stepURL else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     /// 诊断面板用的一行。没有记录时返回 nil。
