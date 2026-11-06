@@ -1670,7 +1670,9 @@ final class RealRTCClient: NSObject, RTCClient {
     ///
     /// fps 用 `Int32`：`adaptOutputFormat` 的入参就是 `Int32`，
     /// 这里跟着它的类型走，调用点不必到处写 `Int32(...)`。
-    static var screenEncodingProfile: (width: Int32, height: Int32, fps: Int32, bitrate: Int) {
+    /// 共享采样侧（SCK / ReplayKit 的帧回调队列）也要读它，
+    /// 所以必须是 nonisolated：只读 UserDefaults 快照，不碰任何 UI 状态。
+    nonisolated static var screenEncodingProfile: (width: Int32, height: Int32, fps: Int32, bitrate: Int) {
         switch AppSettings.shareQualitySnapshot {
         case .sharp:
             // 4Mbps 对 1080p 的文档画面是不够的：滚动/翻页时整屏都在变，
