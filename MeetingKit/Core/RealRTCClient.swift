@@ -812,17 +812,19 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 与 `beginScreenFramePush` 的唯一区别是**不启动 ScreenFramePusher**：
     /// 那个是轮询 App Group 里 JPEG 的，SCK 路径下容器里什么都没有。
     func beginNativeScreenPush() {
-        guard let track = localScreenTrack, localScreenSource != nil else { return }
-        guard !isScreenSharing else { return }
-
-        isScreenSharing = true
+        guard let track = localScreenTrack else { return }
 
         /* 这里刻意不再调 adaptOutputFormat：
            它在 M140 内部会重建 video adapter，与 SCK 的帧回调并发会崩在
-           AdaptedVideoTrackSource::OnFrame。输出画布在 setupLocalMedia
-           创建 source 时已经设成 screenEncodingProfile，够用。
-           内容比例由 SCStreamConfiguration 的 width/height 控制，
-           竖屏内容会被 WebRTC 按比例居中，不会压扁。 */
+           AdaptedVideoTrackSource::OnFrame。画布由 SCK 在首帧按真实比例
+           自己设（ScreenCaptureKitSharer.adaptCanvasIfNeeded）。
+
+           也刻意**不**用 `isScreenSharing` 做早退：停止共享时 sender 上的轨
+           会被换回摄像头（或摘空），重新开始时如果这里直接 return，共享轨就
+           永远挂不回去——真机表现正是"第二次点共享，浏览器一直停在接收中"。
+           这个方法是幂等的：重复挂同一条轨只是重发一次 offer。 */
+        isScreenSharing = true
+        track.isEnabled = true
 
         // 用共享轨替换每条连接的 video sender（Web 端同款 replaceTrack）。
         for peer in remotePeers.values {
@@ -945,9 +947,17 @@ final class RealRTCClient: NSObject, RTCClient {
         screenPusher?.stop()
         screenPusher = nil
         isScreenSharing = false
-        let back = localVideoTrack
-        for peer in remotePeers.values {
-            peer.session.replaceVideoTrack(with: back)
+        if let back = localVideoTrack {
+            for peer in remotePeers.values {
+                peer.session.replaceVideoTrack(with: back)
+            }
+        } else {
+            /* 没有摄像头轨可回：不要把 sender.track 置空。
+               置空后对端那条 m-line 变成"无轨"，浏览器会把共享画面整块拆掉；
+               再开共享时收不到新的 track 事件，就永久停在"接收中"。
+               把屏幕轨留着、只关掉发送，对端 receiver 还在，
+               下一次 beginNativeScreenPush 打开就能立刻续上。 */
+            localScreenTrack?.isEnabled = false
         }
         applyCameraEncodingBudget()
         /* 广播结束同样会切一次路由：不抢回来，用户会遇到
@@ -1192,14 +1202,13 @@ final class RealRTCClient: NSObject, RTCClient {
             track.isEnabled = false
         }
 
-        // 共享源（帧由 SharedFrameStore 推送）。
+        /* 共享源（帧由 Broadcast 扩展的 JPEG 循环、ScreenCaptureKit 或
+           in-app 捕获推送）。
+           这里**不设** adaptOutputFormat：它是按目标画布"裁切 + 缩放"的，
+           在不知道真实内容比例之前先把画布定成 16:9，竖屏内容就会被切掉上下。
+           画布由真正拿到帧的那一端在首帧时按源比例设置（见
+           ScreenCaptureKitSharer.adaptCanvasIfNeeded 与 ScreenFramePusher）。 */
         let screenSource = factory.videoSource()
-        let screenProfile = Self.screenEncodingProfile
-        screenSource.adaptOutputFormat(
-            toWidth: screenProfile.width,
-            height: screenProfile.height,
-            fps: screenProfile.fps
-        )
         let screenTrack = factory.videoTrack(with: screenSource, trackId: "screen-\(UUID().uuidString)")
         screenTrack.isEnabled = true
         localScreenSource = screenSource

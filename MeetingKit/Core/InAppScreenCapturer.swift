@@ -35,6 +35,11 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
     private var source: RTCVideoSource?
     private var capturer: RTCVideoCapturer?
     private var running = false
+    /// 已设过的输出画布（见 ScreenOutputSize）。
+    private var adaptedCanvas: (width: Int, height: Int)?
+    /// 上一帧送进编码器的时间戳与间隔：帧率闸门，多出来的帧直接丢。
+    private var lastPushAt: CFTimeInterval = 0
+    private var pushInterval: CFTimeInterval = 1.0 / 24.0
 
     func start(source: RTCVideoSource) {
         guard !running else { return }
@@ -50,6 +55,9 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
         idleFrameCount = 0
         lastFrameAt = nil
         lastError = nil
+        adaptedCanvas = nil
+        lastPushAt = 0
+        pushInterval = 1.0 / Double(max(Int(RealRTCClient.screenEncodingProfile.fps), 1))
 
         /* 不要在这里开麦克风：会议的音频走独立的 RTCAudioTrack，
            再让 ReplayKit 采一次会产生两路麦克风，对端听到回声。 */
@@ -97,6 +105,15 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
               let source,
               let capturer else { return }
 
+        /* 画布必须和源同一个宽高比。
+           WebRTC 的 adaptOutputFormat 是"裁切 + 缩放"：按固定 16:9 设画布，
+           竖屏内容就会被切掉上下。 */
+        adaptCanvasIfNeeded(pixelBuffer: pixelBuffer, source: source)
+
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastPushAt >= pushInterval else { return }
+        lastPushAt = now
+
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let timeStampNs = Int64(CMTimeGetSeconds(timestamp) * 1_000_000_000)
         let buffer = RTCCVPixelBuffer(pixelBuffer: pixelBuffer)
@@ -105,6 +122,29 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
 
         frameCount += 1
         lastFrameAt = Date()
+    }
+
+    /// 按真实像素比例设置输出画布（只在首帧与尺寸变化时调用）。
+    private func adaptCanvasIfNeeded(pixelBuffer: CVPixelBuffer, source: RTCVideoSource) {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 1, height > 1 else { return }
+
+        let profile = RealRTCClient.screenEncodingProfile
+        let longEdge = max(Int(profile.width), Int(profile.height))
+        let target = ScreenOutputSize.fit(width: width, height: height, maxLongEdge: longEdge)
+        if let adaptedCanvas,
+           adaptedCanvas.width == target.width,
+           adaptedCanvas.height == target.height {
+            return
+        }
+        adaptedCanvas = (target.width, target.height)
+        pushInterval = 1.0 / Double(max(Int(profile.fps), 1))
+        source.adaptOutputFormat(
+            toWidth: Int32(target.width),
+            height: Int32(target.height),
+            fps: profile.fps
+        )
     }
 
     private func notify(_ state: ScreenSharingSessionState) {

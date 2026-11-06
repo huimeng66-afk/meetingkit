@@ -632,6 +632,17 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     private var running = false
     /// 选择器是否已经给过回应（选中或取消）。用于区分"面板还开着"和"面板没起来"。
     private var didReceivePickerCallback = false
+
+    /// 已经设过的输出画布。只在首帧与尺寸变化时重设：
+    /// `adaptOutputFormat` 内部会重建适配器，能少调一次就少调一次。
+    private var adaptedCanvas: (width: Int, height: Int)?
+    /// 上一帧送进编码器的时间戳（秒）。
+    private var lastPushAt: CFTimeInterval = 0
+    /// 两帧之间的最小间隔。屏幕共享要的是"近实时"，多出来的帧直接丢。
+    private var pushInterval: CFTimeInterval = 1.0 / 24.0
+    /// 是否已经报过"共享中"。首帧到达就报，不必干等 1.5 秒体检。
+    private var didSignalRunning = false
+
     private let stateLock = NSLock()
 
     /// 帧回调不挂在主队列：共享时用户很可能正在别的 App 里翻页，
@@ -658,6 +669,10 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         lastFrameAt = nil
         lastError = nil
         didReceivePickerCallback = false
+        didSignalRunning = false
+        adaptedCanvas = nil
+        lastPushAt = 0
+        pushInterval = 1.0 / Double(max(Int(RealRTCClient.screenEncodingProfile.fps), 1))
         // 黑匣子第一步：之后每推进一步都落盘。
         // 万一系统在某个调用里把进程带走，下次启动就知道死在哪。
         ShareBreadcrumb.mark("sck:start")
@@ -855,6 +870,8 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
            宁可多发几帧，也不能把已经在跑的流误判成失败。 */
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             guard let self, self.running else { return }
+            // 首帧已经把"共享中"报上去了，体检就没必要再做一遍。
+            guard !self.didSignalRunning else { return }
             self.stateLock.lock()
             let current = self.stream
             self.stateLock.unlock()
@@ -869,6 +886,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
             // 真的跑起来了：把「连续崩溃」计数清零，
             // 否则偶发崩溃会让这台机器永久失去系统捕获。
             ShareBreadcrumb.recordSckSuccess()
+            self.didSignalRunning = true
             self.notify(.running(startedAt: Date()))
         }
     }
@@ -1109,6 +1127,19 @@ extension ScreenCaptureKitSharer {
               let source,
               let capturer else { return }
 
+        /* 先对齐画幅，再谈帧率。
+           过去这里沿用 setupLocalMedia 里的 1920x1080 画布，而手机竖屏是
+           9:19.5 —— WebRTC 的适配器是"裁切后缩放"，于是上下被切掉、剩下的
+           590 宽再被放大到 1920，对端同时得到"缺一块"和"糊"两个结果。 */
+        adaptCanvasIfNeeded(pixelBuffer: pixelBuffer, source: source)
+
+        /* 帧率闸门。SCK 的屏幕回调通常是 30 甚至 60fps，
+           全推给编码器只会让它丢帧或排队——排队就是延迟。
+           这里按目标帧率取帧，多出来的直接扔，宁少不卡。 */
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastPushAt >= pushInterval else { return }
+        lastPushAt = now
+
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let timeStampNs = Int64(CMTimeGetSeconds(timestamp) * 1_000_000_000)
         let buffer = RTCCVPixelBuffer(pixelBuffer: pixelBuffer)
@@ -1117,6 +1148,48 @@ extension ScreenCaptureKitSharer {
 
         frameCount += 1
         lastFrameAt = Date()
+
+        /* 首帧是"真的在共享"最硬的证据。
+           原来只靠 startCapture 之后 1.5 秒的 isCapturing 体检，对端在这段
+           时间里看到的是"还没开始"，用户体验上就是"点了共享半天没反应"。 */
+        if !didSignalRunning {
+            didSignalRunning = true
+            ShareBreadcrumb.mark("sck:first-frame")
+            ShareBreadcrumb.recordSckSuccess()
+            notify(.running(startedAt: Date()))
+        }
+    }
+
+    /// 把输出画布设成与源同一个宽高比。
+    ///
+    /// 尺寸取的是 `CVPixelBuffer` 的**真实像素**，不需要再乘 pointPixelScale。
+    /// 画布比例一致时，适配器的裁切区域正好等于整帧——既不丢内容，也不会放大。
+    private func adaptCanvasIfNeeded(pixelBuffer: CVPixelBuffer, source: RTCVideoSource) {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 1, height > 1 else { return }
+
+        let profile = RealRTCClient.screenEncodingProfile
+        let longEdge = max(Int(profile.width), Int(profile.height))
+        let target = ScreenOutputSize.fit(width: width, height: height, maxLongEdge: longEdge)
+
+        if let adaptedCanvas,
+           adaptedCanvas.width == target.width,
+           adaptedCanvas.height == target.height {
+            return
+        }
+        adaptedCanvas = (target.width, target.height)
+        pushInterval = 1.0 / Double(max(Int(profile.fps), 1))
+
+        /* 只在首帧与尺寸变化时调：adaptOutputFormat 内部会重建视频适配器。
+           调用点固定在 sampleQueue 上，和 didCapture 是同一条串行队列，
+           不会出现"这边重建、那边同时用"的崩溃（1.5.x 踩过）。 */
+        source.adaptOutputFormat(
+            toWidth: Int32(target.width),
+            height: Int32(target.height),
+            fps: profile.fps
+        )
+        ScreenCaptureKitRuntime.note("画布 \(width)x\(height)→\(target.width)x\(target.height)")
     }
 
     /// 从 sample attachments 里找状态位。

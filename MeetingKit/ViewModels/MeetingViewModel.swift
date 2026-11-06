@@ -214,8 +214,14 @@ final class MeetingViewModel: ObservableObject {
             lines.append("已降级：SCK 起播失败，本次会议改用 in-app 捕获")
         }
 
-        if isScreenSharing, let startedAt = nativeShareStartedAt {
-            lines.append(String(format: "状态：共享中 · 已 %.0f 秒", Date().timeIntervalSince(startedAt)))
+        if isScreenSharing {
+            if let startedAt = nativeShareStartedAt {
+                lines.append(String(format: "状态：共享中 · 已 %.0f 秒", Date().timeIntervalSince(startedAt)))
+            } else {
+                // 共享中但拿不到起播时间：以前会落到下面的分支，显示成
+                // "等待系统面板选择内容"，而画面明明已经在推——误导排查方向。
+                lines.append("状态：共享中")
+            }
         } else if nativeShareSession != nil {
             lines.append("状态：等待系统面板选择内容")
         } else {
@@ -696,11 +702,18 @@ final class MeetingViewModel: ObservableObject {
             break
 
         case .running(let startedAt):
+            let wasSharing = isScreenSharing
             nativeShareStartedAt = startedAt
             nativeShareError = nil
             // SCK 的 running 一定是"刚刚真的开始"，不存在冷启动同步，
             // 所以 isInitial 固定为 false：要让 RTC 发一次 screen:state。
             applyScreenSharing(true, isInitial: false, source: .screenCaptureKit)
+            /* applyScreenSharing 里有 `isScreenSharing != broadcasting` 的短路：
+               状态若已被别的路径置成 true，它就不会再调一次挂轨，
+               对端便永远收不到画面。这里补一次——该方法是幂等的。 */
+            if wasSharing {
+                rtc.beginNativeScreenPush()
+            }
             showToast(.screenShareStarted())
 
         case .stopped:
@@ -1434,6 +1447,14 @@ private extension MeetingViewModel {
                 // 直接调用 @MainActor 方法，所以显式跳一次主线程。
                 Task { @MainActor in
                     guard let self = self else { return }
+
+                    /* iOS 27 起共享在本进程内跑（SCK / in-app），完全没有扩展进程，
+                       扩展桥的 isBroadcasting 只会是 false。这条订阅如果照单全收，
+                       它每一次回落都会调 applyScreenSharing(false)：
+                       状态被打回"未共享"、共享轨被摘掉，而 SCK 还在出帧——
+                       真机现象就是"画面突然停在某一帧，再点共享一直是接收中"。
+                       扩展通道以外的后端，这里一律不参与。 */
+                    guard self.screenSharingBackend == .broadcastExtension else { return }
 
                     let isInitial = !self.hasAppliedInitialShareState
                     self.hasAppliedInitialShareState = true
