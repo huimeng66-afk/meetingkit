@@ -206,6 +206,10 @@ final class MeetingViewModel: ObservableObject {
         // 无论当前走哪条都报一次绑定结论：SCK 失败降级到 in-app 时，
         // 这行正是唯一能说明"为什么降级"的证据，不能跟着 backend 一起消失。
         lines.append("SCK 绑定：\(ScreenCaptureKitRuntime.resolutionLog)")
+        // 上一次共享如果闪退，黑匣子会记下死在哪一步、抛了什么异常。
+        if let breadcrumb = ShareBreadcrumb.diagnosticLine {
+            lines.append(breadcrumb)
+        }
         if didFallbackToInApp {
             lines.append("已降级：SCK 起播失败，本次会议改用 in-app 捕获")
         }

@@ -89,6 +89,15 @@ enum ScreenSharingSessionFactory {
         // 必须先看 SCK，再退 in-app，最后才轮到扩展。
         guard #available(iOS 27.0, *) else { return .broadcastExtension }
 
+        /* 上一次共享没有正常收尾，说明进程是在共享链路上被带走的
+           （最可能是运行时绑定的某个调用抛了异常或触发了系统断言）。
+           本次会话不再试 SCK，直接 in-app：同一台设备不该连续闪退两次。
+           诊断面板会写明上次停在哪个调用，修好后再放开。 */
+        if ShareBreadcrumb.previousAttemptUnfinished {
+            ScreenCaptureKitRuntime.note("上次共享未收尾，本次跳过 SCK")
+            return .inApp
+        }
+
         if ScreenCaptureKitRuntime.isUsable {
             return .screenCaptureKit
         }
@@ -332,6 +341,28 @@ enum ScreenCaptureKitRuntime {
     // 选择子找不到时 objc_msgSend 什么都不会发生，也不会报错，
     // 表现出来就是"点了共享没弹窗、没反应"。
 
+    // MARK: 异常护盾
+    //
+    // Swift 没有 @try/@catch，Objective-C 抛出的 NSException 会直接终止进程。
+    // MKExceptionCatcher 是项目里唯一的 ObjC 文件，只做一件事：把 block 包进
+    // @try/@catch，把异常转成字符串。找不到它（比如被裁掉）就退化成直接调用。
+
+    static func shield(_ block: @escaping () -> Void) -> String? {
+        guard let cls = NSClassFromString("MKExceptionCatcher"),
+              let imp = classIMP(cls, "catchException:") else {
+            block()
+            return nil
+        }
+        let boxed: @convention(block) () -> Void = block
+        typealias F = @convention(c) (AnyObject, Selector, AnyObject) -> AnyObject?
+        let result = unsafeBitCast(imp, to: F.self)(
+            cls as AnyObject,
+            NSSelectorFromString("catchException:"),
+            unsafeBitCast(boxed, to: AnyObject.self)
+        )
+        return result as? String
+    }
+
     /// 打开选择器。返回命中的 setter 名，用于诊断。
     static func activatePicker(_ picker: AnyObject) -> String? {
         for name in ["setActive:", "setIsActive:"] where hasInstanceMethod(picker, name) {
@@ -518,6 +549,9 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         lastFrameAt = nil
         lastError = nil
         didReceivePickerCallback = false
+        // 黑匣子第一步：之后每推进一步都落盘。
+        // 万一系统在某个调用里把进程带走，下次启动就知道死在哪。
+        ShareBreadcrumb.mark("sck:start")
 
         guard let picker = ScreenCaptureKitRuntime.sharedPicker() else {
             fail("本机没有可用的系统内容选择器（ScreenCaptureKit 未加载）")
@@ -528,13 +562,6 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         // 先 remove 再 add：重复点「开始共享」时不会叠加观察者，
         // 否则一次选择会触发多次 startStream。
         // 选择子名不一定和 Swift 名一致，逐个试。
-        //
-        // 编译期没有 SCK 的协议头，Swift 类自然也不会声明 conformance。
-        // 少数系统版本会在 addObserver 时校验 conformsToProtocol，
-        // 这里用运行时把协议挂上去，挂了没坏处，不挂可能连观察者都加不上。
-        if let proto = objc_getProtocol("SCContentSharingPickerObserver") {
-            class_addProtocol(ScreenCaptureKitSharer.self, proto)
-        }
         for name in ["removeObserver:", "removePickerObserver:", "remove:"] {
             if ScreenCaptureKitRuntime.hasInstanceMethod(picker, name) {
                 ScreenCaptureKitRuntime.send(picker, name, self)
@@ -553,23 +580,46 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
             fail("系统内容选择器没有 addObserver 接口")
             return
         }
+        ShareBreadcrumb.mark("sck:observer")
 
         /* 顺序不能反：先把 active 打开，再 present。
-           active 默认是 false，为 false 时 present() 什么都不做。 */
-        guard let setter = ScreenCaptureKitRuntime.activatePicker(picker) else {
+           active 默认是 false，为 false 时 present() 什么都不做。
+           这两步都套异常护盾：系统如果因为权限/entitlement 抛 NSException，
+           护盾能接住并写进诊断，而不是把整个会议 App 带走。 */
+        ShareBreadcrumb.mark("sck:activating")
+        var setter: String?
+        if let reason = ScreenCaptureKitRuntime.shield({
+            setter = ScreenCaptureKitRuntime.activatePicker(picker)
+        }) {
+            ShareBreadcrumb.mark("sck:activate-exception")
+            failWithException("打开系统选择器时异常", reason)
+            return
+        }
+        guard let setter else {
             fail("系统内容选择器没有 active 开关")
             return
         }
         ScreenCaptureKitRuntime.note("active=\(setter)")
+        ShareBreadcrumb.mark("sck:activated(\(setter))")
 
         running = true
         notify(.picking)
 
-        guard let presentName = ScreenCaptureKitRuntime.presentPicker(picker) else {
+        ShareBreadcrumb.mark("sck:presenting")
+        var presentName: String?
+        if let reason = ScreenCaptureKitRuntime.shield({
+            presentName = ScreenCaptureKitRuntime.presentPicker(picker)
+        }) {
+            ShareBreadcrumb.mark("sck:present-exception")
+            failWithException("弹出系统面板时异常", reason)
+            return
+        }
+        guard let presentName else {
             fail("系统内容选择器没有 present 接口")
             return
         }
         ScreenCaptureKitRuntime.note("present=\(presentName)")
+        ShareBreadcrumb.mark("sck:presented(\(presentName))")
 
         schedulePresentCheck()
     }
@@ -604,6 +654,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         stream = nil
         running = false
         stateLock.unlock()
+        ShareBreadcrumb.finish()
 
         if let runningStream {
             ScreenCaptureKitRuntime.stopCapture(runningStream)
@@ -623,6 +674,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     // MARK: - 建立 SCStream
 
     private func startStream(with filter: AnyObject) {
+        ShareBreadcrumb.mark("sck:stream-init")
         guard let streamClass = ScreenCaptureKitRuntime.streamType,
               let configurationClass = ScreenCaptureKitRuntime.configurationType,
               let configuration = ScreenCaptureKitRuntime.newInstance(of: configurationClass) else {
@@ -652,56 +704,79 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         ScreenCaptureKitRuntime.setBool(configuration, "setCapturesAudio:", false)
         ScreenCaptureKitRuntime.setInt(configuration, "setQueueDepth:", 3)
 
-        guard let newStream = ScreenCaptureKitRuntime.newInstance(
-            of: streamClass,
-            selector: "initWithFilter:configuration:delegate:",
-            filter,
-            configuration,
-            self
-        ) else {
+        var created: AnyObject?
+        if let reason = ScreenCaptureKitRuntime.shield({
+            created = ScreenCaptureKitRuntime.newInstance(
+                of: streamClass,
+                selector: "initWithFilter:configuration:delegate:",
+                filter,
+                configuration,
+                self
+            )
+        }) {
+            failWithException("创建屏幕捕获流时异常", reason)
+            return
+        }
+        guard let newStream = created else {
             fail("无法创建屏幕捕获流")
             return
         }
+        ShareBreadcrumb.mark("sck:stream-created")
 
         // SCStreamOutputType 的原始值：macOS 上是 screen=0 / audio=1。
         // iOS 27 是这个枚举第一次进手机，顺序没有公开保证，所以两种都订阅：
         // 订阅错的那个只会收到音频（没有图像缓冲区，处理时天然被过滤），
         // 比赌一个数字然后整场黑屏划算。
         var subscribed = false
+        var subscribeError: String?
         for outputType in [0, 1] {
-            if ScreenCaptureKitRuntime.addStreamOutput(
-                newStream,
-                output: self,
-                type: outputType,
-                queue: sampleQueue as AnyObject
-            ) {
-                subscribed = true
+            if let reason = ScreenCaptureKitRuntime.shield({
+                if ScreenCaptureKitRuntime.addStreamOutput(
+                    newStream,
+                    output: self,
+                    type: outputType,
+                    queue: sampleQueue as AnyObject
+                ) {
+                    subscribed = true
+                }
+            }) {
+                subscribeError = reason
             }
         }
         guard subscribed else {
-            fail("无法接收屏幕帧（addStreamOutput 被拒绝）")
+            if let subscribeError {
+                failWithException("订阅屏幕帧时异常", subscribeError)
+            } else {
+                fail("无法接收屏幕帧（addStreamOutput 被拒绝）")
+            }
             return
         }
+        ShareBreadcrumb.mark("sck:outputs-added")
 
         stateLock.lock()
         stream = newStream
         stateLock.unlock()
 
-        ScreenCaptureKitRuntime.startCapture(newStream) { [weak self] error in
-            guard let self else { return }
-            if let error {
-                self.stateLock.lock()
-                self.stream = nil
-                self.running = false
-                self.stateLock.unlock()
-                self.fail(error.localizedDescription)
-                return
+        if let reason = ScreenCaptureKitRuntime.shield({
+            ScreenCaptureKitRuntime.startCapture(newStream) { [weak self] error in
+                guard let self else { return }
+                if let error {
+                    self.stateLock.lock()
+                    self.stream = nil
+                    self.running = false
+                    self.stateLock.unlock()
+                    self.fail(error.localizedDescription)
+                    return
+                }
+                ShareBreadcrumb.mark("sck:running")
+                self.notify(.running(startedAt: Date()))
             }
-            self.notify(.running(startedAt: Date()))
+        }) {
+            failWithException("启动屏幕捕获时异常", reason)
+            return
         }
     }
 
-    /// 输出画布：长边 1280，按内容宽高比缩放，且保证是偶数。
     /// 输出画布：长边 1280，按内容宽高比缩放，且保证是偶数。
     ///
     /// 单位换算踩过一次坑：`contentRect` 是**点**，`width/height` 是**像素**。
@@ -775,9 +850,19 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         ScreenCaptureKitRuntime.note("未识别回调 \(NSStringFromSelector(aSelector))")
     }
 
+    /// 系统抛异常时的收尾：异常写进黑匣子（不随 fail 一起清掉），
+    /// 然后走正常的失败路径降级。
+    private func failWithException(_ context: String, _ reason: String) {
+        ShareBreadcrumb.recordFailure("\(context)：\(reason)")
+        fail("\(context)：\(reason)")
+    }
+
     private func fail(_ message: String) {
         lastError = message
         running = false
+        // 走到这里是一条完整的失败路径，不是崩溃——把现场清掉，
+        // 免得下次启动被误判成"上次闪退"。
+        ShareBreadcrumb.finish()
         notify(.failed(message))
     }
 
@@ -945,6 +1030,7 @@ extension ScreenCaptureKitSharer {
         guard isCurrent else { return }
 
         lastError = (error as? NSError)?.localizedDescription
+        ShareBreadcrumb.finish()
         notify(.stopped)
     }
 }
