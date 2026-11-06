@@ -1303,9 +1303,17 @@ final class RealRTCClient: NSObject, RTCClient {
             peers: remotePeers.count
         )
         for peer in remotePeers.values {
+            /* 三层保险，任何一层生效都能把画面从"冻住"拉回"能动"：
+               1. SDP 的 x-google-start-bitrate —— 协商时被 libwebrtc 读走；
+               2. seedBandwidthEstimate —— 连接已建好、SDP 不重写时的运行期入口；
+               3. minBitrateBps —— 编码器自己的产出下限，保证链路退得出
+                  ALR（应用受限区），不再出现"发得少→不探测→涨不上去"。 */
             peer.session.setVideoEncoding(
                 maxBitrateBps: perPeer,
                 maxFramerate: Int(profile.fps),
+                // 目标的 15%：4Mbps 档 → 600kbps。低于这个数，编码器会
+                // 为了守住码率把九成的帧直接丢掉（现场就是 321 帧进、32 帧出）。
+                minBitrateBps: max(300_000, perPeer * 3 / 20),
                 keepResolution: true,
                 forScreen: true
             )
