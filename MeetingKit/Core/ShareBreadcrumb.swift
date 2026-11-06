@@ -58,7 +58,7 @@ enum ShareBreadcrumb {
     /// 这里记死次数，够数就永久改用 in-app——宁可只共享会议画面，
     /// 也不能让用户每次点共享都掉线。
     private(set) static var sckCrashCount = 0
-    static let sckCrashLimit = 2
+    static let sckCrashLimit = 1
 
     /// 在 App 启动时调用一次。
     static func loadAtLaunch() {

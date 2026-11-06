@@ -352,12 +352,19 @@ enum ScreenCaptureKitRuntime {
             block()
             return nil
         }
+        /* 参数类型必须声明成 @convention(block)。
+           1.6.7 这里是 `unsafeBitCast(boxed, to: AnyObject.self)`：ARC 不认
+           这个"对象"，编译器可能在调用前就把它释放掉，系统拿到野指针，
+           直接 EXC_BAD_ACCESS —— 闪退就发生在"护盾"自己身上。
+           写成 block 类型后，生命周期由编译器按对象规则管理。 */
         let boxed: @convention(block) () -> Void = block
-        typealias F = @convention(c) (AnyObject, Selector, AnyObject) -> AnyObject?
+        typealias F = @convention(c) (
+            AnyObject, Selector, @convention(block) () -> Void
+        ) -> AnyObject?
         let result = unsafeBitCast(imp, to: F.self)(
             cls as AnyObject,
             NSSelectorFromString("catchException:"),
-            unsafeBitCast(boxed, to: AnyObject.self)
+            boxed
         )
         return result as? String
     }
@@ -495,6 +502,109 @@ enum ScreenCaptureKitRuntime {
             stream,
             NSSelectorFromString("stopCaptureWithCompletionHandler:"),
             unsafeBitCast(block, to: AnyObject.self)
+        )
+    }
+}
+
+// MARK: - 建流：全部交给 ObjC
+
+/// `MKScreenShareBuilder` 的 Swift 入口。
+///
+/// 为什么这层这么薄：所有会碰到系统框架的调用（建配置、建流、订阅、启动）
+/// 都发生在 ObjC 里面，那里有真正的 `@try/@catch`，参数类型由运行时按
+/// 真实 type encoding 决定，不需要把方法签名抄成函数指针去猜。
+///
+/// 这里只用函数指针调**我们自己写的**类方法，签名由自己定义，
+/// 不存在"猜系统 API"的风险。
+enum SCKStreamBuilder {
+
+    private static var builderClass: AnyClass? { NSClassFromString("MKScreenShareBuilder") }
+
+    static func makeStream(
+        filter: AnyObject,
+        delegate: AnyObject,
+        width: Int,
+        height: Int
+    ) -> (stream: AnyObject?, error: String?) {
+        guard let cls = builderClass,
+              let imp = ScreenCaptureKitRuntime.classIMP(
+                cls,
+                "streamWithFilter:delegate:width:height:error:"
+              ) else {
+            return (nil, "找不到 MKScreenShareBuilder")
+        }
+        typealias F = @convention(c) (
+            AnyObject, Selector, AnyObject, AnyObject, Int, Int, UnsafeMutablePointer<NSString?>?
+        ) -> AnyObject?
+        var error: NSString?
+        let stream = unsafeBitCast(imp, to: F.self)(
+            cls as AnyObject,
+            NSSelectorFromString("streamWithFilter:delegate:width:height:error:"),
+            filter,
+            delegate,
+            width,
+            height,
+            &error
+        )
+        return (stream, error.map { $0 as String })
+    }
+
+    /// 返回 nil 表示订阅成功。
+    static func subscribe(
+        _ stream: AnyObject,
+        output: AnyObject,
+        type: Int,
+        queue: DispatchQueue
+    ) -> String? {
+        guard let cls = builderClass,
+              let imp = ScreenCaptureKitRuntime.classIMP(cls, "subscribe:output:type:queue:") else {
+            return "找不到 MKScreenShareBuilder.subscribe"
+        }
+        typealias F = @convention(c) (AnyObject, Selector, AnyObject, AnyObject, Int, AnyObject) -> AnyObject?
+        let result = unsafeBitCast(imp, to: F.self)(
+            cls as AnyObject,
+            NSSelectorFromString("subscribe:output:type:queue:"),
+            stream,
+            output,
+            type,
+            queue as AnyObject
+        )
+        return result as? String
+    }
+
+    static func start(_ stream: AnyObject) -> Bool {
+        guard let cls = builderClass,
+              let imp = ScreenCaptureKitRuntime.classIMP(cls, "start:") else {
+            return false
+        }
+        typealias F = @convention(c) (AnyObject, Selector, AnyObject) -> Bool
+        return unsafeBitCast(imp, to: F.self)(
+            cls as AnyObject,
+            NSSelectorFromString("start:"),
+            stream
+        )
+    }
+
+    static func stop(_ stream: AnyObject) {
+        guard let cls = builderClass,
+              let imp = ScreenCaptureKitRuntime.classIMP(cls, "stop:") else { return }
+        typealias F = @convention(c) (AnyObject, Selector, AnyObject) -> Void
+        unsafeBitCast(imp, to: F.self)(
+            cls as AnyObject,
+            NSSelectorFromString("stop:"),
+            stream
+        )
+    }
+
+    static func updateFilter(_ stream: AnyObject, filter: AnyObject) {
+        guard let cls = builderClass,
+              let imp = ScreenCaptureKitRuntime.classIMP(cls, "updateFilter:filter:") else { return }
+        typealias F = @convention(c) (AnyObject, Selector, AnyObject, AnyObject) -> Void
+        unsafeBitCast(imp, to: F.self)(
+            cls as AnyObject,
+            NSSelectorFromString("updateFilter:filter:"),
+            stream,
+            filter
         )
     }
 }
@@ -656,7 +766,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         ShareBreadcrumb.finish()
 
         if let runningStream {
-            ScreenCaptureKitRuntime.stopCapture(runningStream)
+            SCKStreamBuilder.stop(runningStream)
         }
         if let picker {
             ScreenCaptureKitRuntime.deactivatePicker(picker)
@@ -674,60 +784,31 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
 
     private func startStream(with filter: AnyObject) {
         ShareBreadcrumb.mark("sck:stream-init")
-        guard let streamClass = ScreenCaptureKitRuntime.streamType,
-              let configurationClass = ScreenCaptureKitRuntime.configurationType,
-              let configuration = ScreenCaptureKitRuntime.newInstance(of: configurationClass) else {
-            fail("无法创建屏幕捕获配置")
+
+        /* 尺寸、帧率、像素格式——一个都不设。
+           1.6.6 设五个 API_UNAVAILABLE 的属性，崩；1.6.7 只留宽高，还是崩。
+           Apple 的 iOS 27 示例和社区实现都是 `SCStreamConfiguration()`
+           什么都不配就直接建流。这一版把变量减到零：连 contentRect /
+           pointPixelScale 都不再读，建流路径上不碰任何可选属性。 */
+        ShareBreadcrumb.mark("sck:cfg-default-size")
+
+        /* 建流整段交给 ObjC（MKScreenShareBuilder）。
+           这里不再拼函数指针、不再跨语言传 block —— 1.6.7 的崩溃正是
+           发生在「异常护盾」自己身上：block 用 unsafeBitCast 塞进 C 函数
+           指针后 ARC 不认它是对象，编译器提前释放，系统拿到野指针，
+           EXC_BAD_ACCESS，@try/@catch 也拦不住。 */
+        let (built, buildError) = SCKStreamBuilder.makeStream(
+            filter: filter,
+            delegate: self,
+            width: 0,
+            height: 0
+        )
+        if let buildError {
+            fail("创建屏幕捕获流失败：\(buildError)")
             return
         }
-        ShareBreadcrumb.mark("sck:cfg-new")
-
-        let size = outputSize(for: filter)
-        ShareBreadcrumb.mark("sck:cfg-size(\(size.width)x\(size.height))")
-
-        /* 只设宽高，其余一个都不碰。
-           1.6.6 在这里连着设了 pixelFormat / minimumFrameInterval / queueDepth /
-           showsCursor / capturesAudio —— 这五个在 iOS 上都标了 API_UNAVAILABLE。
-           标了不代表调用会安全返回，iOS 27 的实际实现里但凡有一条抛异常，
-           而这段没有护盾，进程当场就被带走：黑匣子停在 sck:stream-init 正是这个原因。
-           分辨率交给系统默认（BGRA）也完全够用，RTCCVPixelBuffer 两种都吃。 */
-        var configError: String?
-        if let reason = ScreenCaptureKitRuntime.shield({
-            if let object = configuration as? NSObject {
-                if object.responds(to: NSSelectorFromString("setWidth:")) {
-                    object.setValue(NSNumber(value: size.width), forKey: "width")
-                }
-                if object.responds(to: NSSelectorFromString("setHeight:")) {
-                    object.setValue(NSNumber(value: size.height), forKey: "height")
-                }
-            }
-        }) {
-            configError = reason
-        }
-        if let configError {
-            // 配置失败不等于不能共享：不设宽高就是按内容原始分辨率输出，
-            // 画面会大一点、带宽高一点，但能出去。记一笔继续。
-            ScreenCaptureKitRuntime.note("设置输出尺寸失败：\(configError)")
-            ShareBreadcrumb.mark("sck:cfg-default")
-        } else {
-            ShareBreadcrumb.mark("sck:cfg-ok")
-        }
-
-        var created: AnyObject?
-        if let reason = ScreenCaptureKitRuntime.shield({
-            created = ScreenCaptureKitRuntime.newInstance(
-                of: streamClass,
-                selector: "initWithFilter:configuration:delegate:",
-                filter,
-                configuration,
-                self
-            )
-        }) {
-            failWithException("创建屏幕捕获流时异常", reason)
-            return
-        }
-        guard let newStream = created else {
-            fail("无法创建屏幕捕获流")
+        guard let newStream = built else {
+            fail("创建屏幕捕获流失败")
             return
         }
         ShareBreadcrumb.mark("sck:stream-created")
@@ -737,27 +818,21 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         // 订阅错的那个只会收到音频（没有图像缓冲区，处理时天然被过滤），
         // 比赌一个数字然后整场黑屏划算。
         var subscribed = false
-        var subscribeError: String?
+        var lastSubscribeError: String?
         for outputType in [0, 1] {
-            if let reason = ScreenCaptureKitRuntime.shield({
-                if ScreenCaptureKitRuntime.addStreamOutput(
-                    newStream,
-                    output: self,
-                    type: outputType,
-                    queue: self.sampleQueue as AnyObject
-                ) {
-                    subscribed = true
-                }
-            }) {
-                subscribeError = reason
+            if let reason = SCKStreamBuilder.subscribe(
+                newStream,
+                output: self,
+                type: outputType,
+                queue: sampleQueue
+            ) {
+                lastSubscribeError = reason
+            } else {
+                subscribed = true
             }
         }
         guard subscribed else {
-            if let subscribeError {
-                failWithException("订阅屏幕帧时异常", subscribeError)
-            } else {
-                fail("无法接收屏幕帧（addStreamOutput 被拒绝）")
-            }
+            fail("无法接收屏幕帧：\(lastSubscribeError ?? "addStreamOutput 被拒绝")")
             return
         }
         ShareBreadcrumb.mark("sck:outputs-added")
@@ -766,26 +841,35 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         stream = newStream
         stateLock.unlock()
 
-        if let reason = ScreenCaptureKitRuntime.shield({
-            ScreenCaptureKitRuntime.startCapture(newStream) { [weak self] error in
-                guard let self else { return }
-                if let error {
-                    self.stateLock.lock()
-                    self.stream = nil
-                    self.running = false
-                    self.stateLock.unlock()
-                    self.fail(error.localizedDescription)
-                    return
-                }
-                ShareBreadcrumb.mark("sck:running")
-                // 真的跑起来了：把「连续崩溃」计数清零，
-                // 否则两次偶发崩溃会让这台机器永久失去系统捕获。
-                ShareBreadcrumb.recordSckSuccess()
-                self.notify(.running(startedAt: Date()))
-            }
-        }) {
-            failWithException("启动屏幕捕获时异常", reason)
+        guard SCKStreamBuilder.start(newStream) else {
+            stateLock.lock()
+            stream = nil
+            stateLock.unlock()
+            fail("启动屏幕捕获失败")
             return
+        }
+
+        /* 启动结果用 isCapturing 轮询，不等 completion。
+           SCK 的 completion 有时很晚才来（1.6.5 就因此让用户对着
+           "等待选择"发呆）；读不到 isCapturing（nil）时按成功处理，
+           宁可多发几帧，也不能把已经在跑的流误判成失败。 */
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, self.running else { return }
+            self.stateLock.lock()
+            let current = self.stream
+            self.stateLock.unlock()
+            guard let current, current === newStream else { return }
+
+            if ScreenCaptureKitRuntime.boolValue(current, "isCapturing") == false {
+                ShareBreadcrumb.mark("sck:capture-not-started")
+                self.fail("屏幕捕获没有启动（isCapturing 仍为 false）")
+                return
+            }
+            ShareBreadcrumb.mark("sck:running")
+            // 真的跑起来了：把「连续崩溃」计数清零，
+            // 否则偶发崩溃会让这台机器永久失去系统捕获。
+            ShareBreadcrumb.recordSckSuccess()
+            self.notify(.running(startedAt: Date()))
         }
     }
 
@@ -951,16 +1035,10 @@ extension ScreenCaptureKitSharer {
         stateLock.unlock()
 
         if let existing {
-            if let imp = ScreenCaptureKitRuntime.instanceIMP(existing, "updateContentFilter:completionHandler:") {
-                let block: @convention(block) (AnyObject?) -> Void = { _ in }
-                typealias F = @convention(c) (AnyObject, Selector, AnyObject, AnyObject) -> Void
-                unsafeBitCast(imp, to: F.self)(
-                    existing,
-                    NSSelectorFromString("updateContentFilter:completionHandler:"),
-                    filter,
-                    unsafeBitCast(block, to: AnyObject.self)
-                )
-            }
+            // 换源也走 ObjC：`updateContentFilter:completionHandler:` 在 iOS 上
+            // 标了 API_UNAVAILABLE，调不通会抛异常 —— 以前这里用 IMP 强转
+            // 加跨语言 block，抛出来就是闪退。现在最坏是"画面没换"，不是"人掉线"。
+            SCKStreamBuilder.updateFilter(existing, filter: filter)
             return
         }
 
