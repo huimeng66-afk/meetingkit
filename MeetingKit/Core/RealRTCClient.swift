@@ -114,6 +114,17 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 共享轨是否 enabled。诊断用：轨关着的时候，采集侧照样在出帧，
     /// 但所有帧都会被 WebRTC 丢掉，编码器一帧都拿不到。
     var isScreenTrackEnabled: Bool { localScreenTrack?.isEnabled ?? false }
+
+    /// 共享链路的一句话现场：m-line 数、远端是否可收、ICE 状态。
+    ///
+    /// 只有这三项能区分"本端以为在发"和"链路真的能发"。
+    /// 前几轮诊断缺的正是这一行，才会出现"挂轨/轨开/SDP允许"三绿但 0 包。
+    var screenLinkDebugText: String {
+        guard isScreenSharing, !remotePeers.isEmpty else { return "" }
+        return remotePeers.values
+            .map { "\($0.peerID)：\($0.session.screenLinkDebug)" }
+            .joined(separator: " · ")
+    }
     private var videoCapturer: RTCCameraVideoCapturer?
     /// 摄像头是否正在采集。与 `localVideoTrack.isEnabled` 分开：
     /// 轨可以一直是开的，但采集停了（关摄像头时 stopCapture 会熄灯）。
@@ -826,9 +837,9 @@ final class RealRTCClient: NSObject, RTCClient {
            而且这一步必须赶在 start() 之前，否则前几帧会按旧画布推。 */
         pusher.applyOutputFormat(width: profile.width, height: profile.height, fps: profile.fps)
 
-        // 用共享轨替换每条连接的 video sender（Web 端同款 replaceTrack）。
+        // 共享轨独占一条新 m-line（见 PeerSession.attachScreenTrack）。
         for peer in remotePeers.values {
-            peer.session.replaceVideoTrack(with: track)
+            peer.session.attachScreenTrack(track)
         }
         applyScreenEncodingBudget()
 
@@ -868,9 +879,14 @@ final class RealRTCClient: NSObject, RTCClient {
         offerRebuildCount = 0
         hardRepairCount = 0
 
-        // 用共享轨替换每条连接的 video sender（Web 端同款 replaceTrack）。
+        /* 共享轨独占一条新的 m-line（1.7.2）。
+           以前这里是 replaceVideoTrack：在摄像头 sender 上换源。
+           真机连续出现"sender 上就是共享轨、轨是开的、SDP 允许发，
+           编码器 0 帧、0 包"——replaceTrack 不会为一条没建起来的
+           send stream 重建发送通道，远端也收不到新的 ontrack。
+           新开 m-line 一定能拿到一条干净的 sendrecv 通道。 */
         for peer in remotePeers.values {
-            peer.session.replaceVideoTrack(with: track)
+            peer.session.attachScreenTrack(track)
         }
         applyScreenEncodingBudget()
 
@@ -1000,16 +1016,44 @@ final class RealRTCClient: NSObject, RTCClient {
 
         if snapshot.packets == 0 || !sendsUpstream || !snapshot.attached {
             guard reattachAttempts < 3,
-                  Date().timeIntervalSince(lastHardRepairAt) > 4 else { return }
+                  Date().timeIntervalSince(lastHardRepairAt) > 3 else { return }
             reattachAttempts += 1
             lastHardRepairAt = Date()
-            for peer in remotePeers.values {
-                peer.session.forceReattachVideo(track)
+
+            /* 三级阶梯，必须一级比一级狠。
+               1.7.1 只做到第一级，两次之后 `reattachAttempts < 3` 就永远
+               不成立——真机上正是"两次重挂之后彻底放弃，浏览器一直转圈"。
+               第二级必须换 m-line：send stream 没建起来时，在旧 m-line 上
+               怎么重挂都没用。 */
+            switch reattachAttempts {
+            case 1:
+                for peer in remotePeers.values {
+                    peer.session.forceReattachVideo(track)
+                }
+                ScreenShareRuntime.note(
+                    "上行自愈：packets=\(snapshot.packets) 挂轨=\(snapshot.attached ? 1 : 0) "
+                    + "SDP上行=\(sendsUpstream ? 1 : 0)，已重挂并重新协商（第 1 次）"
+                )
+            case 2:
+                guard let source = localScreenSource else { return }
+                let fresh = Self.sharedFactory.videoTrack(
+                    with: source,
+                    trackId: "screen-\(UUID().uuidString)"
+                )
+                fresh.isEnabled = true
+                localScreenTrack = fresh
+                for peer in remotePeers.values {
+                    peer.session.attachScreenTrack(fresh)
+                }
+                applyScreenEncodingBudget()
+                ScreenShareRuntime.note("上行自愈：仍 0 包，已重建共享 m-line 与发送通道（第 2 次）")
+            default:
+                let sessions = remotePeers.values.map { $0.session }
+                ScreenShareRuntime.note("上行自愈：重建 m-line 后仍 0 包，重建全部连接（第 3 次）")
+                for session in sessions {
+                    peerSessionNeedsRebuild(session)
+                }
             }
-            ScreenShareRuntime.note(
-                "上行自愈：packets=\(snapshot.packets) 挂轨=\(snapshot.attached ? 1 : 0) "
-                + "SDP上行=\(sendsUpstream ? 1 : 0)，已重挂并重新协商（第 \(reattachAttempts) 次）"
-            )
             return
         }
 
@@ -1037,7 +1081,7 @@ final class RealRTCClient: NSObject, RTCClient {
         fresh.isEnabled = true
         localScreenTrack = fresh
         for peer in remotePeers.values {
-            peer.session.replaceVideoTrack(with: fresh)
+            peer.session.attachScreenTrack(fresh)
         }
         ScreenShareRuntime.note("上行自愈：编码器连续 0 帧，已重建共享轨（第 \(hardRepairCount) 次）")
     }
@@ -1085,7 +1129,7 @@ final class RealRTCClient: NSObject, RTCClient {
             isScreenSharing = true
             if let track = localScreenTrack {
                 for peer in remotePeers.values {
-                    peer.session.replaceVideoTrack(with: track)
+                    peer.session.attachScreenTrack(track)
                 }
                 applyScreenEncodingBudget()
             }
@@ -1098,7 +1142,7 @@ final class RealRTCClient: NSObject, RTCClient {
 
         for peer in remotePeers.values where !peer.session.videoUplinkSummary.attached {
             if let track = localScreenTrack {
-                peer.session.replaceVideoTrack(with: track)
+                peer.session.attachScreenTrack(track)
             }
             ScreenShareRuntime.note("上行守护：sender 没挂共享轨，已重挂")
         }
@@ -1154,18 +1198,18 @@ final class RealRTCClient: NSObject, RTCClient {
         screenPusher?.stop()
         screenPusher = nil
         isScreenSharing = false
-        if let back = localVideoTrack {
-            for peer in remotePeers.values {
-                peer.session.replaceVideoTrack(with: back)
+        for peer in remotePeers.values {
+            /* 收掉共享 m-line（远端 receiver 随之 ended），再把"该发的轨"
+               改回摄像头。共享 m-line 留着不删的话，下一轮再 add 一条，
+               SDP 里的死 m-line 会越积越多，浏览器也可能挑到旧轨。 */
+            peer.session.detachScreenTrack()
+            if let back = localVideoTrack {
+                peer.session.restoreCameraTrack(back)
+            } else {
+                peer.session.clearLocalVideoIntent()
             }
-        } else {
-            /* 没有摄像头轨可回：不要把 sender.track 置空。
-               置空后对端那条 m-line 变成"无轨"，浏览器会把共享画面整块拆掉；
-               再开共享时收不到新的 track 事件，就永久停在"接收中"。
-               把屏幕轨留着、只关掉发送，对端 receiver 还在，
-               下一次 beginNativeScreenPush 打开就能立刻续上。 */
-            localScreenTrack?.isEnabled = false
         }
+        localScreenTrack?.isEnabled = false
         applyCameraEncodingBudget()
         /* 广播结束同样会切一次路由：不抢回来，用户会遇到
            "共享停了以后反而听不见人说话"。 */
@@ -1186,7 +1230,12 @@ final class RealRTCClient: NSObject, RTCClient {
         screenPusher = nil
         let back = localVideoTrack
         for peer in remotePeers.values {
-            peer.session.replaceVideoTrack(with: back)
+            peer.session.detachScreenTrack()
+            if let back {
+                peer.session.restoreCameraTrack(back)
+            } else {
+                peer.session.clearLocalVideoIntent()
+            }
         }
         applyCameraEncodingBudget()
         signaling?.sendMediaState(audio: nil, video: nil, screen: false)
@@ -1967,7 +2016,7 @@ final class RealRTCClient: NSObject, RTCClient {
                 session: session
             )
             newPeers[peerID] = peer
-            session.attachLocalTracks(audio: localAudioTrack, video: isScreenSharing ? localScreenTrack : localVideoTrack)
+            session.attachLocalTracks(audio: localAudioTrack, video: isScreenSharing ? localScreenTrack : localVideoTrack, screen: isScreenSharing)
         }
         remotePeers = newPeers
 
@@ -2048,7 +2097,7 @@ final class RealRTCClient: NSObject, RTCClient {
                 session: session
             )
             remotePeers[peerID] = peer
-            session.attachLocalTracks(audio: localAudioTrack, video: isScreenSharing ? localScreenTrack : localVideoTrack)
+            session.attachLocalTracks(audio: localAudioTrack, video: isScreenSharing ? localScreenTrack : localVideoTrack, screen: isScreenSharing)
         }
 
         // 断线期间错过的消息（consumeChatMessage 按 id 去重）。
@@ -2308,7 +2357,7 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         reactivateAudioSession()
 
         guard let session = makePeerSession(peerID: peerID) else { return }
-        session.attachLocalTracks(audio: localAudioTrack, video: isScreenSharing ? localScreenTrack : localVideoTrack)
+        session.attachLocalTracks(audio: localAudioTrack, video: isScreenSharing ? localScreenTrack : localVideoTrack, screen: isScreenSharing)
         /* 两路来源都要认：入会快照里带的 screen 标记，以及先于本事件到达、
            被 pendingScreenPeerID 暂存的 screen:state。 */
         let screenOn = (peer["screen"] as? Bool ?? false) || pendingScreenPeerID == peerID
@@ -2660,7 +2709,7 @@ extension RealRTCClient: PeerSessionDelegate {
             return
         }
         // attachLocalTracks 会触发 negotiationneeded → negotiate()，无需手动 restart。
-        newSession.attachLocalTracks(audio: localAudioTrack, video: isScreenSharing ? localScreenTrack : localVideoTrack)
+        newSession.attachLocalTracks(audio: localAudioTrack, video: isScreenSharing ? localScreenTrack : localVideoTrack, screen: isScreenSharing)
         peer.session = newSession
         publishParticipants()
         syncTeardownBox()

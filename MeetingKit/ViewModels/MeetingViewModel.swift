@@ -288,6 +288,16 @@ final class MeetingViewModel: ObservableObject {
             lines.append("自愈：\(notes)")
         }
 
+        /* 链路现场：m-line 数 / 远端是否可收 / ICE。
+           "挂轨、轨开、SDP 允许"这三项都是本端视角，全绿也可能一个包都发不出去。
+           这一行补上对端与传输层的证据。 */
+        if let client = rtc as? RealRTCClient {
+            let link = client.screenLinkDebugText
+            if !link.isEmpty {
+                lines.append("链路：\(link)")
+            }
+        }
+
         if let error = nativeShareError {
             lines.append("最近错误：\(error)")
         }
@@ -1619,9 +1629,9 @@ private extension MeetingViewModel {
 
                screen:state 与 replaceTrack 都是幂等的，重复发没有副作用；
                而漏发一次，对端就永远等不到。 */
-            if !isInitial {
-                rtc.startScreenShare()
-            }
+            /* 顺序很重要：先把共享轨挂上（新开 m-line），再告诉对端"我在共享"。
+               反过来做，浏览器会先切到共享舞台、再等一条还不存在的轨，
+               那几秒正是用户看到的"正在接收共享画面…"。 */
             switch source {
             case .broadcastExtension:
                 // 真实链路：开始把 App Group 里的共享帧推上 video sender。
@@ -1629,6 +1639,9 @@ private extension MeetingViewModel {
             case .screenCaptureKit:
                 // 帧由 SCK 直接推进 localScreenSource，这里只挂轨。
                 rtc.beginNativeScreenPush()
+            }
+            if !isInitial {
+                rtc.startScreenShare()
             }
         } else {
             if changed {
