@@ -255,36 +255,21 @@ final class PeerSession: NSObject {
     /// 不会出现"谈成 inactive 却以为能发"的情况。
     private func ensureScreenSender(_ track: RTCVideoTrack) {
         localScreen = track
-        if let sender = screenSender, sender.track?.trackId == track.trackId {
-            screenTrackId = track.trackId
+        /* 幂等判断只看自己记的 trackId，**不看 `sender.track`**。
+           M140 的 Swift 包装层里 `RTCRtpSender.track` 偶尔读回 nil，
+           拿它判断"已经挂了"会假阴性：真机上每开一次共享就 add 一条新
+           m-line（`SDP video 2` → `video 3`），方向判定被带偏、带宽被白吃。
+           `screenTrackId` 是本端写死的字符串，永远读得到。 */
+        if screenSender != nil, screenTrackId == track.trackId {
             return
         }
-        if let existing = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId }) {
-            screenSender = existing
-            screenTransceiver = peerConnection.transceivers.first { $0.sender.senderId == existing.senderId }
-            screenTrackId = track.trackId
-            _ = screenTransceiver?.setDirection(.sendOnly, error: nil)
+        /* 真有 sender 但 trackId 变了：M140 的 Swift 侧看不到 replaceTrack
+           （只有 ObjC 头文件里有），这里**绝不 add**。多一条 m-line 的代价
+           远大于黑屏：判定会错、共享会被判成"未进SDP"、每次共享再补协商。
+           正常路径下 track 只在入会时建一次，这个分支不会走到。 */
+        if screenSender != nil, screenTrackId != nil {
             return
         }
-        /* transceiver 还在、只是轨道对象换了（setup 重跑、断线重连都会换
-           一个新 UUID 的共享轨）：**换轨，不 add**。
-           每次 add 都会往 SDP 里多一条 video m-line；真机上 `SDP video 3`
-           之后共享被判成"未进SDP"，每开一次共享再补一次协商，m-line 只增不减。
-           带宽也被两条挂在同一路帧上的共享流白吃一份。 */
-        if let transceiver = screenTransceiver, !transceiver.isStopped {
-            if transceiver.sender.track?.trackId != track.trackId {
-                _ = transceiver.sender.replaceTrack(track)
-            }
-            _ = transceiver.setDirection(.sendOnly, error: nil)
-            screenSender = transceiver.sender
-            screenTrackId = track.trackId
-            return
-        }
-        /* 1.7.4：直接接住 `add` 的**返回值**，不再回头去 `senders` 里按
-           trackId 反查。反查拿到的是另一个包装对象时，后续的编码参数与轨
-           状态都作用在这个包装上，帧却推给了没有 VideoSendStream 的底层
-           sender——真机上就是"轨开着、SDP sendonly、编码 0 帧"。
-           返回值就是这条轨自己的 sender，不存在查错的余地。 */
         guard let newSender = peerConnection.add(track, streamIds: ["screen-\(peerID)"]) else {
             return
         }
@@ -323,8 +308,11 @@ final class PeerSession: NSObject {
             peerConnection.removeTrack(sender)
         }
         audioSender = nil
-        peerConnection.add(track, streamIds: ["tq-\(peerID)"])
-        audioSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
+        audioTrackId = nil
+        if let sender = peerConnection.add(track, streamIds: ["tq-\(peerID)"]) {
+            audioSender = sender
+            audioTrackId = track.trackId
+        }
         negotiate()
     }
 
@@ -342,13 +330,14 @@ final class PeerSession: NSObject {
     func attachScreenTrack(_ track: RTCVideoTrack) {
         guard !isClosed else { return }
 
-        let alreadyAttached = screenSender?.track?.trackId == track.trackId
-            && screenTrackId == track.trackId
+        /* 同 ensureScreenSender：不看 `sender.track`，那个属性读回 nil 时
+           会把"已经挂好"判成"没挂"，于是每开一次共享就补一次协商。 */
+        let alreadyAttached = screenSender != nil && screenTrackId == track.trackId
         /* 本地 sender 挂上 ≠ 这条 m-line 进了 SDP。
            对方先发 offer 时，answer 不能新增 m-line：sender 建好了、
            轨也开了，但它没有 mid，帧永远到不了编码器。这里以本地 SDP 为准，
            没进就补一次 offer（只补一次，重发由 scheduleOfferRetry 负责）。 */
-        let inSDP = Self.containsScreenMSID(peerConnection.localDescription?.sdp)
+        let inSDP = Self.screenMLineAcceptsSend(peerConnection.localDescription?.sdp)
             && !(screenTransceiver?.mid ?? "").isEmpty
         localScreen = track
         ensureScreenSender(track)
@@ -521,7 +510,7 @@ final class PeerSession: NSObject {
         guard let track = localScreen else { return summary }
         summary.trackExists = true
         summary.trackEnabled = track.isEnabled
-        summary.attached = screenSender?.track?.trackId == track.trackId
+        summary.attached = screenSender != nil && screenTrackId == track.trackId
         // 最后一条 video m-line 就是共享那条（摄像头先建，共享后建）。
         let localSDP = peerConnection.localDescription?.sdp
         summary.screenInSDP = Self.screenMLineAcceptsSend(localSDP)
@@ -555,6 +544,11 @@ final class PeerSession: NSObject {
         guard !isClosed else { return }
         negotiate()
     }
+
+    /// 摄像头 / 麦克风轨的 trackId，用途同 `screenTrackId`：
+    /// 幂等判断只认自己记的字符串，不依赖 `sender.track`。
+    private var videoTrackId: String?
+    private var audioTrackId: String?
 
     /// 共享轨的 trackId。看门狗用它把 `outbound-rtp` 统计里属于共享的那条
     /// 挑出来——摄像头和共享是两条独立的 send stream，合计会把"共享没发"
@@ -618,50 +612,30 @@ final class PeerSession: NSObject {
     }
 
     private func ensureSender(for track: RTCMediaStreamTrack, streamID: String) {
-        // 同一 track 只挂一个 sender，重复 attach 不产生第二个上行流。
-        if peerConnection.senders.contains(where: { $0.track?.trackId == track.trackId }) {
-            if track.kind == "video", videoSender == nil {
-                videoSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
-            }
-            if track.kind == "video", videoTransceiver == nil {
-                videoTransceiver = transceiverForVideoSender()
-            }
-            if track.kind == "audio", audioSender == nil {
-                audioSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
-            }
+        let isVideo = track.kind == "video"
+        let knownID = isVideo ? videoTrackId : audioTrackId
+        let hasSender = isVideo ? (videoSender != nil) : (audioSender != nil)
+
+        if hasSender, knownID == track.trackId {
+            if isVideo, videoTransceiver == nil { videoTransceiver = transceiverForVideoSender() }
             return
         }
-        /* 同 kind 已经有 sender、只是轨道对象换了（setup 重跑会重建
-           RTCCameraVideoCapturer 的轨），**必须 replaceTrack，不能 add**。
-           add 会往 SDP 里再加一条 m-line：真机上出现 `SDP video 3` 就是这么来的。
-           多出来的那条是 sendrecv 的摄像头，排在共享后面，直接把
-           "最后一条 video 是不是 sendonly" 的判断带偏，共享从此被判成
-           "未进SDP"，每次开共享都补一次协商——越协商 m-line 越多。
-           带宽也被两条摄像头流白吃一份。 */
-        if track.kind == "video",
-           let existing = videoSender ?? peerConnection.senders.first(where: {
-               $0.track?.kind == "video" && $0.senderId != screenSender?.senderId
-           }),
-           existing.track?.trackId != track.trackId,
-           existing.replaceTrack(track) {
-            videoSender = existing
-            if videoTransceiver == nil { videoTransceiver = transceiverForVideoSender() }
+        /* 同 kind 已有 sender、trackId 却变了（`setupLocalMedia` 重跑会重建轨）：
+           M140 没有 replaceTrack，这里也**不 add**。理由同 ensureScreenSender。 */
+        if hasSender, knownID != nil {
             return
         }
-        if track.kind == "audio",
-           let existing = audioSender ?? peerConnection.senders.first(where: { $0.track?.kind == "audio" }),
-           existing.track?.trackId != track.trackId,
-           existing.replaceTrack(track) {
-            audioSender = existing
-            return
-        }
-        peerConnection.add(track, streamIds: [streamID])
-        if track.kind == "video" {
-            videoSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
+        /* 用 `add` 的返回值，不回头按 trackId 反查：
+           反查依赖 `sender.track`，而这个属性在包装层里会读回 nil，
+           一旦反查失败，下一次 attach 就会再 add 一条 m-line。 */
+        guard let sender = peerConnection.add(track, streamIds: [streamID]) else { return }
+        if isVideo {
+            videoSender = sender
             videoTransceiver = transceiverForVideoSender()
-        }
-        if track.kind == "audio" {
-            audioSender = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId })
+            videoTrackId = track.trackId
+        } else {
+            audioSender = sender
+            audioTrackId = track.trackId
         }
     }
 
