@@ -287,6 +287,15 @@ final class MeetingViewModel: ObservableObject {
             if let sampledAt = video.sampledAt {
                 videoLine += String(format: " · 采样 %.1f 秒前", Date().timeIntervalSince(sampledAt))
             }
+            /* 编码率 = 编码帧 / 采集帧。这一项比码率更早暴露故障：
+               1.8.0 现场是 32/321 = 10%，编码器把九成的帧丢了，
+               浏览器那边看到的就是"画面冻住"。低于 60% 就一定有问题。 */
+            if let session = nativeShareSession, session.frameCount > 0, video.framesEncoded > 0 {
+                let ratio = Double(video.framesEncoded) / Double(session.frameCount)
+                if ratio < 0.9 {
+                    videoLine += String(format: " · 编码率 %.0f%% ⚠️", ratio * 100)
+                }
+            }
             lines.append(videoLine)
 
             /* 画质判决书。`受限` 一项直接区分三种完全不同的病因：
@@ -379,6 +388,7 @@ final class MeetingViewModel: ObservableObject {
         }
         if let client = rtc as? RealRTCClient {
             stats["mLines"] = client.screenSdpOverview
+            stats["h264Level"] = client.screenH264Level
         }
         DiagReporter.shared.report(
             room: meetingNumber,

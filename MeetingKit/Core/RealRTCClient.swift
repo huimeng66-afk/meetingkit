@@ -134,6 +134,13 @@ final class RealRTCClient: NSObject, RTCClient {
         return first.session.mLineOverview
     }
 
+    /// 协商出来的 H.264 level。`L3.1` 就是"整屏编不出来"的确诊单：
+    /// Level 3.1 只允许 3600 个宏块（1280×720），880×1920 是 6600 个。
+    var screenH264Level: String {
+        guard let first = remotePeers.values.first else { return "-" }
+        return first.session.screenH264Level
+    }
+
     private var videoCapturer: RTCCameraVideoCapturer?
     /// 摄像头是否正在采集。与 `localVideoTrack.isEnabled` 分开：
     /// 轨可以一直是开的，但采集停了（关摄像头时 stopCapture 会熄灯）。
@@ -1295,14 +1302,45 @@ final class RealRTCClient: NSObject, RTCClient {
             peers: remotePeers.count
         )
         for peer in remotePeers.values {
+            /* 起步阶段顺便把带宽估计器的起点抬到真实量级。
+               见 PeerSession.seedBandwidthEstimate：GCC 默认 300kbps 起步，
+               再叠加 ALR 死锁，局域网也会被钉死在 300k。
+               4 秒后那次 ramp 不再 seed——那时估计器已经在正常收敛，
+               再写一次会把刚降下来的估计值顶回去。 */
+            if !keepResolution {
+                peer.session.seedBandwidthEstimate(
+                    startBps: min(perPeer, 3_000_000),
+                    maxBps: max(perPeer, 8_000_000)
+                )
+            }
             peer.session.setVideoEncoding(
                 maxBitrateBps: perPeer,
                 maxFramerate: Int(profile.fps),
+                minBitrateBps: Self.screenMinBitrateBps,
                 keepResolution: keepResolution,
                 forScreen: true
             )
         }
     }
+
+    /// 共享的"启动助推"码率：600kbps。
+    ///
+    /// 为什么必须有这个下限（1.8.1 的核心修复）：
+    /// libwebrtc 的带宽估计器有一个"应用受限区"（ALR）判定——当实际发送
+    /// 速率低于估计值的 60% 持续一秒，它就认为"你没东西要发"，**停止发探测包**。
+    /// 而 GCC 的加性增长是按"已确认字节数"的百分比涨的：发 36kbps 就只涨
+    /// 36kbps 的 5%，一秒 1.8k。从 300k 爬到 1M 要十几分钟。
+    ///
+    /// 真机日志就是这个死锁的现场：
+    ///   目标码率 194kbps · 可用上行 301kbps · 受限 无 · host→host · RTT 8ms
+    /// 局域网直连、8ms、零丢包，带宽估计却停在起始值 300k，因为编码器
+    /// 被 194k 掐着只产出 36kbps，永远退不出 ALR。
+    ///
+    /// 给一条 600k 的下限，编码器就有足够的东西可发，链路退出 ALR、
+    /// 探测重启，估计值才会真的往上爬。600k 是保守值：pacer 在 300k 估计下
+    /// 按 2.5 倍 pacing 能发 750k，600k 不会在队列里堆出可感知的延迟。
+    /// 等估计值涨过 600k 之后这个下限自动失效，不参与分配。
+    private static let screenMinBitrateBps = 600_000
 
     /// 共享开始 4 秒后，把编码策略从"保帧率"切回"保分辨率"。
     ///

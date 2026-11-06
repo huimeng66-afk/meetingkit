@@ -363,6 +363,44 @@ final class PeerSession: NSObject {
     ///
     /// 把"看起来都对但就是 0 包"拆成三项可判定的证据：共享 m-line 有几条、
     /// 远端到底收不收、ICE 通不通。缺了这三项，前几轮只能靠猜。
+    /// 本地 SDP 里 H.264 的 level，形如 `L4.0`。诊断回传用它判断
+    /// "编码器是不是被 SDP 限在 3.1 而编不出整屏"。
+    var screenH264Level: String {
+        SDPCodecFilter.h264Level(in: peerConnection.localDescription?.sdp)
+    }
+
+    /// 直接给带宽估计器一个"起步价"。
+    ///
+    /// libwebrtc 的 GCC 固定从 300kbps 起步，并且有一条 ALR（应用受限）判定：
+    /// 实际发送速率低于估计值 60% 持续一秒，就认为"你没东西要发"，**停止发探测包**。
+    /// 而 GCC 的加性增长按已确认字节数的百分比走——发 36kbps 就只涨 1.8kbps/秒。
+    /// 于是形成死锁：码率低 → 不探测 → 估计值不涨 → 码率更低。
+    ///
+    /// 真机现场就是这个死锁：`发送 50 包 / 编码 32 帧 / 目标码率 194kbps /
+    /// 可用上行 301kbps / 受限 无 / host→host / RTT 8ms`。局域网直连、
+    /// 8ms、零丢包，估计值却停在起始值 300k 上。
+    ///
+    /// `setBweMinBitrateBps:currentBitrateBps:maxBitrateBps:` 是 ObjC 层写
+    /// `PeerConnectionInterface::SetBitrate(BitrateSettings)` 的入口，
+    /// 能把 current 直接抬到真实量级，让估计器从 3Mbps 开始收敛。
+    /// 用 IMP 调用而不是直接写方法名：这个选择器不在 Swift 伞头文件里，
+    /// 直接调用编译不过。`responds(to:)` 先探一次，老版本 SDK 上不会崩。
+    func seedBandwidthEstimate(startBps: Int, maxBps: Int) {
+        let selector = NSSelectorFromString("setBweMinBitrateBps:currentBitrateBps:maxBitrateBps:")
+        guard peerConnection.responds(to: selector) else { return }
+        typealias SeedFn = @convention(c) (AnyObject, Selector, NSNumber?, NSNumber?, NSNumber?) -> Void
+        let implementation = peerConnection.method(for: selector)
+        let call = unsafeBitCast(implementation, to: SeedFn.self)
+        call(
+            peerConnection,
+            selector,
+            // 下限：抬太高会让估计器在真弱网里也不肯降，压到起点的四分之一。
+            NSNumber(value: max(200_000, startBps / 4)),
+            NSNumber(value: startBps),
+            NSNumber(value: max(maxBps, startBps))
+        )
+    }
+
     var screenLinkDebug: String {
         let localSDP = peerConnection.localDescription?.sdp
         let videoMLines = Self.videoMLineCount(localSDP)
@@ -413,11 +451,16 @@ final class PeerSession: NSObject {
            `上限` 是真正落到 encoder 的数字，它要是 300k 那种默认值，
            说明 setVideoEncoding 根本没写进去（encodings 为空时会被跳过）。 */
         let codec = SDPCodecFilter.videoCodecName(in: localSDP)
+        /* level 是"编码器肯不肯干活"的开关。
+           `L3.1`（Chrome 默认的 42001f）帧尺寸上限 3600 宏块 = 1280×720，
+           整屏 880×1920 是 6600 宏块，VideoToolbox 每帧都编不出来，
+           表现是出帧 321、编码 32、浏览器冻住。看到 L3.1 就等于看到故障。 */
+        let level = SDPCodecFilter.h264Level(in: localSDP)
         let capBps = encodings.first?.maxBitrateBps?.intValue ?? 0
         let capText = capBps > 0 ? String(format: "%.1fM", Double(capBps) / 1_000_000) : "未设"
         return "SDP video \(videoMLines) · 共享\(screenSDPText) · sender \(screenSenderText)"
             + " · mid=\(mid)/enc=\(encodings.count)/ssrc=\(ssrc)"
-            + " · \(codec)/上限\(capText)"
+            + " · \(codec)/\(level)/上限\(capText)"
             + " · 远端\(remote) · 信令 \(signaling) · ICE \(ice)"
     }
 
@@ -635,11 +678,14 @@ final class PeerSession: NSObject {
     /// 调整上行视频编码参数。屏幕共享是"文字优先"，需要比摄像头更高的码率上限，
     /// 否则 1080p 画面会被 WebRTC 按摄像头模型压到 1~2Mbps，文字边缘发糊。
     ///
+    /// `minBitrateBps` 是 1.8.1 加的"启动助推"：见 applyScreenEncodingBudget 的说明。
+    ///
     /// `forScreen` 必须显式指定：摄像头和共享是两条独立的 send stream，
     /// 共用一条 sender 引用会让"停止共享后把 8Mbps 配到摄像头"或反过来。
     func setVideoEncoding(
         maxBitrateBps: Int?,
         maxFramerate: Int?,
+        minBitrateBps: Int? = nil,
         keepResolution: Bool = false,
         forScreen: Bool = false
     ) {
@@ -665,6 +711,9 @@ final class PeerSession: NSObject {
             }
             if let fps = maxFramerate {
                 encoding.maxFramerate = NSNumber(value: fps)
+            }
+            if let minBps = minBitrateBps {
+                encoding.minBitrateBps = NSNumber(value: minBps)
             }
         }
         // 共享文档时宁可掉帧也不降分辨率，否则 1080p 会被降成 720p 再放大，文字糊成一片。
@@ -1019,10 +1068,15 @@ final class PeerSession: NSObject {
         narrowed: Bool = true
     ) {
         var target = description
-        if narrowed, description.type == .offer {
+        /* offer 和 answer 都要过一遍。
+           answer 的 fmtp 是 libwebrtc 按收到的 offer 生成的：只要 offer 的 level
+           已经抬到 4.0，answer 也会是 4.0。但 iOS 自己发 offer 时 answer 由浏览器给，
+           那边还是 `42001f`，回程同样要抬——否则屏幕上看到的是"共享那条是 3.1"，
+           编码器照样丢帧。`preferH264Only` 幂等，跑两遍不会改坏。 */
+        if narrowed, description.type == .offer || description.type == .answer {
             let filtered = SDPCodecFilter.preferH264Only(description.sdp)
             if filtered != description.sdp {
-                target = RTCSessionDescription(type: .offer, sdp: filtered)
+                target = RTCSessionDescription(type: description.type, sdp: filtered)
             }
         }
         peerConnection.setLocalDescription(target) { [weak self] error in
