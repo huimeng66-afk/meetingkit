@@ -19,17 +19,35 @@ struct SharePickerPanel: View {
 
     @State private var selectsScreenSource: Bool = true
 
-    /// 签名是否真的给了 App Group 能力。
+    /// 是否具备共享能力。
     ///
-    /// 只在这里求值一次：`containerURL` 是系统调用，放进 body 会在每次
-    /// 状态刷新时都跑一遍；而签名能力在一次进程生命周期内不会变。
-    @State private var isSystemShareAvailable: Bool = AppGroupConfig.isAvailable
+    /// iOS 27 起系统不再创建广播扩展进程（ReplayKit 的广播 API 被判
+    /// "No longer supported"），共享改由 ScreenCaptureKit 在本进程内完成，
+    /// **不需要 App Group**，任何签名都可用。
+    /// iOS 26 及以下仍然依赖广播扩展 + App Group。
+    /// 能力说明。三种实现的能力差别很大，不能共用一句文案——
+    /// 用户看到"可以共享整个屏幕"却只能共享 App 内画面，会比不知道更困惑。
+    private var shareSubtitle: String {
+        switch viewModel.screenSharingBackend {
+        case .screenCaptureKit:
+            return "可以共享整个屏幕，也可以只共享某一个 App"
+        case .inApp:
+            return "当前安装包只能共享天穹会议内的画面，切到别的 App 会暂停"
+        case .broadcastExtension:
+            return "iOS 只能共享整个屏幕，不能只投某一个 App"
+        }
+    }
+
+    private var canShareScreen: Bool {
+        if viewModel.supportsNativeScreenShare { return true }
+        return AppGroupConfig.isAvailable
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             header
 
-            if isSystemShareAvailable {
+            if canShareScreen {
                 sourceCards
                 infoCard
                 diagnosticsCard
@@ -112,7 +130,7 @@ struct SharePickerPanel: View {
                 .font(Theme.Typography.sectionTitle)
                 .foregroundColor(Theme.Palette.textPrimary)
 
-            Text("iOS 只能共享整个屏幕，不能只投某一个 App")
+            Text(shareSubtitle)
                 .font(Theme.Typography.caption)
                 .foregroundColor(Theme.Palette.textTertiary)
         }
@@ -226,10 +244,23 @@ struct SharePickerPanel: View {
                     .foregroundColor(Theme.Palette.textPrimary)
             }
 
-            stepRow(index: 1, text: "点击下方「开始共享屏幕」")
-            stepRow(index: 2, text: "在系统弹窗中选择「\(AppGroupConfig.displayName) 屏幕共享」")
-            stepRow(index: 3, text: "点击「开始直播」，共享画面会出现在会议里")
-            stepRow(index: 4, text: "回到桌面、切到要展示的 App —— 你切到哪儿，对面就看到哪儿（包括通知和横竖屏切换）")
+            switch viewModel.screenSharingBackend {
+            case .screenCaptureKit:
+                stepRow(index: 1, text: "点击下方「开始共享屏幕」")
+                stepRow(index: 2, text: "系统弹出内容面板，选「整个屏幕」或某一个 App")
+                stepRow(index: 3, text: "首次使用需允许「屏幕录制」权限")
+                stepRow(index: 4, text: "开始后可以回到桌面、切到要展示的 App —— 你切到哪儿，对面就看到哪儿")
+            case .inApp:
+                stepRow(index: 1, text: "点击下方「开始共享屏幕」")
+                stepRow(index: 2, text: "系统会请求「屏幕录制」权限，允许一次即可")
+                stepRow(index: 3, text: "共享的是天穹会议内的画面")
+                stepRow(index: 4, text: "共享期间请保持天穹会议在前台；切到别的 App 会暂停共享")
+            case .broadcastExtension:
+                stepRow(index: 1, text: "点击下方「开始共享屏幕」")
+                stepRow(index: 2, text: "在系统弹窗中选择「\(AppGroupConfig.displayName) 屏幕共享」")
+                stepRow(index: 3, text: "点击「开始直播」，共享画面会出现在会议里")
+                stepRow(index: 4, text: "回到桌面、切到要展示的 App —— 你切到哪儿，对面就看到哪儿（包括通知和横竖屏切换）")
+            }
         }
         .padding(Theme.Metrics.space3)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -322,7 +353,7 @@ struct SharePickerPanel: View {
 
     @ViewBuilder
     private var primaryAction: some View {
-        if !isSystemShareAvailable {
+        if !canShareScreen {
             // 不可用时不摆一个注定打不开系统面板的"开始共享"。
             // 主按钮直接就是唯一有结果的路径：复制链接去网页版。
             Button {
@@ -428,6 +459,17 @@ struct SharePickerPanel: View {
     // MARK: - 动作
 
     private func startSharing() {
+        /* iOS 27：系统已经不再创建广播扩展进程。
+           继续走 BroadcastPickerPresenter 只会让系统弹出一张
+           "天穹会议 00:04 + 转圈"的卡片，然后永远停在 idle——
+           真机上那一组"扩展进程：本次未启动 / 0 帧"就是这么来的。
+           改由 ScreenCaptureKit 在本进程内共享，选完内容立刻出帧。 */
+        if viewModel.supportsNativeScreenShare {
+            viewModel.closePanel()
+            viewModel.startNativeScreenShare()
+            return
+        }
+
         // 先清旧帧、写本次会话的 requestedAt，再弹系统面板。
         // 顺序不能反：第一帧可能比面板点击更早落盘，晚写 requestedAt
         // 会把它误判成"上一场的旧帧"。

@@ -168,10 +168,31 @@ XCODEBUILD_ARGS=(
     -archivePath "$ARCHIVE_PATH"
 )
 
+# ---------- ScreenCaptureKit 的链接方式 ----------
+# iOS 27 起 Apple 用 ScreenCaptureKit 取代了广播扩展，但那个 framework
+# 只存在于 iOS 27 SDK 里：
+#   · 构建机是 Xcode 26（macos-15 / macos-26 镜像都如此）：
+#     framework 根本不存在，告诉链接器 -weak_framework 会直接失败。
+#   · 构建机是 Xcode 27：必须弱链接，否则产物在 iOS 26 设备上
+#     dyld 找不到框架，App 启动即崩。
+# 所以这里按实际 SDK 版本决定，不写死在 project.yml 里。
+SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || echo 0)"
+SDK_MAJOR="${SDK_VERSION%%.*}"
+info "iOS SDK：${SDK_VERSION}"
+
+EXTRA_BUILD_SETTINGS=()
+if [ "${SDK_MAJOR:-0}" -ge 27 ] 2>/dev/null; then
+    info "SDK >= 27：ScreenCaptureKit 参与编译（弱链接）"
+    EXTRA_BUILD_SETTINGS+=("OTHER_LDFLAGS=-weak_framework ScreenCaptureKit")
+else
+    info "SDK < 27：ScreenCaptureKit 不参与编译，共享回退到 ReplayKit in-app 捕获"
+fi
+
 if ! xcodebuild "${XCODEBUILD_ARGS[@]}" \
         CODE_SIGNING_ALLOWED=NO \
         CODE_SIGNING_REQUIRED=NO \
-        CODE_SIGN_IDENTITY="" 2>&1 | tee "${BUILD_DIR}/archive.log"; then
+        CODE_SIGN_IDENTITY="" \
+        ${EXTRA_BUILD_SETTINGS[@]+"${EXTRA_BUILD_SETTINGS[@]}"} 2>&1 | tee "${BUILD_DIR}/archive.log"; then
     die "归档失败，完整日志：${BUILD_DIR}/archive.log"
 fi
 

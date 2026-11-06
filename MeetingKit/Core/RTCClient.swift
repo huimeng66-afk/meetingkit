@@ -17,6 +17,7 @@
 
 import Foundation
 import UIKit
+import WebRTC
 
 // MARK: - 连接状态
 
@@ -245,6 +246,14 @@ protocol RTCClient: AnyObject {
     func beginScreenFramePush()
     func endScreenFramePush()
 
+    /// 屏幕共享的视频源。iOS 27 起由 ScreenCaptureKit 直接往这里推帧，
+    /// 不再经过 App Group 里的 JPEG。
+    var screenVideoSource: RTCVideoSource? { get }
+
+    /// iOS 27：SCStream 起播后把共享轨挂到每条连接上。
+    /// 与 `beginScreenFramePush` 的区别是不启动 JPEG 轮询。
+    func beginNativeScreenPush()
+
     /// 发送一条文本消息。
     func sendMessage(_ text: String)
 
@@ -275,6 +284,14 @@ protocol RTCClient: AnyObject {
 // MARK: - 麦克风自愈
 
 extension RTCClient {
+
+    /// 默认实现：Mock 与不支持 ScreenCaptureKit 的平台没有共享视频源。
+    /// 声明成 requirement（见协议里）+ 默认实现，既保证 Mock 零改动，
+    /// 又保证 `RealRTCClient` 的实现走 witness table 被真正调到。
+    var screenVideoSource: RTCVideoSource? { nil }
+
+    /// 默认实现：Mock 不做真实推流。
+    func beginNativeScreenPush() {}
 
     /// 确保麦克风落到期望状态，轨缺失时由实现方异步重建后再回调。
     ///

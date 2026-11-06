@@ -47,6 +47,8 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>开启摄像头后，参会人可以看见你的画面</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>共享屏幕时，需要录制屏幕内容并发送给会议中的其他参会人</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>开会时需要麦克风采集你的声音</string>
 	<key>NSLocalNetworkUsageDescription</key>
@@ -60,6 +62,11 @@
 		     本项目没有任何 PushKit / CallKit 实现，声明 voip 会在提审时被问询，
 		     因此等真正接入 VoIP 推送后再启用 voip。 -->
 		<string>audio</string>
+		<!-- iOS 27 起屏幕共享走 ScreenCaptureKit，捕获发生在本进程内。
+		     没有这一项，App 一进后台 SCStream 就会以
+		     SCStreamError.Code.missingBackgroundMode 停止——
+		     而共享屏幕的典型用法恰恰是"切到别的 App 去演示"。 -->
+		<string>screen-capture</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict>

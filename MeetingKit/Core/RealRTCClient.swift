@@ -107,6 +107,10 @@ final class RealRTCClient: NSObject, RTCClient {
     private var localVideoSource: RTCVideoSource?
     private var localScreenTrack: RTCVideoTrack?
     private var localScreenSource: RTCVideoSource?
+    /// iOS 27 的 ScreenCaptureKit 需要直接往这个 source 推帧。
+    /// 广播扩展那条路是"扩展写 JPEG → 主 App 解码 → 推 source"，
+    /// SCK 没有中间文件，帧从 SCStream 直接进来。
+    var screenVideoSource: RTCVideoSource? { localScreenSource }
     private var videoCapturer: RTCCameraVideoCapturer?
     /// 摄像头是否正在采集。与 `localVideoTrack.isEnabled` 分开：
     /// 轨可以一直是开的，但采集停了（关摄像头时 stopCapture 会熄灯）。
@@ -796,6 +800,39 @@ final class RealRTCClient: NSObject, RTCClient {
         /* ReplayKit 真正起播会晚于这里 200~800ms，并重配一次音频会话。
            先强制抢一次，再由 routeGuard 每 2 秒兜底——
            只靠这一次同步调用，经常正好打在 ReplayKit 改配置之前。 */
+        reactivateAudioSession(force: true)
+        startRouteGuard()
+        scheduleVideoUplinkWatchdog()
+        syncTeardownBox()
+    }
+
+    /// iOS 27 起：帧由 ScreenCaptureKit 直接推进 `localScreenSource`，
+    /// 这里只负责把共享轨挂到每条连接上。
+    ///
+    /// 与 `beginScreenFramePush` 的唯一区别是**不启动 ScreenFramePusher**：
+    /// 那个是轮询 App Group 里 JPEG 的，SCK 路径下容器里什么都没有。
+    func beginNativeScreenPush() {
+        guard let track = localScreenTrack, localScreenSource != nil else { return }
+        guard !isScreenSharing else { return }
+
+        isScreenSharing = true
+
+        /* 这里刻意不再调 adaptOutputFormat：
+           它在 M140 内部会重建 video adapter，与 SCK 的帧回调并发会崩在
+           AdaptedVideoTrackSource::OnFrame。输出画布在 setupLocalMedia
+           创建 source 时已经设成 screenEncodingProfile，够用。
+           内容比例由 SCStreamConfiguration 的 width/height 控制，
+           竖屏内容会被 WebRTC 按比例居中，不会压扁。 */
+
+        // 用共享轨替换每条连接的 video sender（Web 端同款 replaceTrack）。
+        for peer in remotePeers.values {
+            peer.session.replaceVideoTrack(with: track)
+        }
+        applyScreenEncodingBudget()
+
+        /* 系统共享同样会切一次音频路由（ReplayKit / SCK 都会把
+           AVAudioSession 的 mode 拨到录制侧）。不抢回来，
+           用户会遇到"开始共享后听不见人说话"。 */
         reactivateAudioSession(force: true)
         startRouteGuard()
         scheduleVideoUplinkWatchdog()

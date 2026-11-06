@@ -13,11 +13,23 @@
 //  App Group。所以 `isScreenSharing` 永远从 ScreenShareBridge 单向流入，
 //  业务代码不允许把它当成"我点了共享"的开关来用。
 //
+//  iOS 27 例外：ReplayKit 的广播扩展被 Apple 判为 "No longer supported"，
+//  系统不再创建扩展进程。共享改由 ScreenCaptureKit 在本进程内完成，
+//  状态由 SCStream 自己驱动（见 ScreenCaptureKitSharer）。
+//
 
 import AVFoundation
 import Combine
 import Foundation
 import UIKit
+
+/// 本次共享的画面从哪来。两条路径的帧来源完全不同：
+/// 广播扩展写 JPEG 到 App Group、主 App 轮询解码；SCK 直接把 CMSampleBuffer
+/// 推到 RTCVideoSource。状态对账逻辑也因此必须分开。
+enum ScreenShareSource {
+    case broadcastExtension
+    case screenCaptureKit
+}
 
 @MainActor
 final class MeetingViewModel: ObservableObject {
@@ -104,6 +116,34 @@ final class MeetingViewModel: ObservableObject {
 
     /// 本机是否正在共享。只由扩展进程的真实状态驱动，不做乐观点值。
     @Published private(set) var isScreenSharing: Bool = false
+
+    // MARK: - 屏幕共享（iOS 27 / ScreenCaptureKit）
+
+    /// iOS 27 起系统不再创建广播扩展进程（ReplayKit 的广播 API 被判
+    /// "No longer supported"），改用 ScreenCaptureKit 在本进程内共享。
+    /// 这条路径没有 App Group、没有第二个进程，状态也不需要"对账"。
+    private var nativeShareSession: ScreenSharingSession?
+    private var nativeShareStartedAt: Date?
+    /// 最近一次 SCK 失败原因。诊断面板直接展示。
+    @Published private(set) var nativeShareError: String?
+
+    /// 当前共享走哪条实现。缓存一次：底层要访问系统单例，
+    /// 而 View 的 body 与每秒一次的时钟都会读它。
+    private lazy var cachedNativeShareBackend: ScreenSharingBackend = ScreenSharingSessionFactory.backend
+
+    var screenSharingBackend: ScreenSharingBackend {
+        cachedNativeShareBackend
+    }
+
+    var supportsNativeScreenShare: Bool {
+        cachedNativeShareBackend != .broadcastExtension
+    }
+
+    /// 本次共享走的是不是 SCK。UI 用它切换文案。
+    var isNativeShareSessionActive: Bool {
+        nativeShareSession != nil
+    }
+
     /// 本机共享已持续时长 "mm:ss"。
     @Published private(set) var shareDurationText: String = "00:00"
     /// 远端共享者的显示名。用于共享舞台的"某某正在共享"，空串表示没有远端共享。
@@ -148,7 +188,50 @@ final class MeetingViewModel: ObservableObject {
     /// 共享链路体检报告。面板展开时现算，不做成 @Published：
     /// 它要读文件与心跳，没必要每秒刷新一次 UI。
     var shareDiagnosticsReport: String {
-        shareBridge.makeDiagnostics().report
+        if supportsNativeScreenShare {
+            return nativeShareDiagnosticsReport
+        }
+        return shareBridge.makeDiagnostics().report
+    }
+
+    /// iOS 27 的诊断。没有 App Group 可对账，直接报 SCStream 的帧数与 RTC 发包。
+    private var nativeShareDiagnosticsReport: String {
+        var lines: [String] = []
+        lines.append("共享通道：ScreenCaptureKit（iOS 27+，本进程内）")
+
+        if isScreenSharing, let startedAt = nativeShareStartedAt {
+            lines.append(String(format: "状态：共享中 · 已 %.0f 秒", Date().timeIntervalSince(startedAt)))
+        } else if nativeShareSession != nil {
+            lines.append("状态：等待系统面板选择内容")
+        } else {
+            lines.append("状态：未共享")
+        }
+
+        if let session = nativeShareSession {
+            var frameLine = "SCK 出帧：\(session.frameCount) 帧"
+            if let lastFrameAt = session.lastFrameAt {
+                frameLine += String(format: "（最新 %.1f 秒前）", Date().timeIntervalSince(lastFrameAt))
+            }
+            if session.idleFrameCount > 0 {
+                frameLine += " · 画面未变的静止帧 \(session.idleFrameCount) 个（已丢弃，正常）"
+            }
+            lines.append(frameLine)
+        }
+
+        let video = ScreenShareRuntime.videoStats
+        if video.sampled {
+            lines.append(
+                "RTC 视频：发送 \(video.packetsSent) 包 · 编码 \(video.framesEncoded) 帧 · "
+                + (video.screenAttached ? "共享轨已挂" : "共享轨未挂 ⚠️")
+            )
+        } else {
+            lines.append("RTC 视频：尚未采样（入会后约 4 秒出结果；无对端时不会发包）")
+        }
+
+        if let error = nativeShareError {
+            lines.append("最近错误：\(error)")
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// 用户已经看过失败提示：清掉，避免每次刷新重复弹。
@@ -379,6 +462,16 @@ final class MeetingViewModel: ObservableObject {
         // 顺序不能反：必须先 requestStop 再 stopObserving，后者会摘掉 Darwin 观察者。
         // 这里不判断 isScreenSharing：App 侧状态可能因为心跳延迟而失真（扩展还在录、
         // UI 以为已经停了），漏发一次停止请求会把录屏留在后台；扩展没在跑时收到通知无害。
+        // iOS 27：SCStream 跑在本进程内，离会必须显式停。
+        // 不停的话系统顶部的"正在共享"红条会一直亮着，而且摄像头轨
+        // 永远换不回来——下次入会看到的是上一场的屏幕画面。
+        if let session = nativeShareSession {
+            session.stop()
+            nativeShareSession = nil
+            nativeShareStartedAt = nil
+            isScreenSharing = false
+        }
+
         shareBridge.requestStop()
         shareBridge.stopObserving()
 
@@ -528,6 +621,89 @@ final class MeetingViewModel: ObservableObject {
         openPanel(.sharePicker)
     }
 
+    /// iOS 27：在本进程内发起系统级共享。
+    ///
+    /// 与广播扩展的区别：没有「开始直播」倒计时、不写文件、不需要 App Group。
+    /// 系统弹出内容选择面板，用户选完立刻开始推帧；回调直接来自 SCStream。
+    func startNativeScreenShare() {
+        guard supportsNativeScreenShare else { return }
+
+        guard let source = rtc.screenVideoSource else {
+            showToast(
+                ToastMessage(
+                    text: "共享通道还没准备好，请回到会议后重试",
+                    systemImage: "exclamationmark.triangle.fill",
+                    style: .warning
+                )
+            )
+            return
+        }
+
+        let session: ScreenSharingSession
+        if let existing = nativeShareSession {
+            session = existing
+        } else {
+            guard let created = ScreenSharingSessionFactory.make() else {
+                showToast(
+                    ToastMessage(
+                        text: "当前系统没有可用的屏幕共享通道",
+                        systemImage: "exclamationmark.triangle.fill",
+                        style: .danger
+                    )
+                )
+                return
+            }
+            created.onStateChange = { [weak self] state in
+                // 回调可能来自 SCK 的任意线程，统一回主线程再动 @Published。
+                Task { @MainActor in
+                    self?.handleNativeShareState(state)
+                }
+            }
+            nativeShareSession = created
+            session = created
+        }
+
+        nativeShareError = nil
+        session.start(source: source)
+    }
+
+    /// SCK 的状态回流。三条路径（起播 / 停止 / 失败）都在这里收敛。
+    private func handleNativeShareState(_ state: ScreenSharingSessionState) {
+        switch state {
+        case .picking:
+            // 系统面板已弹出，等用户选内容。此阶段不改任何共享状态。
+            break
+
+        case .running(let startedAt):
+            nativeShareStartedAt = startedAt
+            nativeShareError = nil
+            // SCK 的 running 一定是"刚刚真的开始"，不存在冷启动同步，
+            // 所以 isInitial 固定为 false：要让 RTC 发一次 screen:state。
+            applyScreenSharing(true, isInitial: false, source: .screenCaptureKit)
+            showToast(.screenShareStarted())
+
+        case .stopped:
+            let wasSharing = isScreenSharing
+            nativeShareStartedAt = nil
+            applyScreenSharing(false, isInitial: false, source: .screenCaptureKit)
+            if wasSharing {
+                showToast(.screenShareStopped())
+            }
+
+        case .failed(let message):
+            nativeShareError = message
+            nativeShareStartedAt = nil
+            applyScreenSharing(false, isInitial: false, source: .screenCaptureKit)
+            showToast(
+                ToastMessage(
+                    text: "屏幕共享未能开始：\(message)",
+                    systemImage: "exclamationmark.triangle.fill",
+                    style: .danger
+                )
+            )
+        }
+    }
+
     /// 系统共享面板弹出**之前**调用：清旧帧、写本次会话的 requestedAt。
     ///
     /// 必须在 `BroadcastPickerPresenter.present()` 之前完成，否则第一帧
@@ -555,6 +731,21 @@ final class MeetingViewModel: ObservableObject {
             return
         }
         pendingStopAt = now
+
+        // iOS 27：SCStream 就在本进程里，直接停，不需要等任何进程回话。
+        // 走 shareBridge.requestStop() 只会发一条没人监听的 Darwin 通知，
+        // 用户会看到"正在停止共享…"一直挂着。
+        if let session = nativeShareSession {
+            session.stop()
+            showToast(
+                ToastMessage(
+                    text: "正在停止共享…",
+                    systemImage: "rectangle.slash",
+                    style: .info
+                )
+            )
+            return
+        }
 
         // 主 App 无权结束扩展进程，只能发信号让扩展自己收尾（它会调 finishBroadcastWithError）。
         // `rtc.stopScreenShare()` 不在这里调：等 applyScreenSharing(false) 在真实状态确认后
@@ -799,6 +990,14 @@ final class MeetingViewModel: ObservableObject {
         canRejoin: Bool = true
     ) {
         rtc.leave()
+        // iOS 27：共享在本进程内，离会必须停掉 SCStream，
+        // 否则系统"正在共享"的红条会留在状态栏上。
+        if let session = nativeShareSession {
+            session.stop()
+            nativeShareSession = nil
+            nativeShareStartedAt = nil
+            isScreenSharing = false
+        }
         // 标记主动离会：正在飞行中的入会回调看到它就不再改写界面状态。
         hasLeftLocally = true
         connectionState = .disconnected
@@ -1237,7 +1436,11 @@ private extension MeetingViewModel {
     /// - Parameters:
     ///   - broadcasting: 来自 ScreenShareBridge 的真实状态。
     ///   - isInitial: 是否是冷启动后的第一次同步。
-    func applyScreenSharing(_ broadcasting: Bool, isInitial: Bool) {
+    func applyScreenSharing(
+        _ broadcasting: Bool,
+        isInitial: Bool,
+        source: ScreenShareSource = .broadcastExtension
+    ) {
         guard isScreenSharing != broadcasting else { return }
         isScreenSharing = broadcasting
 
@@ -1250,16 +1453,24 @@ private extension MeetingViewModel {
             // 新一轮共享：诊断计数从零开始，否则面板里会混着上一场的数字。
             ScreenShareRuntime.reset()
             shareFailure = nil
+            nativeShareError = nil
             // 首次同步不调：扩展早就在跑，重复 start 只是往日志里灌噪音。
             if !isInitial {
                 rtc.startScreenShare()
             }
-            // 真实链路：开始把 App Group 里的共享帧推上 video sender。
-            rtc.beginScreenFramePush()
+            switch source {
+            case .broadcastExtension:
+                // 真实链路：开始把 App Group 里的共享帧推上 video sender。
+                rtc.beginScreenFramePush()
+            case .screenCaptureKit:
+                // 帧由 SCK 直接推进 localScreenSource，这里只挂轨。
+                rtc.beginNativeScreenPush()
+            }
         } else {
             shareDurationText = "00:00"
             pendingStopAt = nil
             // 真实链路：停止推流并换回摄像头轨。
+            // SCK 路径下 screenPusher 本来就是 nil，endScreenFramePush 同样适用。
             rtc.endScreenFramePush()
             if !isInitial {
                 rtc.stopScreenShare()
@@ -1310,6 +1521,12 @@ private extension MeetingViewModel {
             durationText = Self.formatClock(now.timeIntervalSince(start))
         }
 
+        /* iOS 27 起系统不再拉起广播扩展，App Group 里永远是 idle。
+           继续跑下面这套扩展对账，只会把 SCK 已经点亮的"共享中"每秒冲掉一次。
+           所以整块扩展逻辑在 SCK 模式下直接跳过。 */
+        let usesNativeShare = supportsNativeScreenShare
+
+        if !usesNativeShare {
         // 屏幕共享与 App Group 的对账挂在这里。
         //
         // 从"每 2 秒"提到"每秒"：共享状态是从另一个进程读回来的，2 秒的轮询
@@ -1366,10 +1583,16 @@ private extension MeetingViewModel {
         if clockTickCount % 4 == 0 {
             shareBridge.validateLiveness()
         }
+        } // if !usesNativeShare
 
-        if isScreenSharing, let shareStart = shareBridge.startedAt {
-            shareDurationText = Self.formatShortClock(now.timeIntervalSince(shareStart))
-        } else if !isScreenSharing {
+        if isScreenSharing {
+            // 两条路径的起算时间来源不同：
+            // 扩展写的是 App Group 里的 startedAt，SCK 是本进程刚拿到的时刻。
+            let shareStart = usesNativeShare ? nativeShareStartedAt : shareBridge.startedAt
+            if let shareStart = shareStart {
+                shareDurationText = Self.formatShortClock(now.timeIntervalSince(shareStart))
+            }
+        } else {
             shareDurationText = "00:00"
         }
 
