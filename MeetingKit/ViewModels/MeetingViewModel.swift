@@ -265,6 +265,12 @@ final class MeetingViewModel: ObservableObject {
             if session.idleFrameCount > 0 {
                 frameLine += " · 画面未变的静止帧 \(session.idleFrameCount) 个（已丢弃，正常）"
             }
+            /* 重推帧是 1.8.5 新增的"静止保活"：画面不动时按 15fps 把最后一张图
+               再送一遍，只为了让编码器、pacer 和带宽估计器别休眠。
+               它涨而上面那个帧数不涨，就说明当前画面是静止的。 */
+            if session.repeatFrameCount > 0 {
+                frameLine += " · 静止保活重推 \(session.repeatFrameCount) 帧"
+            }
             lines.append(frameLine)
         }
 

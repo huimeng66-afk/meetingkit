@@ -1172,6 +1172,12 @@ final class RealRTCClient: NSObject, RTCClient {
     ) {
         guard let track = localScreenTrack else { return }
 
+        /* 共享刚启动的 8 秒内一律不判"0 包"。
+           编码器冷启动要 1~2 秒，首帧还要等 SCK 建流；这段时间 packets 必然是 0。
+           旧逻辑在共享第 2 秒就把 maintainResolution 和码率上限一起放开，
+           等于开局先自残一次：画面糊、编码器重配，之后再也没恢复。 */
+        guard Date().timeIntervalSince(lastScreenShareStartAt) >= 8 else { return }
+
         if !track.isEnabled {
             track.isEnabled = true
             ScreenShareRuntime.note("上行守护：共享轨被关，已打开")
@@ -1334,17 +1340,26 @@ final class RealRTCClient: NSObject, RTCClient {
             peers: remotePeers.count
         )
         for peer in remotePeers.values {
-            /* 只做 LiveKit 做的那两件事：单轨码率上限 + maintainResolution。
-               起始码率由 SDP 的 `x-google-start-bitrate` 负责（协商时生效）。
-
-               1.8.3 在这里多做了两件 LiveKit 没做的事，两件都撤了：
-                 · seedBandwidthEstimate —— Call 级预算被写成 0，
-                   整条连接（含摄像头）0 包 0 帧，浏览器彻底黑屏；
-                 · minBitrateBps —— 编码器下限，未经验证，
-                   而且 SDP 起始码率一旦生效它就没有存在意义。 */
+            /* 单轨上限 + maintainResolution + 编码器下限。
+               起始码率由 SDP 的 `x-google-start-bitrate` 负责（协商时生效），
+               这里补的是"运行期不饿死"。
+               
+               1.8.3 在这里踩过一次坑，要分清两条路径：
+                 · `setBweMinBitrateBps` 是 **Call 级**（RtpBitrateConfigurator
+                   每条连接只有一份），第三个参数传 nil 会把整条连接的上限
+                   写成 0，摄像头跟着 0 包——那是黑屏事故；
+                 · `RTCRtpEncodingParameters.minBitrateBps` 是 **单轨**，
+                   只告诉这条 sender 的编码器"别低于这个产出"。
+               后者才是安全的，LiveKit 的 VideoParameters 也是按单轨算的。
+               
+               真机现场：共享从 179kbps 起步，用 50 秒才爬到 2.2Mbps，
+               期间浏览器看到的全是糊的。原因是编码器初期只产 200k，
+               GCC 把"发得少"读成"不需要那么多"，估计值不涨。
+               给一条 35% 的产出下限，链路才退得出这个死锁。 */
             peer.session.setVideoEncoding(
                 maxBitrateBps: perPeer,
                 maxFramerate: Int(profile.fps),
+                minBitrateBps: max(400_000, perPeer * 35 / 100),
                 keepResolution: true,
                 forScreen: true
             )

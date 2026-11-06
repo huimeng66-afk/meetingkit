@@ -41,6 +41,8 @@ protocol ScreenSharingSession: AnyObject {
     var frameCount: Int { get }
     /// 被 SCK 的 idle 帧挡下的次数（画面没变化）。诊断用。
     var idleFrameCount: Int { get }
+    /// 静止画面重推的帧数。它涨而 `frameCount` 不涨，说明当前画面是静止的。
+    var repeatFrameCount: Int { get }
     var lastFrameAt: Date? { get }
     /// 这一轮是不是真的在出帧。
     /// ViewModel 用它识别"迟到事件"：停止回调到了，但会话其实还在跑，
@@ -74,6 +76,7 @@ extension ScreenSharingSession {
     var phase: ScreenSharingPhase { isRunning ? .running : .stopped }
     var stopReason: String? { nil }
     var captureSummary: String? { nil }
+    var repeatFrameCount: Int { 0 }
 }
 
 enum ScreenSharingSessionState {
@@ -700,6 +703,36 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     private var lastPushAt: CFTimeInterval = 0
     /// 两帧之间的最小间隔。屏幕共享要的是"近实时"，多出来的帧直接丢。
     private var pushInterval: CFTimeInterval = 1.0 / 24.0
+
+    /* ───────── 静止画面保活（1.8.5 的核心修复） ─────────
+
+       真机现场（1.8.4，host→host / RTT 8ms）：
+           15:58:47  已推 762 · 编码 509 · 发送 3141 包 · 目标 1.7Mbps
+           15:58:49  已推 792 · 编码 509 · 发送 3141 包   ← 从此永久定格
+           15:59:01  已推 962 · 编码 509 · 发送 3141 包
+       采集一直在出帧，编码器和发送却一起停了。用户看到的就是"一分钟就卡死"，
+       而且"必须来回切 App 才动一下"。
+
+       原因不是编码器坏了：ScreenCaptureKit 的帧回调**不等于新画面**。
+       内容静止时它照样回调，但携带的是同一张图、**同一个 PTS**，
+       而 libwebrtc 的 VideoStreamEncoder 遇到时间戳不前进会直接丢弃。
+       过去这里靠 SCFrameStatus 判定（complete=0 / idle=1），可 iOS 27 上
+       `SCStreamFrameInfoStatus` 是符号常量，运行时取不到键名，
+       `frameStatus` 永远返回 nil，于是 idle 帧全被当成新帧推了出去：
+       面板上 `idleFrames = 0`、编码率常年 50~60%，画面一静止就永久定格。
+
+       现在改用 PTS 判定（不依赖任何平台枚举）：PTS 没前进 = 同一张图，
+       不推给编码器，只更新缓存；再由下面的看门狗按固定节奏重推缓存帧。
+       重推帧在 H.264 里是几十字节的 P 帧，几乎不占带宽，但能让
+       编码器、pacer、带宽估计器（GCC 的 ALR 判定）全程保持活跃。 */
+    private var lastPixelBuffer: CVPixelBuffer?
+    /// 采集侧最近一次**真正前进**的 PTS（ns）。
+    private var lastSourcePtsNs: Int64 = -1
+    /// 已送进编码器的最后一个时间戳（ns）。必须严格递增。
+    private var lastEmittedTsNs: Int64 = 0
+    /// 静止重推的帧数。诊断用：它能直接说明"当前画面是不是静止的"。
+    private(set) var repeatFrameCount = 0
+    private var keepAliveTimer: DispatchSourceTimer?
     /// 是否已经报过"共享中"。首帧到达就报，不必干等 1.5 秒体检。
     private var didSignalRunning = false
 
@@ -735,6 +768,10 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         self.capturer = RTCVideoCapturer(delegate: source)
         frameCount = 0
         idleFrameCount = 0
+        repeatFrameCount = 0
+        lastPixelBuffer = nil
+        lastSourcePtsNs = -1
+        lastEmittedTsNs = 0
         lastFrameAt = nil
         lastError = nil
         stopReason = nil
@@ -860,6 +897,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         stream = nil
         running = false
         stateLock.unlock()
+        stopKeepAlive()
         ShareBreadcrumb.finish()
 
         if let runningStream {
@@ -968,6 +1006,10 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
             fail("启动屏幕捕获失败")
             return
         }
+
+        /* 看门狗从这一刻起跑：画面一旦静止，它负责让编码器继续有输入。
+           必须在 start 之后，否则第一帧还没到，重推的是空缓存。 */
+        startKeepAlive()
 
         /* 启动结果用 isCapturing 轮询，不等 completion。
            SCK 的 completion 有时很晚才来（1.6.5 就因此让用户对着
@@ -1243,28 +1285,36 @@ extension ScreenCaptureKitSharer {
         guard isCurrent, stillRunning else { return }
 
         let sampleBuffer = unsafeBitCast(sampleBufferPointer, to: CMSampleBuffer.self)
-        guard CMSampleBufferGetImageBuffer(sampleBuffer) != nil else { return }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        /* SCK 与 ReplayKit 最大的语义差别：回调 ≠ 新画面。
-           画面没变化时它照样回调，但附带的 status 是 idle，
-           底层还是同一块 IOSurface。转发只会让编码器重复编同一张图。
-           SCFrameStatus：complete=0、idle=1、blank=2、started=3、suspended=4、stopped=5，
-           只有 complete 和 started 是新画面。解析不出 status 时**照常转发**：
-           宁可多推几帧，也不能黑屏。 */
-        if let status = frameStatus(of: sampleBuffer), status != 0, status != 3 {
+        /* ── 回调 ≠ 新画面（1.8.5 核心修复）──
+           SCK 在内容静止时照样回调，但携带的是同一张图、**同一个 PTS**。
+           libwebrtc 的 VideoStreamEncoder 对"时间戳不前进"的帧直接丢弃，
+           所以这些帧既不会编码、也不会发送，只会让面板上的"已推帧数"虚涨。
+           真机现场就是这样：已推 962 帧，编码 509 帧，然后永久定格。
+
+           过去这里读 SCFrameStatus 判断，但那个键在 iOS 27 上是符号常量，
+           运行时取不到，`frameStatus` 恒为 nil，idle 帧全漏了出去。
+           改用 PTS：不依赖任何平台枚举，iOS 26/27/28 行为一致。 */
+        let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let sourcePtsNs = Int64(CMTimeGetSeconds(timestamp) * 1_000_000_000)
+        guard sourcePtsNs > lastSourcePtsNs else {
             idleFrameCount += 1
+            /* 仍然刷新缓存：SCK 复用的是同一块 IOSurface，
+               持有最新引用能保证看门狗重推时拿到的是有效画面。 */
+            lastPixelBuffer = pixelBuffer
             return
         }
-
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
-              let source,
-              let capturer else { return }
+        lastSourcePtsNs = sourcePtsNs
+        lastPixelBuffer = pixelBuffer
 
         /* 先对齐画幅，再谈帧率。
            过去这里沿用 setupLocalMedia 里的 1920x1080 画布，而手机竖屏是
            9:19.5 —— WebRTC 的适配器是"裁切后缩放"，于是上下被切掉、剩下的
            590 宽再被放大到 1920，对端同时得到"缺一块"和"糊"两个结果。 */
-        adaptCanvasIfNeeded(pixelBuffer: pixelBuffer, source: source)
+        if let source {
+            adaptCanvasIfNeeded(pixelBuffer: pixelBuffer, source: source)
+        }
 
         /* 帧率闸门。SCK 的屏幕回调通常是 30 甚至 60fps，
            全推给编码器只会让它丢帧或排队——排队就是延迟。
@@ -1273,11 +1323,34 @@ extension ScreenCaptureKitSharer {
         guard now - lastPushAt >= pushInterval else { return }
         lastPushAt = now
 
-        let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        let timeStampNs = Int64(CMTimeGetSeconds(timestamp) * 1_000_000_000)
+        emit(pixelBuffer: pixelBuffer, sourceTimestampNs: sourcePtsNs, isRepeat: false)
+    }
+
+    /// 把一帧真正送进编码器。
+    ///
+    /// 时间戳在这里统一处理：**必须严格单调递增**。真实帧用采集侧的 PTS，
+    /// 静止重推的帧在上一个时间戳上往前推一个帧间隔。libwebrtc 对
+    /// `timestamp_us` 不前进的帧一律丢弃，这一条比任何状态位都可靠。
+    private func emit(pixelBuffer: CVPixelBuffer, sourceTimestampNs: Int64, isRepeat: Bool) {
+        guard let source, let capturer else { return }
+
+        var timeStampNs = sourceTimestampNs
+        if timeStampNs <= lastEmittedTsNs {
+            timeStampNs = lastEmittedTsNs + Int64(pushInterval * 1_000_000_000)
+        }
+        lastEmittedTsNs = timeStampNs
+
         let buffer = RTCCVPixelBuffer(pixelBuffer: pixelBuffer)
         let frame = RTCVideoFrame(buffer: buffer, rotation: ._0, timeStampNs: timeStampNs)
         source.capturer(capturer, didCapture: frame)
+
+        if isRepeat {
+            repeatFrameCount += 1
+            /* 保活帧也算"链路是活的"：诊断里的「最新 0.x 秒前」应该反映
+               最后一次送进编码器的时间，否则画面静止时看起来像采集停了。 */
+            lastFrameAt = Date()
+            return
+        }
 
         frameCount += 1
         lastFrameAt = Date()
@@ -1298,6 +1371,51 @@ extension ScreenCaptureKitSharer {
             ShareBreadcrumb.recordSckSuccess()
             notify(.running(startedAt: Date()))
         }
+    }
+
+    /// 静止画面看门狗。
+    ///
+    /// 画面静止时 SCK 不再产生新 PTS，上面那道闸门会挡掉所有回调，
+    /// 编码器随即进入"没有输入"的状态，`pushed` 还在涨、`encoded` 已经停了。
+    /// 这里按固定节奏把最后一张图重推一次，作用是三件事：
+    ///   1. 编码器持续出 P 帧，VideoToolbox 会话不会因为空闲而失效；
+    ///   2. pacer 持续有包，GCC 不会判成"应用受限"（ALR）而停止探测；
+    ///   3. 浏览器持续收到帧，`requestVideoFrameCallback` 不会超时冻结。
+    /// 静止画面的 P 帧只有几十字节，对带宽几乎没有影响。
+    private func startKeepAlive() {
+        stopKeepAlive()
+        /* 保活节奏取「目标帧率」与 15fps 的较小者。
+           再低就骗不过 GCC 的 ALR 判定（它按 1 秒窗口算发送速率）；
+           再高只是在重复编同一张图，白耗电。 */
+        let interval = max(pushInterval, 1.0 / 15.0)
+        let timer = DispatchSource.makeTimerSource(queue: sampleQueue)
+        timer.schedule(
+            deadline: .now() + interval,
+            repeating: interval,
+            leeway: .milliseconds(8)
+        )
+        timer.setEventHandler { [weak self] in self?.pushKeepAliveFrame() }
+        timer.resume()
+        keepAliveTimer = timer
+    }
+
+    private func stopKeepAlive() {
+        keepAliveTimer?.cancel()
+        keepAliveTimer = nil
+    }
+
+    private func pushKeepAliveFrame() {
+        stateLock.lock()
+        let alive = running && stream != nil
+        stateLock.unlock()
+        guard alive, let pixelBuffer = lastPixelBuffer else { return }
+
+        /* 刚刚推过真实帧就不补：宁可少推，也不能让静止帧挤掉真实帧的节奏。 */
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastPushAt >= pushInterval * 0.9 else { return }
+        lastPushAt = now
+
+        emit(pixelBuffer: pixelBuffer, sourceTimestampNs: 0, isRepeat: true)
     }
 
     /// 采集源的画幅 + 像素格式。例：`1180x2556 BGRA`。
