@@ -29,6 +29,7 @@ import CoreMedia
 import Darwin
 import Foundation
 import ObjectiveC
+import UIKit
 import WebRTC
 
 /// 屏幕共享会话的统一抽象。
@@ -135,9 +136,13 @@ enum ScreenCaptureKitRuntime {
     }
 
     /// 追加一条运行期记录（未识别回调、异常分支都写这里）。
+    ///
+    /// 同一条只留一次：诊断面板一行显示，重复十遍会把真正的关键信息挤出去。
     static func note(_ text: String) {
         lock.lock()
-        log.append(text)
+        if !log.contains(text) {
+            log.append(text)
+        }
         lock.unlock()
     }
 
@@ -220,16 +225,29 @@ enum ScreenCaptureKitRuntime {
     static var isUsable: Bool {
         guard let picker = sharedPicker() else { return false }
         // isAvailable 是 SCK 的自我判断（例如设备不支持、被家长控制禁用）。
-        if let available = boolValue(picker, "isAvailable"), !available {
-            lock.lock(); log.append("picker 报告不可用"); lock.unlock()
-            return false
+        if let available = boolValue(picker, "isAvailable") {
+            if !available {
+                lock.lock(); log.append("picker 报告不可用"); lock.unlock()
+                return false
+            }
+            lock.lock(); log.append("available=1"); lock.unlock()
         }
         let canPresent = hasInstanceMethod(picker, "present")
             || hasInstanceMethod(picker, "presentForCurrentApplication")
+            || hasInstanceMethod(picker, "presentPickerForCurrentApplication")
         if !canPresent {
             lock.lock(); log.append("缺 present"); lock.unlock()
         }
-        return canPresent && streamClass != nil && configurationClass != nil
+        /* active 开关必须存在。
+           头文件里是 `@property (getter=isActive) BOOL active;`，setter 叫 setActive:。
+           没有这个开关，present() 会静静地什么都不做——1.6.4 在 iOS 27 真机上
+           点了共享没反应，就是把它拼成了 setIsActive: 导致的选择子找不到。 */
+        let canActivate = hasInstanceMethod(picker, "setActive:")
+            || hasInstanceMethod(picker, "setIsActive:")
+        if !canActivate {
+            lock.lock(); log.append("缺 active 开关"); lock.unlock()
+        }
+        return canPresent && canActivate && streamClass != nil && configurationClass != nil
     }
 
     static var streamType: AnyClass? { bootstrap(); return streamClass }
@@ -294,6 +312,70 @@ enum ScreenCaptureKitRuntime {
         guard let imp = instanceIMP(obj, name) else { return }
         typealias F = @convention(c) (AnyObject, Selector, CMTime) -> Void
         unsafeBitCast(imp, to: F.self)(obj, NSSelectorFromString(name), value)
+    }
+
+    /// 无返回值、一个 NSInteger 参数。
+    ///
+    /// 用在 `presentPickerUsingContentStyle:`——枚举在 64 位上是 NSInteger，
+    /// 与 Swift 的 Int 同位宽，直接按值传即可。
+    static func sendInt(_ obj: AnyObject, _ name: String, _ value: Int) {
+        guard let imp = instanceIMP(obj, name) else { return }
+        typealias F = @convention(c) (AnyObject, Selector, Int) -> Void
+        unsafeBitCast(imp, to: F.self)(obj, NSSelectorFromString(name), value)
+    }
+
+    // MARK: 选择器的激活与弹出
+    //
+    // 这两步是整条 SCK 链路的**唯一入口**，也是 1.6.4 折掉的地方：
+    // 属性声明是 `@property (getter=isActive) BOOL active;`，
+    // 于是 setter 叫 `setActive:`，而不是按属性名拼出来的 `setIsActive:`。
+    // 选择子找不到时 objc_msgSend 什么都不会发生，也不会报错，
+    // 表现出来就是"点了共享没弹窗、没反应"。
+
+    /// 打开选择器。返回命中的 setter 名，用于诊断。
+    static func activatePicker(_ picker: AnyObject) -> String? {
+        for name in ["setActive:", "setIsActive:"] where hasInstanceMethod(picker, name) {
+            setBool(picker, name, true)
+            return String(name.dropLast())
+        }
+        return nil
+    }
+
+    static func deactivatePicker(_ picker: AnyObject) {
+        for name in ["setActive:", "setIsActive:"] where hasInstanceMethod(picker, name) {
+            setBool(picker, name, false)
+            return
+        }
+    }
+
+    /// 读回 active 标志。读不到返回 nil（不同系统版本可能只有 getter 没 setter）。
+    static func isPickerActive(_ picker: AnyObject) -> Bool? {
+        boolValue(picker, "isActive")
+    }
+
+    /// 弹出系统面板，返回真正调到的选择子。
+    ///
+    /// 首选无参 `present`（Apple 示例里整屏共享用的就是它）；
+    /// 万一 iOS 27 只暴露了带 style 的变体，再按 `presentPickerUsingContentStyle:`
+    /// 用 display(3) 直接进整屏选择；最后才是只限本 App 的入口。
+    static func presentPicker(_ picker: AnyObject) -> String? {
+        let chain = [
+            "present",
+            "presentPickerUsingContentStyle:",
+            "presentForCurrentApplication",
+            "presentPickerForCurrentApplication"
+        ]
+        for name in chain {
+            guard hasInstanceMethod(picker, name) else { continue }
+            if name.hasSuffix(":") {
+                // SCShareableContentStyle.display = 3
+                sendInt(picker, name, 3)
+            } else {
+                send(picker, name)
+            }
+            return name.hasSuffix(":") ? String(name.dropLast()) : name
+        }
+        return nil
     }
 
     /// alloc + 无参 init，用于 SCStreamConfiguration。
@@ -408,6 +490,8 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     private var source: RTCVideoSource?
     private var capturer: RTCVideoCapturer?
     private var running = false
+    /// 选择器是否已经给过回应（选中或取消）。用于区分"面板还开着"和"面板没起来"。
+    private var didReceivePickerCallback = false
     private let stateLock = NSLock()
 
     /// 帧回调不挂在主队列：共享时用户很可能正在别的 App 里翻页，
@@ -420,6 +504,12 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     // MARK: - 生命周期
 
     func start(source: RTCVideoSource) {
+        // 系统面板由 UIKit 呈现，只认主线程。调用方目前都在主线程，
+        // 这里再兜一道：从任意线程点进来也不会变成"什么都没发生"。
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.start(source: source) }
+            return
+        }
         guard !running else { return }
         self.source = source
         self.capturer = RTCVideoCapturer(delegate: source)
@@ -427,6 +517,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         idleFrameCount = 0
         lastFrameAt = nil
         lastError = nil
+        didReceivePickerCallback = false
 
         guard let picker = ScreenCaptureKitRuntime.sharedPicker() else {
             fail("本机没有可用的系统内容选择器（ScreenCaptureKit 未加载）")
@@ -437,6 +528,13 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         // 先 remove 再 add：重复点「开始共享」时不会叠加观察者，
         // 否则一次选择会触发多次 startStream。
         // 选择子名不一定和 Swift 名一致，逐个试。
+        //
+        // 编译期没有 SCK 的协议头，Swift 类自然也不会声明 conformance。
+        // 少数系统版本会在 addObserver 时校验 conformsToProtocol，
+        // 这里用运行时把协议挂上去，挂了没坏处，不挂可能连观察者都加不上。
+        if let proto = objc_getProtocol("SCContentSharingPickerObserver") {
+            class_addProtocol(ScreenCaptureKitSharer.self, proto)
+        }
         for name in ["removeObserver:", "removePickerObserver:", "remove:"] {
             if ScreenCaptureKitRuntime.hasInstanceMethod(picker, name) {
                 ScreenCaptureKitRuntime.send(picker, name, self)
@@ -456,16 +554,45 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
             return
         }
 
-        ScreenCaptureKitRuntime.setBool(picker, "setIsActive:", true)
+        /* 顺序不能反：先把 active 打开，再 present。
+           active 默认是 false，为 false 时 present() 什么都不做。 */
+        guard let setter = ScreenCaptureKitRuntime.activatePicker(picker) else {
+            fail("系统内容选择器没有 active 开关")
+            return
+        }
+        ScreenCaptureKitRuntime.note("active=\(setter)")
+
         running = true
         notify(.picking)
 
-        if ScreenCaptureKitRuntime.hasInstanceMethod(picker, "present") {
-            ScreenCaptureKitRuntime.send(picker, "present")
-        } else if ScreenCaptureKitRuntime.hasInstanceMethod(picker, "presentForCurrentApplication") {
-            ScreenCaptureKitRuntime.send(picker, "presentForCurrentApplication")
-        } else {
+        guard let presentName = ScreenCaptureKitRuntime.presentPicker(picker) else {
             fail("系统内容选择器没有 present 接口")
+            return
+        }
+        ScreenCaptureKitRuntime.note("present=\(presentName)")
+
+        schedulePresentCheck()
+    }
+
+    /// present 之后的体检。
+    ///
+    /// 正常情况下用户会在几秒内选好内容，filter 回调一到就建流。
+    /// 如果 4 秒后既没有回调、active 又被系统复位了，说明面板根本没起来
+    /// （选择子缺失、被系统拒绝都会这样）。与其让用户对着"等待选择"发呆，
+    /// 不如报一次失败，让上层降级到 in-app 捕获——至少画面能出去。
+    private func schedulePresentCheck() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self, self.running, self.stream == nil, !self.didReceivePickerCallback else {
+                return
+            }
+            let active = ScreenCaptureKitRuntime.isPickerActive(self.picker)
+            if active == false {
+                ScreenCaptureKitRuntime.note("present 后 4 秒无回调，active 已被复位")
+                self.fail("系统内容面板没有打开")
+            } else {
+                // 面板可能还开着，用户在看内容列表。只记一笔，不打断。
+                ScreenCaptureKitRuntime.note("present 后 4 秒仍无 filter 回调")
+            }
         }
     }
 
@@ -481,7 +608,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
             ScreenCaptureKitRuntime.stopCapture(runningStream)
         }
         if let picker {
-            ScreenCaptureKitRuntime.setBool(picker, "setIsActive:", false)
+            ScreenCaptureKitRuntime.deactivatePicker(picker)
             for name in ["removeObserver:", "removePickerObserver:", "remove:"] {
                 if ScreenCaptureKitRuntime.hasInstanceMethod(picker, name) {
                     ScreenCaptureKitRuntime.send(picker, name, self)
@@ -509,6 +636,9 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         ScreenCaptureKitRuntime.setInt(configuration, "setWidth:", size.width)
         ScreenCaptureKitRuntime.setInt(configuration, "setHeight:", size.height)
         // 30fps 上限：屏幕内容不需要 60fps，省一半码率。
+        // 注：minimumFrameInterval / pixelFormat / queueDepth / showsCursor 在
+        // iOS 上是 API_UNAVAILABLE，选择子不存在时 setInt/setBool 静默跳过；
+        // 留着是为了同一份代码在 macOS 上也能用。真正生效的只有宽高。
         ScreenCaptureKitRuntime.setTime(
             configuration,
             "setMinimumFrameInterval:",
@@ -571,10 +701,28 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     }
 
     /// 输出画布：长边 1280，按内容宽高比缩放，且保证是偶数。
+    /// 输出画布：长边 1280，按内容宽高比缩放，且保证是偶数。
+    ///
+    /// 单位换算踩过一次坑：`contentRect` 是**点**，`width/height` 是**像素**。
+    /// 3x 屏整屏是 393×852 点，不乘 pointPixelScale 就只编码到 1/3 分辨率，
+    /// 对端看到的是糊的。
     private func outputSize(for filter: AnyObject) -> (width: Int, height: Int) {
-        let rect = contentRect(of: filter) ?? CGRect(x: 0, y: 0, width: 16, height: 9)
-        let width = max(rect.width, 1)
-        let height = max(rect.height, 1)
+        var rect = pixelRect(of: filter)
+
+        // 拿不到 contentRect 时按整屏像素兜底：分享整屏是最常见的情况，
+        // 用 16:9 兜底反而会把手机竖屏画面压成一条。
+        if rect == nil {
+            let bounds = UIScreen.main.bounds
+            let scale = UIScreen.main.scale
+            rect = CGRect(
+                x: 0, y: 0,
+                width: bounds.width * scale,
+                height: bounds.height * scale
+            )
+        }
+
+        let width = max(rect?.width ?? 1280, 1)
+        let height = max(rect?.height ?? 720, 1)
         let ratio = width / height
         let longEdge: CGFloat = 1280
 
@@ -584,11 +732,30 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         return (even(Int((longEdge * ratio).rounded())), even(Int(longEdge)))
     }
 
+    /// contentRect（点）× pointPixelScale → 像素。
+    private func pixelRect(of filter: AnyObject) -> CGRect? {
+        guard let rect = contentRect(of: filter) else { return nil }
+        guard let scale = pixelScale(of: filter), scale > 0 else { return rect }
+        return CGRect(
+            x: 0,
+            y: 0,
+            width: rect.width * scale,
+            height: rect.height * scale
+        )
+    }
+
     private func contentRect(of filter: AnyObject) -> CGRect? {
         guard let imp = ScreenCaptureKitRuntime.instanceIMP(filter, "contentRect") else { return nil }
         typealias F = @convention(c) (AnyObject, Selector) -> CGRect
         let rect = unsafeBitCast(imp, to: F.self)(filter, NSSelectorFromString("contentRect"))
         return rect.width > 1 && rect.height > 1 ? rect : nil
+    }
+
+    private func pixelScale(of filter: AnyObject) -> CGFloat? {
+        guard let imp = ScreenCaptureKitRuntime.instanceIMP(filter, "pointPixelScale") else { return nil }
+        typealias F = @convention(c) (AnyObject, Selector) -> Double
+        let scale = unsafeBitCast(imp, to: F.self)(filter, NSSelectorFromString("pointPixelScale"))
+        return scale > 0 ? CGFloat(scale) : nil
     }
 
     private func even(_ value: Int) -> Int {
@@ -659,6 +826,7 @@ extension ScreenCaptureKitSharer {
     }
 
     private func handleFilterUpdate(_ filter: AnyObject) {
+        didReceivePickerCallback = true
         // 共享中途用户在系统面板里换了内容：更新过滤器即可，
         // 不能重建 SCStream——重建会断流，对端画面黑一下。
         stateLock.lock()
@@ -682,6 +850,7 @@ extension ScreenCaptureKitSharer {
     }
 
     private func handleCancel() {
+        didReceivePickerCallback = true
         // 已经有流在跑时，「取消」只是关掉面板，不代表停止共享。
         stateLock.lock()
         let hasStream = stream != nil
@@ -721,8 +890,10 @@ extension ScreenCaptureKitSharer {
         /* SCK 与 ReplayKit 最大的语义差别：回调 ≠ 新画面。
            画面没变化时它照样回调，但附带的 status 是 idle，
            底层还是同一块 IOSurface。转发只会让编码器重复编同一张图。
-           解析不出 status 时**照常转发**：宁可多推几帧，也不能黑屏。 */
-        if let status = frameStatus(of: sampleBuffer), status != 0, status != 4 {
+           SCFrameStatus：complete=0、idle=1、blank=2、started=3、suspended=4、stopped=5，
+           只有 complete 和 started 是新画面。解析不出 status 时**照常转发**：
+           宁可多推几帧，也不能黑屏。 */
+        if let status = frameStatus(of: sampleBuffer), status != 0, status != 3 {
             idleFrameCount += 1
             return
         }
