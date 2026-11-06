@@ -589,7 +589,7 @@ final class PeerSession: NSObject {
             let line = String(raw)
             if line.hasPrefix("m=") {
                 flush()
-                kind = String(line.dropFirst(2).split(separator: " ").first ?? "")
+                kind = line.dropFirst(2).split(separator: " ").first.map(String.init) ?? ""
                 continue
             }
             guard !kind.isEmpty else { continue }
@@ -605,8 +605,7 @@ final class PeerSession: NSObject {
                 direction = "inactive"
             } else if line.hasPrefix("a=msid:") {
                 /* `a=msid:<stream> <track>`：只留流名，track 名太长且没信息量。 */
-                let rest = String(line.dropFirst(7))
-                msid = String(rest.split(separator: " ").first ?? "-")
+                msid = line.dropFirst(7).split(separator: " ").first.map(String.init) ?? "-"
             }
         }
         flush()
