@@ -67,7 +67,11 @@ enum GlassMotion {
     }
 
     /// 带延迟的进场曲线。Reduce Motion 下退化为 0.12s 线性淡入。
-    static func enter(index: Int) -> Animation {
+    ///
+    /// 名字必须带 Stagger：`enter` 已经被上面的 `static let enter` 占用，
+    /// Swift 不允许同一类型里出现同名的存储属性与方法（即使签名不同），
+    /// 写成 `func enter(index:)` 会直接 "invalid redeclaration" 编译失败。
+    static func enterStagger(_ index: Int) -> Animation {
         if isReduceMotion { return .linear(duration: 0.12) }
         return enter.delay(staggerDelay(index))
     }
@@ -121,7 +125,7 @@ struct EnterFromBottom: ViewModifier {
                 // 首帧先以"未进场"渲染，再在下一帧切到进场，
                 // 否则 SwiftUI 会把初始值直接当成终值，动画根本不发生。
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
-                    withAnimation(GlassMotion.enter(index: index)) {
+                    withAnimation(GlassMotion.enterStagger(index)) {
                         shown = true
                     }
                 }
