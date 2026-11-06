@@ -203,8 +203,11 @@ final class MeetingViewModel: ObservableObject {
     private var nativeShareDiagnosticsReport: String {
         var lines: [String] = []
         lines.append("共享通道：\(screenSharingBackend.displayName)（iOS 27+，本进程内）")
-        if screenSharingBackend == .screenCaptureKit {
-            lines.append("SCK 绑定：\(ScreenCaptureKitRuntime.resolutionLog)")
+        // 无论当前走哪条都报一次绑定结论：SCK 失败降级到 in-app 时，
+        // 这行正是唯一能说明"为什么降级"的证据，不能跟着 backend 一起消失。
+        lines.append("SCK 绑定：\(ScreenCaptureKitRuntime.resolutionLog)")
+        if didFallbackToInApp {
+            lines.append("已降级：SCK 起播失败，本次会议改用 in-app 捕获")
         }
 
         if isScreenSharing, let startedAt = nativeShareStartedAt {
@@ -661,10 +664,16 @@ final class MeetingViewModel: ObservableObject {
                 )
                 return
             }
-            created.onStateChange = { [weak self] state in
+            created.onStateChange = { [weak self, weak created] state in
                 // 回调可能来自 SCK 的任意线程，统一回主线程再动 @Published。
                 Task { @MainActor in
-                    self?.handleNativeShareState(state)
+                    guard let self, let created else { return }
+                    /* 只认当前这一场。
+                       stop() 的 .stopped 是异步回投的：降级换通道时，
+                       旧会话的 .stopped 可能排在新会话的 .running 之后到达，
+                       不核对身份就会把刚亮起来的"共享中"打回去。 */
+                    guard self.nativeShareSession === created else { return }
+                    self.handleNativeShareState(state)
                 }
             }
             nativeShareSession = created
