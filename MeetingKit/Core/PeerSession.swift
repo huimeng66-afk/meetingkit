@@ -408,8 +408,16 @@ final class PeerSession: NSObject {
         let mid = midText.isEmpty ? "-" : midText
         let encodings = screenSender?.parameters.encodings ?? []
         let ssrc = encodings.first?.ssrc?.stringValue ?? "-"
+        /* 协商出来的编码 + 写进去的码率上限。
+           VP8 = iOS 上只能软编，880×1920 必然既糊又卡，看到它就该改 SDP；
+           `上限` 是真正落到 encoder 的数字，它要是 300k 那种默认值，
+           说明 setVideoEncoding 根本没写进去（encodings 为空时会被跳过）。 */
+        let codec = SDPCodecFilter.videoCodecName(in: localSDP)
+        let capBps = encodings.first?.maxBitrateBps?.intValue ?? 0
+        let capText = capBps > 0 ? String(format: "%.1fM", Double(capBps) / 1_000_000) : "未设"
         return "SDP video \(videoMLines) · 共享\(screenSDPText) · sender \(screenSenderText)"
             + " · mid=\(mid)/enc=\(encodings.count)/ssrc=\(ssrc)"
+            + " · \(codec)/上限\(capText)"
             + " · 远端\(remote) · 信令 \(signaling) · ICE \(ice)"
     }
 
@@ -554,6 +562,13 @@ final class PeerSession: NSObject {
     /// 挑出来——摄像头和共享是两条独立的 send stream，合计会把"共享没发"
     /// 掩盖成"有包在发"。
     var screenTrackIdentifier: String? { screenTrackId }
+
+    /// 共享那条 m-line 的 mid。统计里用它把 `outbound-rtp` 分成两路：
+    /// `trackIdentifier` 在包装层偶尔读回空，mid 是协商写入的，更稳。
+    var screenMid: String {
+        let value = screenTransceiver?.mid ?? ""
+        return value
+    }
 
     /// 记录并返回当前 video sender。sender.track 可能为 nil（关闭视频时），
     /// 所以不能只靠 `track?.kind` 反查，必须缓存引用。
@@ -860,11 +875,28 @@ final class PeerSession: NSObject {
         }
     }
 
-    private func acceptRemoteOffer(_ description: RTCSessionDescription) {
-        peerConnection.setRemoteDescription(description) { [weak self] error in
+    private func acceptRemoteOffer(_ description: RTCSessionDescription, narrowed: Bool = true) {
+        /* 把对端 offer 的视频编码收窄到 H.264。
+           浏览器默认把 VP8 排在最前，answer 只能按 offer 顺序选，
+           协商结果就是 VP8——而 iOS 没有 VP8 硬编码器，880×1920 的屏幕内容
+           软编跑不动：帧率 7fps、每帧 3KB、画面糊成块。详见 SDPCodecFilter。 */
+        var target = description
+        if narrowed {
+            let filtered = SDPCodecFilter.preferH264Only(description.sdp)
+            if filtered != description.sdp {
+                target = RTCSessionDescription(type: .offer, sdp: filtered)
+            }
+        }
+        peerConnection.setRemoteDescription(target) { [weak self] error in
             Task { @MainActor in
                 guard let self = self else { return }
                 if error != nil {
+                    /* 收窄后的 SDP 被拒（对端结构特殊）：用原始描述再试一次。
+                       宁可回到 VP8，也不能因为一次 munging 把整条连接判死。 */
+                    if target.sdp != description.sdp {
+                        self.acceptRemoteOffer(description, narrowed: false)
+                        return
+                    }
                     self.isNegotiating = false
                     self.isAcceptingRemoteOffer = false
                     // setRemoteDescription 失败通常意味着远端描述与本地状态冲突，
@@ -934,14 +966,22 @@ final class PeerSession: NSObject {
     private func applyLocalDescriptionAndSignal(
         _ description: RTCSessionDescription,
         restart: Bool,
-        onDone: (() -> Void)? = nil
+        onDone: (() -> Void)? = nil,
+        narrowed: Bool = true
     ) {
-        peerConnection.setLocalDescription(description) { [weak self] error in
+        var target = description
+        if narrowed, description.type == .offer {
+            let filtered = SDPCodecFilter.preferH264Only(description.sdp)
+            if filtered != description.sdp {
+                target = RTCSessionDescription(type: .offer, sdp: filtered)
+            }
+        }
+        peerConnection.setLocalDescription(target) { [weak self] error in
             Task { @MainActor in
                 guard let self = self else { return }
                 defer { onDone?() }
                 if error == nil {
-                    let toSend = self.peerConnection.localDescription ?? description
+                    let toSend = self.peerConnection.localDescription ?? target
                     self.offerSentAt = description.type == .offer ? Date() : nil
                     self.delegate?.peerSession(self, needsSignalSDP: toSend, restart: restart)
                     if description.type == .offer {
@@ -952,6 +992,14 @@ final class PeerSession: NSObject {
                         self.offerRetryTask = nil
                     }
                 } else {
+                    /* 收窄编码导致 setLocalDescription 被拒：退回原始 offer 重来。
+                       这一步只发生一次，不会递归。 */
+                    if target.sdp != description.sdp {
+                        self.applyLocalDescriptionAndSignal(
+                            description, restart: restart, onDone: onDone, narrowed: false
+                        )
+                        return
+                    }
                     self.offerSentAt = nil
                     self.delegate?.peerSessionNeedsRebuild(self)
                 }

@@ -943,6 +943,7 @@ final class RealRTCClient: NSObject, RTCClient {
 
             group.enter()
             let trackID = peer.session.screenTrackIdentifier
+            let screenMid = peer.session.screenMid
             peer.session.peerConnection.statistics { report in
                 var peerPackets = 0
                 var peerEncoded = 0
@@ -970,13 +971,28 @@ final class RealRTCClient: NSObject, RTCClient {
                        字段名在 M100~M140 之间改过（trackIdentifier /
                        trackId），取到哪个用哪个；都取不到就不要过滤，
                        否则会把"真的在发"读成 0 包，反过来诱发误自愈。 */
-                    if let trackID {
+                    /* 认法一：mid。协商时写进 SDP 的编号，两边一定有。
+                       认法二：trackIdentifier。包装层偶尔读回空，作为补充。
+                       两样都拿不到时才走"全部算共享"的兜底。 */
+                    var isScreen = false
+                    var judged = false
+                    if !screenMid.isEmpty,
+                       let reportedMid = stat.values["mid"] as? String,
+                       !reportedMid.isEmpty {
+                        judged = true
+                        isScreen = (reportedMid == screenMid)
+                    }
+                    if !judged, let trackID {
                         let reported = (stat.values["trackIdentifier"] as? String)
                             ?? (stat.values["trackId"] as? String)
-                        if let reported, !reported.isEmpty, reported != trackID {
-                            cameraBytes += bytes
-                            continue
+                        if let reported, !reported.isEmpty {
+                            judged = true
+                            isScreen = (reported == trackID)
                         }
+                    }
+                    if judged, !isScreen {
+                        cameraBytes += bytes
+                        continue
                     }
                     matchedScreen = true
                     peerPackets += packets
@@ -987,11 +1003,14 @@ final class RealRTCClient: NSObject, RTCClient {
                    或者共享这条根本没建 send stream。前者按全部视频兜底，
                    后者 0 包本来就该是 0 包，兜底也不会改变结论。 */
                 if !matchedScreen {
+                    /* 一路都没认出来：说明这个版本既没有 mid 也没有
+                       trackIdentifier。此时宁可把总量记给共享，
+                       也不能像 1.7.8 那样用"总量减摄像头"算出 0——
+                       那会让码率永远显示不出来，把"带宽不够"误判成"没在发"。 */
                     peerPackets = allVideoPackets
                     peerEncoded = allVideoEncoded
-                    /* 兜底时把总字节全记给共享，但摄像头那份已经在循环里
-                       按"不匹配"扣走了，这里只补未归类的部分。 */
-                    peerBytes = max(allVideoBytes - cameraBytes, 0)
+                    peerBytes = allVideoBytes
+                    cameraBytes = 0
                 }
                 totals.merge(packets: peerPackets, encoded: peerEncoded)
                 totals.merge(bytes: peerBytes, camera: cameraBytes)
