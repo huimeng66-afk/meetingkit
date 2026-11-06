@@ -222,26 +222,45 @@ final class MeetingViewModel: ObservableObject {
                 // "等待系统面板选择内容"，而画面明明已经在推——误导排查方向。
                 lines.append("状态：共享中")
             }
-        } else if let session = nativeShareSession, session.isRunning {
-            /* 会话真的在出帧，界面状态却是"未共享"。
-               这正是"浏览器不显示画面"的典型现场：本端 SCK 在推、
-               RTC 在发包，但 screen:state 没发出去，对端没切舞台。
-               单独标出来，别再混进"等待选择内容"里。 */
-            lines.append("状态：会话在推帧但界面未同步（异常，请反馈此行）")
-        } else if nativeShareSession != nil {
-            lines.append("状态：等待系统面板选择内容")
+        } else if let session = nativeShareSession {
+            switch session.phase {
+            case .running:
+                /* 会话真的在出帧，界面状态却是"未共享"。
+                   这正是"浏览器不显示画面"的典型现场：本端 SCK 在推、
+                   RTC 在发包，但 screen:state 没发出去，对端没切舞台。
+                   1.7.1 起上行守护会自动把它拉回来，这里只负责如实记录。 */
+                lines.append("状态：会话在推帧但界面未同步（上行守护会自动重挂）")
+            case .picking:
+                lines.append("状态：等待系统面板选择内容")
+            case .idle:
+                lines.append("状态：共享通道待命")
+            case .stopped:
+                if let reason = session.stopReason {
+                    lines.append("状态：未共享（上一轮被系统结束：\(reason)）")
+                } else {
+                    lines.append("状态：未共享（上一轮已停止，可再次开始）")
+                }
+            case .failed:
+                lines.append("状态：未共享（上一轮失败：\(session.stopReason ?? "未知原因")）")
+            }
         } else {
             lines.append("状态：未共享")
         }
 
         if let session = nativeShareSession {
-            lines.append("会话：\(session.isRunning ? "运行中" : "已停止") · 已推 \(session.frameCount) 帧")
+            let runningText = session.isRunning ? "运行中" : "已停止"
+            lines.append(
+                "会话：\(runningText) · 已推 \(session.frameCount) 帧 · 共享轨 \(screenTrackEnabledText)"
+            )
         }
 
         if let session = nativeShareSession {
             var frameLine = "SCK 出帧：\(session.frameCount) 帧"
             if let lastFrameAt = session.lastFrameAt {
                 frameLine += String(format: "（最新 %.1f 秒前）", Date().timeIntervalSince(lastFrameAt))
+            }
+            if let capture = session.captureSummary {
+                frameLine += " · 源 \(capture)"
             }
             if session.idleFrameCount > 0 {
                 frameLine += " · 画面未变的静止帧 \(session.idleFrameCount) 个（已丢弃，正常）"
@@ -251,18 +270,37 @@ final class MeetingViewModel: ObservableObject {
 
         let video = ScreenShareRuntime.videoStats
         if video.sampled {
-            lines.append(
-                "RTC 视频：发送 \(video.packetsSent) 包 · 编码 \(video.framesEncoded) 帧 · "
+            var videoLine = "RTC 视频：发送 \(video.packetsSent) 包 · 编码 \(video.framesEncoded) 帧 · "
                 + (video.screenAttached ? "共享轨已挂" : "共享轨未挂 ⚠️")
-            )
+                + " · 轨\(video.trackEnabled ? "开" : "关 ⚠️")"
+                + " · SDP上行\(video.sendsUpstream ? "允许" : "不允许 ⚠️")"
+            if let sampledAt = video.sampledAt {
+                videoLine += String(format: " · 采样 %.1f 秒前", Date().timeIntervalSince(sampledAt))
+            }
+            lines.append(videoLine)
         } else {
-            lines.append("RTC 视频：尚未采样（入会后约 4 秒出结果；无对端时不会发包）")
+            lines.append("RTC 视频：尚未采样（入会后约 3 秒出结果；无对端时不会发包）")
+        }
+
+        // 自愈流水账：哪条兜底被触发过，一眼可见。
+        let notes = ScreenShareRuntime.notesText
+        if !notes.isEmpty {
+            lines.append("自愈：\(notes)")
         }
 
         if let error = nativeShareError {
             lines.append("最近错误：\(error)")
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// 共享轨当前是否 enabled。
+    ///
+    /// 诊断必须能看见这个：轨被关掉时，采集侧依旧在出帧、sender 上也依旧
+    /// 挂着这条轨，但 WebRTC 会把帧全丢——"出帧上百、编码 0 帧"就是这么来的。
+    private var screenTrackEnabledText: String {
+        guard let client = rtc as? RealRTCClient else { return "—" }
+        return client.isScreenTrackEnabled ? "开" : "关 ⚠️"
     }
 
     /// 用户已经看过失败提示：清掉，避免每次刷新重复弹。
@@ -733,10 +771,24 @@ final class MeetingViewModel: ObservableObject {
                 return
             }
             let wasSharing = isScreenSharing
+            let stopReason = nativeShareSession?.stopReason
             nativeShareStartedAt = nil
             applyScreenSharing(false, isInitial: false, source: .screenCaptureKit)
             if wasSharing {
-                showToast(.screenShareStopped())
+                if let stopReason {
+                    /* 不是用户点的停止，而是系统把流收了（切换内容失败、
+                       系统共享被其它 App 抢占等）。把原因说出来，比一句
+                       "共享已结束"有用得多。 */
+                    showToast(
+                        ToastMessage(
+                            text: "屏幕共享被系统中断：\(stopReason)",
+                            systemImage: "rectangle.badge.xmark",
+                            style: .warning
+                        )
+                    )
+                } else {
+                    showToast(.screenShareStopped())
+                }
             }
 
         case .failed(let message):
@@ -1428,6 +1480,13 @@ extension MeetingViewModel: RTCClientDelegate {
         // RTC 已停本地推流并回退摄像头轨：这里同步 UI 并让扩展停止广播。
         applyScreenSharing(false, isInitial: true)
         shareBridge.requestStop()
+        /* iOS 27 的共享在本进程里：服务端既然拒绝（他人正在共享 / 无权限），
+           就必须把 SCStream 一起停掉。只停 RTC 不停采集，系统状态栏会一直
+           挂着"正在共享"，而帧全被丢进已关闭的轨道——诊断上正是
+           "出帧在涨、发送 0 包、共享轨已挂"。 */
+        if let session = nativeShareSession {
+            session.stop()
+        }
         showToast(
             ToastMessage(
                 text: reason,
@@ -1437,6 +1496,19 @@ extension MeetingViewModel: RTCClientDelegate {
         )
     }
 
+    /// 上行守护把共享救回来了：采集侧一直接在出帧，但 RTC 侧的状态
+    /// （或共享轨）被某条路径打掉了。RTC 已经重挂并补发了 screen:state，
+    /// 这里只需把界面与计时器点亮，别再显示"未共享"。
+    func rtcDidRestoreScreenShare() {
+        guard !isScreenSharing else { return }
+        isScreenSharing = true
+        if nativeShareStartedAt == nil {
+            nativeShareStartedAt = Date()
+        }
+        nativeShareError = nil
+        shareDurationText = "00:00"
+        showToast(.screenShareStarted())
+    }
     func rtcDidRejoinFail(message: String) {
         finalizeLocalEnd(
             toast: ToastMessage(

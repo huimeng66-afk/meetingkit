@@ -320,6 +320,31 @@ enum ScreenShareStore {
 
 // MARK: - 运行期统计
 
+/// 一次视频上行采样。
+///
+/// 为什么单列 `trackEnabled` / `sendsUpstream`：1.7.0 真机出现了
+/// "出帧 119、发送 0 包、编码 0 帧、共享轨已挂"这一组互相矛盾的数字。
+/// 根因就是"挂上"只说明 sender.track 指向共享轨，**不说明这条轨是开的**，
+/// 也不说明 SDP 的 m-line 允许发送。少了这两项，诊断会把"轨被关掉"
+/// 误报成"已经挂好"，排查方向直接被带偏。
+struct ScreenVideoStats {
+    var packetsSent = 0
+    var framesEncoded = 0
+    /// sender.track 是否就是本端的共享轨。
+    var screenAttached = false
+    /// 共享轨本身是否 enabled。false = 帧推到 source 也被丢弃，永远进不了编码器。
+    var trackEnabled = false
+    /// 本地 SDP 里视频 m-line 的方向是否允许发送（sendrecv / sendonly）。
+    var sendsUpstream = true
+    /// 采样时连着的 peer 数。0 表示根本没采样，不要把它当成"没发包"。
+    var senders = 0
+    /// 最近一次采样时间。nil 表示看门狗还没跑过——此时"共享轨已挂"是**没有依据**的，
+    /// 诊断必须显示"尚未采样"，而不是拿默认值冒充结论。
+    var sampledAt: Date?
+
+    var sampled: Bool { sampledAt != nil }
+}
+
 /// 主 App 进程内的共享运行统计，只服务于"共享诊断"面板。
 ///
 /// 为什么要这个东西：共享链路横跨两个进程（扩展 → 文件 → 主 App → WebRTC），
@@ -333,12 +358,17 @@ enum ScreenShareRuntime {
     private static var _lastPushAt: Double?
 
     // 1.5.4：RTP 视频上行统计。用来区分"帧没进编码器"与"编码了但没发出去"。
-    private static var _videoPacketsSent = 0
-    private static var _videoFramesEncoded = 0
-    private static var _screenTrackAttached = false
-    /// 最近一次采样时间。nil 表示看门狗还没跑过——此时"共享轨已挂"是**没有依据**的，
-    /// 诊断必须显示"尚未采样"，而不是拿默认值冒充结论。
-    private static var _videoStatsAt: Double?
+    private static var _video = ScreenVideoStats()
+
+    // 1.7.1：本进程直采（SCK / in-app）的帧计数。
+    // 这是"共享真的在出帧"唯一的独立证据：它由采集侧写入，
+    // 不依赖 ViewModel 的状态机，也不依赖任何跨进程文件。
+    private static var _nativeFrames = 0
+    private static var _nativeLastAt: Double?
+
+    /// 自愈动作的流水账。共享链路上每一次"发现不对、动手修"都记一行：
+    /// 真机复验时这几行比任何状态码都直接——它告诉你哪条兜底被触发了。
+    private static var _notes: [String] = []
 
     /// 扩展写出过多少帧（由主 App 读到新帧时累加）。
     static var framesWritten: Int {
@@ -360,16 +390,22 @@ enum ScreenShareRuntime {
 
     /// 最近一次采样到的视频 RTP 计数。
     /// `sampled` 为 false 时其余字段没有意义，UI 不应把 `screenAttached` 当成结论。
-    static var videoStats: (packetsSent: Int, framesEncoded: Int, screenAttached: Bool, sampled: Bool) {
+    static var videoStats: ScreenVideoStats {
         lock.lock(); defer { lock.unlock() }
-        return (_videoPacketsSent, _videoFramesEncoded, _screenTrackAttached, _videoStatsAt != nil)
+        return _video
     }
 
     /// 最近一次采样的时刻。
     static var videoStatsAt: Date? {
         lock.lock(); defer { lock.unlock() }
-        guard let raw = _videoStatsAt else { return nil }
-        return Date(timeIntervalSince1970: raw)
+        return _video.sampledAt
+    }
+
+    /// 本进程直采累计推了多少帧，以及最后一帧的时刻。
+    /// 上行守护用它判断"帧到底有没有在进 RTC"。
+    static var nativeFrameStats: (count: Int, lastAt: Date?) {
+        lock.lock(); defer { lock.unlock() }
+        return (_nativeFrames, _nativeLastAt.map { Date(timeIntervalSince1970: $0) })
     }
 
     static func noteFrameWritten() {
@@ -383,14 +419,51 @@ enum ScreenShareRuntime {
         lock.unlock()
     }
 
-    /// 由共享看门狗写入。`screenAttached` 表示当前 peer 的 video sender
-    /// 确实挂着共享轨（而不是摄像头黑轨或空轨）。
-    static func noteVideoStats(packetsSent: Int, framesEncoded: Int, screenAttached: Bool) {
+    /// SCK / in-app 每真正推进一帧就记一次。
+    ///
+    /// 放在采集侧而不是 RTC 侧：这是"源真的有画面"的原始信号。
+    /// 只要它在涨、而编码器是 0，问题就一定在 track / sender 这一段，
+    /// 不用再去猜系统面板有没有选中内容。
+    static func noteNativeFrame() {
         lock.lock()
-        _videoPacketsSent = packetsSent
-        _videoFramesEncoded = framesEncoded
-        _screenTrackAttached = screenAttached
-        _videoStatsAt = Date().timeIntervalSince1970
+        _nativeFrames += 1
+        _nativeLastAt = Date().timeIntervalSince1970
+        lock.unlock()
+    }
+
+    /// 记一条自愈动作。只保留最近 6 条，避免诊断面板被历史噪音撑爆。
+    static func note(_ text: String) {
+        lock.lock()
+        if !_notes.contains(text) {
+            _notes.append(text)
+            if _notes.count > 6 { _notes.removeFirst() }
+        }
+        lock.unlock()
+    }
+
+    /// 自愈流水账，诊断面板原样展示。
+    static var notesText: String {
+        lock.lock(); defer { lock.unlock() }
+        return _notes.joined(separator: " · ")
+    }
+
+    /// 由共享看门狗写入。
+    static func noteVideoStats(
+        packetsSent: Int,
+        framesEncoded: Int,
+        screenAttached: Bool,
+        trackEnabled: Bool = false,
+        sendsUpstream: Bool = true,
+        senders: Int = 0
+    ) {
+        lock.lock()
+        _video.packetsSent = packetsSent
+        _video.framesEncoded = framesEncoded
+        _video.screenAttached = screenAttached
+        _video.trackEnabled = trackEnabled
+        _video.sendsUpstream = sendsUpstream
+        _video.senders = senders
+        _video.sampledAt = Date()
         lock.unlock()
     }
 
@@ -399,10 +472,9 @@ enum ScreenShareRuntime {
         _framesWritten = 0
         _framesPushed = 0
         _lastPushAt = nil
-        _videoPacketsSent = 0
-        _videoFramesEncoded = 0
-        _screenTrackAttached = false
-        _videoStatsAt = nil
+        _video = ScreenVideoStats()
+        _nativeFrames = 0
+        _nativeLastAt = nil
         lock.unlock()
     }
 }

@@ -168,6 +168,11 @@ protocol RTCClientDelegate: AnyObject {
     /// 断线重连后重新入会失败且不可恢复（会议已结束 / 被移出 / 已锁定等）。
     func rtcDidRejoinFail(message: String)
 
+    /// 上行守护发现"采集侧在出帧、RTC 却已停"，已经把共享轨重新挂上并补发了
+    /// `screen:state`。UI 需要跟着把共享态与计时器点亮，否则本端在推、
+    /// 界面却显示未共享，用户会以为共享失败。
+    func rtcDidRestoreScreenShare()
+
     /// 本地摄像头的**实际**状态与界面请求不一致时回调。
     ///
     /// 典型场景：用户点开摄像头，但系统权限被拒、或设备上没有可用摄像头。
@@ -324,4 +329,7 @@ struct RemoteMediaKey: Hashable {
 @MainActor
 extension RTCClientDelegate {
     func rtcDidUpdateMeetingBrand(_ brand: MeetingBrand) {}
+
+    /// 默认空实现：没有共享界面的调用方不需要响应。
+    func rtcDidRestoreScreenShare() {}
 }

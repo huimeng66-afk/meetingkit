@@ -30,6 +30,9 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
     private(set) var idleFrameCount = 0
     private(set) var lastFrameAt: Date?
     private(set) var lastError: String?
+    private(set) var phase: ScreenSharingPhase = .idle
+    private(set) var stopReason: String?
+    private(set) var captureSummary: String?
 
     private let recorder = RPScreenRecorder.shared()
     private var source: RTCVideoSource?
@@ -75,6 +78,9 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
         idleFrameCount = 0
         lastFrameAt = nil
         lastError = nil
+        stopReason = nil
+        captureSummary = nil
+        phase = .idle
         adaptedCanvas = nil
         lastPushAt = 0
         pushInterval = 1.0 / Double(max(Int(RealRTCClient.screenEncodingProfile.fps), 1))
@@ -86,6 +92,7 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
         stateLock.lock()
         running = true
         stateLock.unlock()
+        phase = .picking
         notify(.picking)
 
         recorder.startCapture { [weak self] sampleBuffer, sampleType, error in
@@ -115,6 +122,7 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
         // 先占票号：此后排队的旧回调一律作废。
         epoch += 1
         stateLock.unlock()
+        phase = .stopped
 
         guard wasRunning else {
             notify(.stopped)
@@ -126,6 +134,9 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
     }
 
     private func fail(_ message: String) {
+        lastError = message
+        stopReason = message
+        phase = .failed
         stateLock.lock()
         running = false
         epoch += 1
@@ -156,6 +167,13 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
 
         frameCount += 1
         lastFrameAt = Date()
+        ScreenShareRuntime.noteNativeFrame()
+        if captureSummary == nil {
+            let width = CVPixelBufferGetWidth(pixelBuffer)
+            let height = CVPixelBufferGetHeight(pixelBuffer)
+            captureSummary = "\(width)x\(height)"
+        }
+        if phase != .running { phase = .running }
     }
 
     /// 按真实像素比例设置输出画布（只在首帧与尺寸变化时调用）。

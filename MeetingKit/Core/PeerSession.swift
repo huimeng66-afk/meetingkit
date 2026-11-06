@@ -106,6 +106,20 @@ final class PeerSession: NSObject {
 
     // MARK: 协商状态
 
+    /// 本地 offer 发出后等了多久还没等到 answer。nil 表示当前没在等。
+    ///
+    /// 一条 offer 卡在这里超过几秒，就说明对端根本没回 answer（浏览器端的
+    /// glare 丢弃、信令没投递、或页面已卡死）。此时 sender 上挂着轨、
+    /// 轨也是开的，但 WebRTC 永远不会为它建 VideoSendStream——
+    /// 诊断上就是"共享轨已挂 + 编码 0 帧"。
+    private var offerSentAt: Date?
+
+    var pendingOfferAge: TimeInterval? {
+        guard peerConnection.signalingState == .haveLocalOffer,
+              let sentAt = offerSentAt else { return nil }
+        return Date().timeIntervalSince(sentAt)
+    }
+
     private var makingOffer = false
     private var ignoreOffer = false
     /// 只存“远端候选”（远端描述就绪前到达的）；本地候选一律直接发送。
@@ -358,6 +372,34 @@ final class PeerSession: NSObject {
         return (videoSender ?? senderForVideoTrack())?.track?.trackId == current.trackId
     }
 
+    /// 视频上行的完整现场，供共享看门狗与诊断面板使用。
+    ///
+    /// `isVideoTrackAttached` 只回答"sender 上是不是这条轨"，它答不了
+    /// "这条轨是开的吗""SDP 允许发吗"。少了后两项，诊断会出现
+    /// "共享轨已挂 + 编码 0 帧"这种自相矛盾的结论。
+    struct VideoUplinkSummary {
+        var trackExists = false
+        var trackEnabled = false
+        /// sender.track 就是本端要发的那条轨。
+        var attached = false
+        /// 本地 SDP 的视频 m-line 方向允许发送。
+        var sendsUpstream = true
+        /// sender 的数量（>1 通常意味着多了一条历史 m-line）。
+        var senderCount = 0
+    }
+
+    var videoUplinkSummary: VideoUplinkSummary {
+        var summary = VideoUplinkSummary()
+        guard let current = localVideo else { return summary }
+        summary.trackExists = true
+        summary.trackEnabled = current.isEnabled
+        let sender = videoSender ?? senderForVideoTrack()
+        summary.attached = sender?.track?.trackId == current.trackId
+        summary.sendsUpstream = localVideoSendsUpstream
+        summary.senderCount = peerConnection.senders.filter { $0.track?.kind == "video" }.count
+        return summary
+    }
+
     /// 记录并返回当前 video sender。sender.track 可能为 nil（关闭视频时），
     /// 所以不能只靠 `track?.kind` 反查，必须缓存引用。
     private func senderForVideoTrack() -> RTCRtpSender? {
@@ -561,6 +603,7 @@ final class PeerSession: NSObject {
         guard !isClosed else { return }
         isClosed = true
         makingOffer = false
+        offerSentAt = nil
         ignoreOffer = false
         isNegotiating = false
         isRestartingIce = false
@@ -684,6 +727,7 @@ final class PeerSession: NSObject {
                     self.delegate?.peerSessionNeedsRebuild(self)
                     return
                 }
+                self.offerSentAt = nil
                 self.flushPendingRemoteCandidates()
             }
         }
@@ -702,8 +746,10 @@ final class PeerSession: NSObject {
                 defer { onDone?() }
                 if error == nil {
                     let toSend = self.peerConnection.localDescription ?? description
+                    self.offerSentAt = description.type == .offer ? Date() : nil
                     self.delegate?.peerSession(self, needsSignalSDP: toSend, restart: restart)
                 } else {
+                    self.offerSentAt = nil
                     self.delegate?.peerSessionNeedsRebuild(self)
                 }
             }
@@ -776,6 +822,10 @@ extension PeerSession: RTCPeerConnectionDelegate {
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCSignalingState) {
         Task { @MainActor in
             guard !self.isClosed else { return }
+            if stateChanged != .haveLocalOffer {
+                // 已经离开"等 answer"的状态，计时作废。
+                self.offerSentAt = nil
+            }
             if stateChanged == .stable {
                 self.flushPendingRemoteCandidates()
                 if self.needsRestartAfterStable {

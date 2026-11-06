@@ -46,8 +46,34 @@ protocol ScreenSharingSession: AnyObject {
     /// ViewModel 用它识别"迟到事件"：停止回调到了，但会话其实还在跑，
     /// 说明那是上一轮排队的消息，不能把当前状态打回去。
     var isRunning: Bool { get }
+    /// 会话当前处在哪一步。
+    ///
+    /// 为什么要独立于 `isRunning`：1.7.0 真机里"点完共享、面板还开着"和
+    /// "上一轮已经停了"都会落到 `isRunning == false`，诊断只能显示成
+    /// 同一句"等待系统面板选择内容"，把排查方向带偏。有了阶段，
+    /// "面板开着"和"已经结束"才能分开说。
+    var phase: ScreenSharingPhase { get }
+    /// 上一轮结束的原因（系统停止 / 失败）。nil 表示用户主动停的。
+    var stopReason: String? { get }
+    /// 采集源的画幅与像素格式，首帧时确定。诊断用。
+    var captureSummary: String? { get }
     func start(source: RTCVideoSource)
     func stop()
+}
+
+/// 共享会话的阶段。诊断面板按它决定措辞。
+enum ScreenSharingPhase {
+    case idle
+    case picking
+    case running
+    case stopped
+    case failed
+}
+
+extension ScreenSharingSession {
+    var phase: ScreenSharingPhase { isRunning ? .running : .stopped }
+    var stopReason: String? { nil }
+    var captureSummary: String? { nil }
 }
 
 enum ScreenSharingSessionState {
@@ -635,6 +661,13 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     private(set) var idleFrameCount = 0
     private(set) var lastFrameAt: Date?
     private(set) var lastError: String?
+    /// 会话阶段。诊断用它区分"面板还开着"和"已经停了"。
+    private(set) var phase: ScreenSharingPhase = .idle
+    /// 结束原因。用户主动停止时为 nil。
+    private(set) var stopReason: String?
+    /// 首帧的实际画幅与像素格式。像素格式是"能不能编码"的关键证据：
+    /// 10bit HDR（xf44/x420）在部分 WebRTC 版本里进不了适配器。
+    private(set) var captureSummary: String?
 
     /// 运行期解析结果，进诊断面板。
     var resolutionLog: String { ScreenCaptureKitRuntime.resolutionLog }
@@ -704,6 +737,9 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         idleFrameCount = 0
         lastFrameAt = nil
         lastError = nil
+        stopReason = nil
+        captureSummary = nil
+        phase = .idle
         didReceivePickerCallback = false
         didSignalRunning = false
         adaptedCanvas = nil
@@ -765,6 +801,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         stateLock.lock()
         running = true
         stateLock.unlock()
+        phase = .picking
         notify(.picking)
 
         ShareBreadcrumb.mark("sck:presenting")
@@ -839,7 +876,11 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         }
         picker = nil
 
-        guard notifyState else { return }
+        guard notifyState else {
+            phase = .idle
+            return
+        }
+        phase = .stopped
         // 先占一个新票号，再把 .stopped 发出去：
         // 此后任何排队的旧回调都对不上票，全部作废。
         stateLock.lock()
@@ -940,6 +981,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
             // 否则偶发崩溃会让这台机器永久失去系统捕获。
             ShareBreadcrumb.recordSckSuccess()
             self.didSignalRunning = true
+            self.phase = .running
             self.notify(.running(startedAt: Date()))
         }
     }
@@ -1045,6 +1087,8 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
 
     private func fail(_ message: String) {
         lastError = message
+        stopReason = message
+        phase = .failed
         stateLock.lock()
         running = false
         // 失败也占一个新票号：之后排队的旧回调一律作废，
@@ -1223,6 +1267,13 @@ extension ScreenCaptureKitSharer {
 
         frameCount += 1
         lastFrameAt = Date()
+        /* 独立于 ViewModel 的"真的在出帧"信号。上行守护只认它：
+           事件会丢，采集计数不会。 */
+        ScreenShareRuntime.noteNativeFrame()
+        if captureSummary == nil {
+            captureSummary = describe(pixelBuffer)
+        }
+        if phase != .running { phase = .running }
 
         /* 首帧是"真的在共享"最硬的证据。
            原来只靠 startCapture 之后 1.5 秒的 isCapturing 体检，对端在这段
@@ -1235,8 +1286,25 @@ extension ScreenCaptureKitSharer {
         }
     }
 
-    /// 把输出画布设成与源同一个宽高比。
+    /// 采集源的画幅 + 像素格式。例：`1180x2556 BGRA`。
     ///
+    /// 像素格式是"帧进了 source 却编不出来"的关键证据：WebRTC 的
+    /// `RTCCVPixelBuffer` 只认 NV12 / BGRA，10bit HDR（xf44 / x420）
+    /// 会在适配器里被整帧丢弃，而计数看起来一切正常。
+    private func describe(_ pixelBuffer: CVPixelBuffer) -> String {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let code = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        let bytes = [
+            UInt8((code >> 24) & 0xFF), UInt8((code >> 16) & 0xFF),
+            UInt8((code >> 8) & 0xFF), UInt8(code & 0xFF)
+        ]
+        let raw = String(bytes: bytes, encoding: .ascii) ?? "?"
+        let fourCC = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(width)x\(height) \(fourCC.isEmpty ? "????" : fourCC)"
+    }
+
+    /// 把输出画布设成与源同一个宽高比。
     /// 尺寸取的是 `CVPixelBuffer` 的**真实像素**，不需要再乘 pointPixelScale。
     /// 画布比例一致时，适配器的裁切区域正好等于整帧——既不丢内容，也不会放大。
     private func adaptCanvasIfNeeded(pixelBuffer: CVPixelBuffer, source: RTCVideoSource) {
@@ -1299,6 +1367,10 @@ extension ScreenCaptureKitSharer {
         guard isCurrent else { return }
 
         lastError = (error as? NSError)?.localizedDescription
+        /* 记下"是系统把流停掉的"，而不是用户点的停止。
+           这两件事对用户的含义完全不同：前者要提示"共享被系统中断"，
+           后者只需要安静收尾。 */
+        stopReason = lastError ?? "系统结束了屏幕捕获"
         /* 统一收尾：这里以前只发一条 .stopped，选择器仍停在 active。
            用户下次点共享时 present 会被系统当作"面板已存在"而不弹，
            真机表现就是"第二次点共享没反应"。 */
