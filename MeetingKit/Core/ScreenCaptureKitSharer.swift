@@ -1334,6 +1334,26 @@ extension ScreenCaptureKitSharer {
     private func emit(pixelBuffer: CVPixelBuffer, sourceTimestampNs: Int64, isRepeat: Bool) {
         guard let source, let capturer else { return }
 
+        /* 上行守护降级后，forcedCanvas 会变。
+           必须在这里应用而不是在 didCapture 里：屏幕静止时 SCK 不产新帧，
+           didCapture 那条路根本不会走，降级会永远等不到生效。
+           这条函数本身就跑在 sampleQueue 上，和 adaptCanvasIfNeeded 同一条
+           串行队列，调 adaptOutputFormat 不会与采集回调并发。 */
+        if let forced = ScreenShareRuntime.forcedCanvas {
+            let w = ScreenOutputSize.align16(forced.width)
+            let h = ScreenOutputSize.align16(forced.height)
+            if adaptedCanvas?.width != w || adaptedCanvas?.height != h {
+                adaptedCanvas = (w, h)
+                pushInterval = 1.0 / Double(max(Int(RealRTCClient.screenEncodingProfile.fps), 1))
+                source.adaptOutputFormat(
+                    toWidth: Int32(w),
+                    height: Int32(h),
+                    fps: RealRTCClient.screenEncodingProfile.fps
+                )
+                ScreenCaptureKitRuntime.note("画布按守护要求设为 \(w)x\(h)")
+            }
+        }
+
         var timeStampNs = sourceTimestampNs
         if timeStampNs <= lastEmittedTsNs {
             timeStampNs = lastEmittedTsNs + Int64(pushInterval * 1_000_000_000)
@@ -1445,8 +1465,17 @@ extension ScreenCaptureKitSharer {
         guard width > 1, height > 1 else { return }
 
         let profile = RealRTCClient.screenEncodingProfile
-        let longEdge = max(Int(profile.width), Int(profile.height))
-        let target = ScreenOutputSize.fit(width: width, height: height, maxLongEdge: longEdge)
+        /* 上行守护判定"编码器零产出"后会强制一个更小的画布。
+           这里必须优先它：否则下一帧又按源比例算回 880x1920，
+           降级等于没做，守护会一直以为是别的原因。 */
+        let target: (width: Int, height: Int)
+        let forced = ScreenShareRuntime.forcedCanvas
+        if let forced {
+            target = (ScreenOutputSize.align16(forced.width), ScreenOutputSize.align16(forced.height))
+        } else {
+            let longEdge = max(Int(profile.width), Int(profile.height))
+            target = ScreenOutputSize.fit(width: width, height: height, maxLongEdge: longEdge)
+        }
 
         if let adaptedCanvas,
            adaptedCanvas.width == target.width,
@@ -1464,7 +1493,8 @@ extension ScreenCaptureKitSharer {
             height: Int32(target.height),
             fps: profile.fps
         )
-        ScreenCaptureKitRuntime.note("画布 \(width)x\(height)→\(target.width)x\(target.height)")
+        let tag = forced == nil ? "" : "（守护强制）"
+        ScreenCaptureKitRuntime.note("画布 \(width)x\(height)→\(target.width)x\(target.height)\(tag)")
     }
 
     /// 从 sample attachments 里找状态位。

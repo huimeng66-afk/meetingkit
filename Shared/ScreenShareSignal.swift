@@ -364,6 +364,13 @@ struct ScreenVideoStats {
     /// relay = 流量过 TURN，带宽与延迟都由中继服务器决定。
     var localCandidate = ""
     var remoteCandidate = ""
+    /// 编码器自己的现场，一行文本：`impl=libvpx key=0 sent=0 0x0 重传=0`。
+    ///
+    /// 这是「帧推进去了但 framesEncoded 恒为 0」唯一能定性的证据：
+    ///   · impl 为空 —— 编码器根本没建起来（sender/source 没接上）
+    ///   · impl 有值、key=0、帧尺寸 0x0 —— 帧没进到编码器
+    ///   · impl 有值、key=0、帧尺寸正常 —— VideoToolbox 每一帧都拒绝
+    var encoderFacts = ""
 
     var sampled: Bool { sampledAt != nil }
 }
@@ -392,6 +399,21 @@ enum ScreenShareRuntime {
     /// 自愈动作的流水账。共享链路上每一次"发现不对、动手修"都记一行：
     /// 真机复验时这几行比任何状态码都直接——它告诉你哪条兜底被触发了。
     private static var _notes: [String] = []
+
+    /// 上行守护强制指定的画布。
+    ///
+    /// 背景：帧按 880x1920 推进 RTCVideoSource，采集侧计数在涨，
+    /// 而 outbound-rtp 的 framesEncoded / packetsSent 恒为 0。
+    /// 已经排除的：track.isEnabled（libwebrtc 的发送链路绑的是
+    /// `track->GetSource()`，不读 enabled 位）、sender 没有 encoding、
+    /// m-line 方向、ICE。剩下的高频嫌疑是编码器按这个尺寸每帧都被
+    /// VideoToolbox 拒绝——硬件编码器对宏块数/level 有硬门槛，
+    /// 拒绝时不报错，只让 framesEncoded 永远停在 0。
+    ///
+    /// 所以这里留一个"强制降画布"的开关：守门狗判定零产出就往下调一档，
+    /// 调了能出帧就说明是尺寸问题，调了还不出就是编码器本身建不起来。
+    /// 非 nil 时采集侧不再按源比例自己算画布。
+    private static var _forcedCanvas: (width: Int, height: Int)?
 
     /// 扩展写出过多少帧（由主 App 读到新帧时累加）。
     static var framesWritten: Int {
@@ -429,6 +451,25 @@ enum ScreenShareRuntime {
     static var nativeFrameStats: (count: Int, lastAt: Date?) {
         lock.lock(); defer { lock.unlock() }
         return (_nativeFrames, _nativeLastAt.map { Date(timeIntervalSince1970: $0) })
+    }
+
+    /// 当前被守护强制的画布。nil = 按源比例自动算。
+    static var forcedCanvas: (width: Int, height: Int)? {
+        lock.lock(); defer { lock.unlock() }
+        return _forcedCanvas
+    }
+
+    /// 强制一个画布。宽高必须已按 16 对齐（H.264 宏块是 16x16）。
+    static func forceCanvas(width: Int, height: Int) {
+        lock.lock()
+        _forcedCanvas = (width, height)
+        lock.unlock()
+    }
+
+    static func clearForcedCanvas() {
+        lock.lock()
+        _forcedCanvas = nil
+        lock.unlock()
     }
 
     static func noteFrameWritten() {
@@ -485,7 +526,8 @@ enum ScreenShareRuntime {
         availableOutgoingBps: Int = 0,
         rttMs: Int = 0,
         localCandidate: String = "",
-        remoteCandidate: String = ""
+        remoteCandidate: String = "",
+        encoderFacts: String = ""
     ) {
         lock.lock()
         _video.packetsSent = packetsSent
@@ -502,12 +544,14 @@ enum ScreenShareRuntime {
         _video.rttMs = rttMs
         _video.localCandidate = localCandidate
         _video.remoteCandidate = remoteCandidate
+        _video.encoderFacts = encoderFacts
         _video.sampledAt = Date()
         lock.unlock()
     }
 
     static func reset() {
         lock.lock()
+        _forcedCanvas = nil
         _framesWritten = 0
         _framesPushed = 0
         _lastPushAt = nil

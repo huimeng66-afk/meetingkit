@@ -290,6 +290,12 @@ final class MeetingViewModel: ObservableObject {
                     Double(video.cameraBitrateBps) / 1_000_000
                 )
             }
+            /* 编码器现场。0 帧时这一行直接决定下一步查哪里：
+                 impl 空 → 编码器没建；key=0 且 0x0 → 帧没进编码器；
+                 key=0 但尺寸正常 → 每一帧都被硬件编码器拒绝。 */
+            if !video.encoderFacts.isEmpty {
+                videoLine += " · 编码器 " + video.encoderFacts
+            }
             if let sampledAt = video.sampledAt {
                 videoLine += String(format: " · 采样 %.1f 秒前", Date().timeIntervalSince(sampledAt))
             }

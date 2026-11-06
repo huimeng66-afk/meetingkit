@@ -100,6 +100,8 @@ final class PeerSession: NSObject {
     /// 这条路只有在 m-line 本身不可发时才会出现，replaceTrack 救不回来。
     private var screenSender: RTCRtpSender?
     private var screenTransceiver: RTCRtpTransceiver?
+    /// 共享 sender 是否已被判定为"不可救"（见 ensureScreenSender 的调用方）。
+    private var screenSenderDead = false
     /// 当前共享 m-line 上挂的轨道 id。同一条轨重复 attach 时不重复开 m-line。
     private var screenTrackId: String?
 
@@ -263,11 +265,16 @@ final class PeerSession: NSObject {
         if screenSender != nil, screenTrackId == track.trackId {
             return
         }
-        /* 真有 sender 但 trackId 变了：M140 的 Swift 侧看不到 replaceTrack
-           （只有 ObjC 头文件里有），这里**绝不 add**。多一条 m-line 的代价
-           远大于黑屏：判定会错、共享会被判成"未进SDP"、每次共享再补协商。
-           正常路径下 track 只在入会时建一次，这个分支不会走到。 */
+        /* 真有 sender 但 trackId 变了：**绝不 add**（多一条 m-line 的代价
+           远大于黑屏：判定会错、共享会被判成"未进SDP"、每次共享再补协商）。
+           但也不能什么都不做 —— 那样 sender 上留着的是上一次的旧轨，
+           帧推到新轨上永远没人消费，现场就是"采集在出帧、编码 0 帧、
+           sender 明明还在"。M140 的 `RTCRtpSender.track` 是可写属性，
+           等价于 ObjC 的 replaceTrack：换轨不产生任何协商。 */
         if screenSender != nil, screenTrackId != nil {
+            screenSender?.track = track
+            screenTrackId = track.trackId
+            localScreen = track
             return
         }
         guard let newSender = peerConnection.add(track, streamIds: ["screen-\(peerID)"]) else {
@@ -277,6 +284,7 @@ final class PeerSession: NSObject {
         screenTransceiver = peerConnection.transceivers.first { $0.sender.senderId == newSender.senderId }
         _ = screenTransceiver?.setDirection(.sendOnly, error: nil)
         screenTrackId = track.trackId
+        screenSenderDead = false
     }
 
     /// 诊断用：当前挂着几条上行音频、轨道是什么状态。

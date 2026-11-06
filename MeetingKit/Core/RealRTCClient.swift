@@ -225,6 +225,18 @@ final class RealRTCClient: NSObject, RTCClient {
     private var videoUplinkMonitor: DispatchSourceTimer?
     /// 连续多少次采样"在出帧但编码 0"。
     private var zeroEncodeStreak = 0
+
+    /// 编码器零产出时依次降到的画布。
+    ///
+    /// 只降不升：一旦某一档确认能出帧，就守在那一档。
+    /// 来回升降会让编码器反复重建，画面反而一直黑。
+    private static let screenCanvasLadder: [(width: Int, height: Int)] = [
+        (432, 960),   // 880x1920 的等比一半，16 对齐
+        (640, 360),   // 标清横屏：H.264 硬件编码器的最低公共档
+        (320, 240),   // 兜底：只用来裁决"编码器究竟能不能工作"
+    ]
+    /// 已经降到第几档。等于 ladder.count 表示降无可降。
+    private var screenCanvasStage = 0
     /// 本轮共享是否已经做过"轨脉冲"（关 0.2 秒再开）。
     /// 编码器如果因为错过关键帧/首帧尺寸变更卡死，脉冲能逼它重建输入；
     /// 一轮只做一次，避免正常链路上出现无谓的闪断。
@@ -916,6 +928,8 @@ final class RealRTCClient: NSObject, RTCClient {
         zeroEncodeStreak = 0
         screenTrackPulsed = false
         guardReviveCount = 0
+        screenCanvasStage = 0
+        ScreenShareRuntime.clearForcedCanvas()
 
         for peer in remotePeers.values {
             peer.session.attachScreenTrack(track)
@@ -985,6 +999,8 @@ final class RealRTCClient: NSObject, RTCClient {
                 var allVideoBytes = 0
                 var matchedScreen = false
                 var perStream: [String] = []
+                /// 共享这条 send stream 的编码器现场，见 ScreenVideoStats.encoderFacts。
+                var peerEncoderFacts = ""
 
                 /* 候选对与候选类型。这一组是"糊"的另一半答案：
                    `relay` 表示流量走 TURN，带宽和延迟都由中继服务器决定，
@@ -1071,6 +1087,12 @@ final class RealRTCClient: NSObject, RTCClient {
                     peerPackets += packets
                     peerEncoded += encoded
                     peerBytes += bytes
+                    /* 这三个数决定"0 帧"到底断在哪一环：
+                         impl 空       → 编码器没建（sender/source 没接上）
+                         key=0 尺寸 0  → 帧没进编码器（source 侧就丢了）
+                         key=0 尺寸正常→ 每帧都被硬件编码器拒绝 */
+                    peerEncoderFacts = "impl=\(impl.isEmpty ? "无" : impl)"
+                        + " key=\(keys) sent=\(fSent) \(fw)x\(fh) 重传=\(retrans)"
                     /* 编码器自己的目标码率，以及 WebRTC 判定的受限原因。
                        `qualityLimitationReason` 只有四个值：
                          none       — 没受限，糊就是画布/缩放/内容本身的问题
@@ -1082,6 +1104,16 @@ final class RealRTCClient: NSObject, RTCClient {
                     let reason = (stat.values["qualityLimitationReason"] as? String) ?? ""
                     if !reason.isEmpty, reason != "none" { peerQuality = reason }
                     else if peerQuality.isEmpty { peerQuality = reason }
+
+                    /* 编码器现场先取出来，等确认是共享这条再落账 ——
+                       放在判断之前会被摄像头那条覆盖，而摄像头恰好是
+                       "能出包"的那条，会把真正的故障掩盖掉。 */
+                    let impl = (stat.values["encoderImplementation"] as? String) ?? ""
+                    let keys = (stat.values["keyFramesEncoded"] as? NSNumber)?.intValue ?? 0
+                    let fSent = (stat.values["framesSent"] as? NSNumber)?.intValue ?? 0
+                    let fw = (stat.values["frameWidth"] as? NSNumber)?.intValue ?? 0
+                    let fh = (stat.values["frameHeight"] as? NSNumber)?.intValue ?? 0
+                    let retrans = (stat.values["retransmittedPacketsSent"] as? NSNumber)?.intValue ?? 0
                 }
                 /* 一条都没匹配上共享轨：说明统计里没有 trackIdentifier，
                    或者共享这条根本没建 send stream。前者按全部视频兜底，
@@ -1105,7 +1137,8 @@ final class RealRTCClient: NSObject, RTCClient {
                     availableBps: pairAvailable,
                     rttMs: pairRttMs,
                     localCandidate: pairLocal,
-                    remoteCandidate: pairRemote
+                    remoteCandidate: pairRemote,
+                    encoderFacts: peerEncoderFacts
                 )
                 group.leave()
             }
@@ -1146,7 +1179,8 @@ final class RealRTCClient: NSObject, RTCClient {
                 availableOutgoingBps: snapshot.availableBps,
                 rttMs: snapshot.rttMs,
                 localCandidate: snapshot.localCandidate,
-                remoteCandidate: snapshot.remoteCandidate
+                remoteCandidate: snapshot.remoteCandidate,
+                encoderFacts: snapshot.encoderFacts
             )
             /* 只把"要不要改本地轨"需要的那三个字段传下去。
                整个元组传进去会让签名跟着 stats 一起膨胀，
@@ -1221,27 +1255,37 @@ final class RealRTCClient: NSObject, RTCClient {
                 + "（挂轨=\(snapshot.attached ? 1 : 0) SDP上行=\(sendsUpstream ? 1 : 0)"
                 + " \(facts)）"
             )
-            if !screenTrackPulsed {
-                screenTrackPulsed = true
-                if !ready {
-                    /* mid 为空 / 没有 encoding 槽位：这不是编码器的问题，
-                       是这条 m-line 根本没有传输通道。补一次 offer，
-                       让 WebRTC 真正为它建 VideoSendStream。 */
-                    for peer in remotePeers.values {
-                        peer.session.renegotiateForScreen()
-                    }
-                    ScreenShareRuntime.note("上行守护：共享 m-line 无传输通道，已补一次协商")
-                } else {
-                    /* 编码器一旦错过首帧（尺寸刚变、关键帧请求丢了），会一直不产帧，
-                       而轨、sender、SDP 全都正常。关 0.25 秒再开，等于给编码器一次
-                       "重新开始"的信号，同时强制它请求关键帧。一轮只做一次。 */
-                    track.isEnabled = false
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                        guard let self, self.isScreenSharing else { return }
-                        self.localScreenTrack?.isEnabled = true
-                        ScreenShareRuntime.note("上行守护：编码器 0 帧，已做一次轨脉冲（关 0.25s 再开）")
-                    }
+            if !ready {
+                /* mid 为空 / 没有 encoding 槽位：这不是编码器的问题，
+                   是这条 m-line 根本没有传输通道。补一次 offer，
+                   让 WebRTC 真正为它建 VideoSendStream。 */
+                for peer in remotePeers.values {
+                    peer.session.renegotiateForScreen()
                 }
+                ScreenShareRuntime.note("上行守护：共享 m-line 无传输通道，已补一次协商")
+            } else if screenCanvasStage < Self.screenCanvasLadder.count {
+                /* 编码器建了、encoding 槽位在、m-line 可发，帧却一帧没编。
+                   libwebrtc 的发送链路绑的是 `track->GetSource()`，
+                   **根本不读 track.isEnabled** —— 所以 1.8.0~1.8.6
+                   反复做的"关 0.25 秒再开"的轨脉冲对 framesEncoded
+                   没有任何作用，纯属安慰剂。
+                   剩下最可能的解释是硬件编码器按这个画布逐帧拒绝：
+                   宏块数 / level 超过 VideoToolbox 的门槛时它不报错，
+                   只让 framesEncoded 永远停在 0。
+                   所以改成**降画布**：一档一档往下走，能出帧就说明是尺寸问题，
+                   降到底还不出就说明编码器本身没建起来。 */
+                let step = Self.screenCanvasLadder[screenCanvasStage]
+                screenCanvasStage += 1
+                /* 只写"想要多大"，真正的 adaptOutputFormat 交给采集队列去调。
+                   这里在主线程直接调会撞上 didCapture 里的同一次调用，
+                   RTCVideoSource 内部重建 adapter 时会崩在
+                   AdaptedVideoTrackSource::OnFrame（1.5.x 踩过）。
+                   sharer 在每一帧（含静止保活重推）前会检查这个值，
+                   最迟 50ms 就生效。 */
+                ScreenShareRuntime.forceCanvas(width: step.width, height: step.height)
+                ScreenShareRuntime.note(
+                    "上行守护：编码器 0 帧，画布降到 \(step.width)x\(step.height) 重建编码器"
+                )
             }
             zeroEncodeStreak = 0
         }
@@ -1411,6 +1455,10 @@ final class RealRTCClient: NSObject, RTCClient {
             peer.session.detachScreenTrack()
         }
         localScreenTrack?.isEnabled = false
+        /* 复位降级阶梯：下一轮共享从原始画布重新开始，
+           万一这次只是偶发的编码器抽风，不该永远卡在 320x240。 */
+        screenCanvasStage = 0
+        ScreenShareRuntime.clearForcedCanvas()
         applyCameraEncodingBudget()
         /* 广播结束同样会切一次路由：不抢回来，用户会遇到
            "共享停了以后反而听不见人说话"。 */
@@ -1433,6 +1481,8 @@ final class RealRTCClient: NSObject, RTCClient {
             peer.session.detachScreenTrack()
         }
         localScreenTrack?.isEnabled = false
+        screenCanvasStage = 0
+        ScreenShareRuntime.clearForcedCanvas()
         applyCameraEncodingBudget()
         signaling?.sendMediaState(audio: nil, video: nil, screen: false)
         delegate?.rtcDidScreenShareRejected(reason: reason)
@@ -3005,6 +3055,8 @@ private final class VideoUplinkTotals: @unchecked Sendable {
     private var rttMs = 0
     private var localCandidate = ""
     private var remoteCandidate = ""
+    /// 共享 sender 的编码器现场（impl / key / sent / 帧尺寸 / 重传）。
+    private var encoderFacts = ""
     /* 每条 video send stream 的原始账本。
        聚合数字会把"共享 0 包 / 摄像头 5 万包"抹成"上行正常"，
        1.7.8 已经因此误判过一次。这里保留逐条明细，诊断里直接贴出来。 */
@@ -3034,9 +3086,11 @@ private final class VideoUplinkTotals: @unchecked Sendable {
         availableBps: Int,
         rttMs: Int,
         localCandidate: String,
-        remoteCandidate: String
+        remoteCandidate: String,
+        encoderFacts: String
     ) {
         lock.lock()
+        if !encoderFacts.isEmpty { self.encoderFacts = encoderFacts }
         self.targetBps = max(self.targetBps, targetBps)
         self.availableBps = max(self.availableBps, availableBps)
         if !qualityReason.isEmpty, qualityReason != "none" {
@@ -3076,6 +3130,7 @@ private final class VideoUplinkTotals: @unchecked Sendable {
         rttMs: Int,
         localCandidate: String,
         remoteCandidate: String,
+        encoderFacts: String,
         streams: [String]
     ) {
         lock.lock()
@@ -3083,7 +3138,7 @@ private final class VideoUplinkTotals: @unchecked Sendable {
         return (
             packets, encoded, screenBytes, cameraBytes, attached,
             targetBps, qualityReason, availableBps, rttMs, localCandidate, remoteCandidate,
-            streams
+            encoderFacts, streams
         )
     }
 }
