@@ -141,6 +141,16 @@ final class RealRTCClient: NSObject, RTCClient {
         return first.session.screenH264Level
     }
 
+    /// 逐条 video send stream 的原始账本，进诊断回传。
+    ///
+    /// 形如 `mid=1|pkt=1200|enc=300|tgt=250k|q=bandwidth ·
+    /// mid=2|pkt=0|enc=0|tgt=2735k|q=bandwidth`。
+    /// 聚合层只给一组数字，答不了"是共享这条断了，还是整条连接都断了"——
+    /// 1.8.3 那次"0 包 0 帧"就是靠这个才看清摄像头也一起归零。
+    var screenUplinkStreamDump: String {
+        lastUplinkStreams.joined(separator: " · ")
+    }
+
     private var videoCapturer: RTCCameraVideoCapturer?
     /// 摄像头是否正在采集。与 `localVideoTrack.isEnabled` 分开：
     /// 轨可以一直是开的，但采集停了（关摄像头时 stopCapture 会熄灯）。
@@ -209,6 +219,8 @@ final class RealRTCClient: NSObject, RTCClient {
     private var lastNativeFrameSeen = 0
     /// 用户最后一次主动停共享的时刻。停之后 3 秒内的在途帧不再拉起链路。
     private var lastScreenShareStopAt = Date.distantPast
+    /// 本轮共享的启动时刻。用来识别"上一轮滞后的停止事件"。
+    private var lastScreenShareStartAt = Date.distantPast
     /// 视频统计采样器（共享期间每 2 秒一次）。
     private var videoUplinkMonitor: DispatchSourceTimer?
     /// 连续多少次采样"在出帧但编码 0"。
@@ -226,6 +238,8 @@ final class RealRTCClient: NSObject, RTCClient {
     private var lastScreenBytes = 0
     private var lastCameraBytes = 0
     private var lastBitrateSampleAt: Date?
+    /// 最近一次采样的逐条 send stream 明细，只给诊断用。
+    private var lastUplinkStreams: [String] = []
 
     /// 上行音频看门狗（peerID → 待执行的探测）。
     private var outboundAudioWatchdogs: [String: DispatchWorkItem] = [:]
@@ -844,6 +858,7 @@ final class RealRTCClient: NSObject, RTCClient {
         guard screenPusher == nil else { return }
 
         isScreenSharing = true
+        lastScreenShareStartAt = Date()
 
         let profile = Self.screenEncodingProfile
         // 帧新鲜度下界：早于本次会话请求时刻的 JPEG 属于上一场，不推。
@@ -865,6 +880,7 @@ final class RealRTCClient: NSObject, RTCClient {
         lastScreenBytes = 0
         lastCameraBytes = 0
         lastBitrateSampleAt = nil
+        lastUplinkStreams = []
 
         pusher.start()
         /* ReplayKit 真正起播会晚于这里 200~800ms，并重配一次音频会话。
@@ -895,6 +911,7 @@ final class RealRTCClient: NSObject, RTCClient {
            "offer 发出去没人答、sender 挂着轨但编码器 0 帧"的僵局。 */
         isScreenSharing = true
         track.isEnabled = true
+        lastScreenShareStartAt = Date()
         lastScreenShareStopAt = .distantPast
         zeroEncodeStreak = 0
         screenTrackPulsed = false
@@ -908,6 +925,7 @@ final class RealRTCClient: NSObject, RTCClient {
         lastScreenBytes = 0
         lastCameraBytes = 0
         lastBitrateSampleAt = nil
+        lastUplinkStreams = []
 
         /* 系统共享同样会切一次音频路由（ReplayKit / SCK 都会把
            AVAudioSession 的 mode 拨到录制侧）。不抢回来，
@@ -966,6 +984,7 @@ final class RealRTCClient: NSObject, RTCClient {
                 var allVideoEncoded = 0
                 var allVideoBytes = 0
                 var matchedScreen = false
+                var perStream: [String] = []
 
                 /* 候选对与候选类型。这一组是"糊"的另一半答案：
                    `relay` 表示流量走 TURN，带宽和延迟都由中继服务器决定，
@@ -1007,6 +1026,16 @@ final class RealRTCClient: NSObject, RTCClient {
                     let packets = (stat.values["packetsSent"] as? NSNumber)?.intValue ?? 0
                     let encoded = (stat.values["framesEncoded"] as? NSNumber)?.intValue ?? 0
                     let bytes = (stat.values["bytesSent"] as? NSNumber)?.intValue ?? 0
+                    /* 逐条明细先记账，再谈聚合。摄像头那条同时入账——
+                       "共享 0 包、摄像头也在 0 包"说明是 Call 级配置被写坏，
+                       "只有共享 0 包"才是共享这条自己的问题。 */
+                    let streamMid = (stat.values["mid"] as? String) ?? "-"
+                    let streamTarget = (stat.values["targetBitrate"] as? NSNumber)?.intValue ?? 0
+                    let streamReason = (stat.values["qualityLimitationReason"] as? String) ?? "-"
+                    perStream.append(
+                        "mid=\(streamMid)|pkt=\(packets)|enc=\(encoded)"
+                            + "|tgt=\(streamTarget / 1000)k|q=\(streamReason)"
+                    )
                     allVideoPackets += packets
                     allVideoEncoded += encoded
                     allVideoBytes += bytes
@@ -1069,6 +1098,7 @@ final class RealRTCClient: NSObject, RTCClient {
                 }
                 totals.merge(packets: peerPackets, encoded: peerEncoded)
                 totals.merge(bytes: peerBytes, camera: cameraBytes)
+                totals.merge(streams: perStream)
                 totals.merge(
                     targetBps: peerTarget,
                     qualityReason: peerQuality,
@@ -1100,6 +1130,7 @@ final class RealRTCClient: NSObject, RTCClient {
             self.lastScreenBytes = snapshot.screenBytes
             self.lastCameraBytes = snapshot.cameraBytes
             self.lastBitrateSampleAt = now
+            self.lastUplinkStreams = snapshot.streams
 
             ScreenShareRuntime.noteVideoStats(
                 packetsSent: snapshot.packets,
@@ -1303,25 +1334,20 @@ final class RealRTCClient: NSObject, RTCClient {
             peers: remotePeers.count
         )
         for peer in remotePeers.values {
-            /* 三层保险，任何一层生效都能把画面从"冻住"拉回"能动"：
-               1. SDP 的 x-google-start-bitrate —— 协商时被 libwebrtc 读走；
-               2. seedBandwidthEstimate —— 连接已建好、SDP 不重写时的运行期入口；
-               3. minBitrateBps —— 编码器自己的产出下限，保证链路退得出
-                  ALR（应用受限区），不再出现"发得少→不探测→涨不上去"。 */
+            /* 只做 LiveKit 做的那两件事：单轨码率上限 + maintainResolution。
+               起始码率由 SDP 的 `x-google-start-bitrate` 负责（协商时生效）。
+
+               1.8.3 在这里多做了两件 LiveKit 没做的事，两件都撤了：
+                 · seedBandwidthEstimate —— Call 级预算被写成 0，
+                   整条连接（含摄像头）0 包 0 帧，浏览器彻底黑屏；
+                 · minBitrateBps —— 编码器下限，未经验证，
+                   而且 SDP 起始码率一旦生效它就没有存在意义。 */
             peer.session.setVideoEncoding(
                 maxBitrateBps: perPeer,
                 maxFramerate: Int(profile.fps),
-                // 目标的 15%：4Mbps 档 → 600kbps。低于这个数，编码器会
-                // 为了守住码率把九成的帧直接丢掉（现场就是 321 帧进、32 帧出）。
-                minBitrateBps: max(300_000, perPeer * 3 / 20),
                 keepResolution: true,
                 forScreen: true
             )
-            /* SDP 里的 `x-google-start-bitrate` 只在协商那一刻被读走。
-               共享发生在连接已经建好之后时 SDP 不会重写，这条路径补上：
-               直接告诉带宽估计器"从 90% 的目标码率起步"。
-               只传 current，不传 max —— 见 PeerSession.seedBandwidthEstimate。 */
-            peer.session.seedBandwidthEstimate(currentBps: Int(Double(perPeer) * 0.9))
         }
     }
 
@@ -2963,6 +2989,10 @@ private final class VideoUplinkTotals: @unchecked Sendable {
     private var rttMs = 0
     private var localCandidate = ""
     private var remoteCandidate = ""
+    /* 每条 video send stream 的原始账本。
+       聚合数字会把"共享 0 包 / 摄像头 5 万包"抹成"上行正常"，
+       1.7.8 已经因此误判过一次。这里保留逐条明细，诊断里直接贴出来。 */
+    private var streams: [String] = []
 
     func merge(packets: Int, encoded: Int) {
         lock.lock()
@@ -3010,6 +3040,14 @@ private final class VideoUplinkTotals: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// 逐条 send stream 的明细，形如 `mid=2|pkt=0|enc=0|tgt=2735|q=bandwidth`。
+    func merge(streams: [String]) {
+        guard !streams.isEmpty else { return }
+        lock.lock()
+        self.streams = streams
+        lock.unlock()
+    }
+
     func snapshot() -> (
         packets: Int,
         encoded: Int,
@@ -3021,13 +3059,15 @@ private final class VideoUplinkTotals: @unchecked Sendable {
         availableBps: Int,
         rttMs: Int,
         localCandidate: String,
-        remoteCandidate: String
+        remoteCandidate: String,
+        streams: [String]
     ) {
         lock.lock()
         defer { lock.unlock() }
         return (
             packets, encoded, screenBytes, cameraBytes, attached,
-            targetBps, qualityReason, availableBps, rttMs, localCandidate, remoteCandidate
+            targetBps, qualityReason, availableBps, rttMs, localCandidate, remoteCandidate,
+            streams
         )
     }
 }

@@ -369,38 +369,41 @@ final class PeerSession: NSObject {
         SDPCodecFilter.h264Level(in: peerConnection.localDescription?.sdp)
     }
 
-    /// 直接给带宽估计器一个"起步价"。
-    ///
-    /// libwebrtc 的 GCC 固定从 300kbps 起步，并且有一条 ALR（应用受限）判定：
-    /// 实际发送速率低于估计值 60% 持续一秒，就认为"你没东西要发"，**停止发探测包**。
-    /// 于是形成死锁：码率低 → 不探测 → 估计值不涨 → 码率更低。
-    ///
-    /// 这是 SDP 里 `x-google-start-bitrate` 的补充路径：那个只在协商时生效，
-    /// 而共享往往发生在连接已经建好之后，那时 SDP 不会重写。两条路径覆盖
-    /// "先共享后入会"和"先入会后共享"两种时序。
-    ///
-    /// **只传 current，`max_bitrate_bps` 必须留空。** libwebrtc 会把这三个值
-    /// 提升成整条连接的 `RtpBitrateConfigurator` 配置，写 max 等于给整条连接
-    /// 设天花板，并发的摄像头轨会被饿死——LiveKit 在
-    /// `Transport.mungeVideoStartBitrate` 的注释里专门警告过这一点。
-    ///
-    /// 用 IMP 调用而不是直接写方法名：这个选择器不在 Swift 伞头文件里，
-    /// 直接调用编译不过。`responds(to:)` 先探一次，老版本 SDK 上不会崩。
-    func seedBandwidthEstimate(currentBps: Int) {
-        guard currentBps > 0 else { return }
-        let selector = NSSelectorFromString("setBweMinBitrateBps:currentBitrateBps:maxBitrateBps:")
-        guard peerConnection.responds(to: selector) else { return }
-        typealias SeedFn = @convention(c) (AnyObject, Selector, NSNumber?, NSNumber?, NSNumber?) -> Void
-        let implementation = peerConnection.method(for: selector)
-        let call = unsafeBitCast(implementation, to: SeedFn.self)
-        call(peerConnection, selector, nil, NSNumber(value: currentBps), nil)
-    }
+    /* 这里曾经有一个 seedBandwidthEstimate，用 IMP 调
+       `setBweMinBitrateBps:currentBitrateBps:maxBitrateBps:` 把带宽估计器的
+       起点抬到目标的 90%。
+
+       **它必须被删掉，因为它是 1.8.3"浏览器彻底没画面"的直接原因。**
+       这个选择器进的不是"这条轨"的配置，而是
+       `PeerConnectionInterface::SetBitrate(BitrateSettings)`——
+       `RtpBitrateConfigurator` **每条连接只有一份**。传进去的
+       `max_bitrate_bps = nil` 被包装层当成 0 落到底层，于是整条连接的
+       可用带宽上限变成 0：pacer 不给配额 → 编码器目标码率归零 →
+       libwebrtc 的帧丢弃器（FrameDropper）把每一帧都丢掉。
+
+       现场数据完全对上：
+         · 共享出帧 216、编码 0 帧、发送 0 包
+         · **摄像头同样 0 字节**（摄像头是被连累的，这最能说明是 Call 级配置）
+         · `可用上行 3.6Mbps` = 我们塞进去的 0.9×4Mbps，一分不差，
+           说明估计器被钉在了种子值上，而配额是 0
+         · 受限 带宽不足（不是 cpu，也不是 none）
+
+       LiveKit 从来不用这个接口，它只往 SDP 写 `x-google-start-bitrate`。
+       现在我们也只用那一条路：见 SDPCodecFilter.injectStartBitrate
+       与 applyLocalDescriptionAndSignal 里的兜底码率。 */
 
     /// 共享那条 track 的目标码率（bps）。没协商出 encodings 时返回 0。
     var screenTargetBps: Int {
         (screenSender?.parameters.encodings ?? [])
             .compactMap { $0.maxBitrateBps?.intValue }
             .reduce(0, +)
+    }
+
+    /// 首轮协商时用来算 `x-google-start-bitrate` 的兜底码率。
+    /// 取当前共享画质档位的目标码率——与真正的 encodings 上限同源，
+    /// 不会出现"起始码率比单轨上限还高"的组合。
+    private static var fallbackVideoBitrateBps: Int {
+        RealRTCClient.screenEncodingProfile.bitrate
     }
 
     var screenLinkDebug: String {
@@ -516,18 +519,57 @@ final class PeerSession: NSObject {
         return inVideo && hasScreenMSID && allows
     }
 
-    /// 远端 SDP 里视频 m-line 是否允许本端发送。
+    /// 远端 SDP 里**共享那条** video m-line 是否允许本端发送。
     /// 远端写 recvonly / sendrecv = 它能收；inactive / sendonly = 它不收。
-    /// 取**最后一条** video m-line：共享 m-line 永远是最新加的那条。
+    ///
+    /// 1.8.3 及以前取的是"最后一条 video m-line"。我们本地有 3 条 video
+    /// （摄像头 / 共享 / 收对方画面），远端 answer 里排在最后的往往正是
+    /// "对方发给我"的那条，它的方向天生不是 recvonly——于是这个判断
+    /// **永远显示"远端可收"**，哪怕共享那条被答成 inactive。
+    /// 1.8.3 现场就是"远端可收 + 0 包 0 帧"这种自相矛盾的组合。
+    /// 现在按 msid 定位共享那一段再判方向；找不到 msid 时才退回旧逻辑。
     private static func videoDirectionAllowsReceive(_ sdp: String?) -> Bool {
         guard let sdp, !sdp.isEmpty else { return false }
-        var result = false
         var inVideo = false
+        var hasScreenMSID = false
+        var allows = false
+        var foundScreen = false
         for raw in sdp.split(whereSeparator: { $0.isNewline }) {
             let line = String(raw)
-            if line.hasPrefix("m=video") { inVideo = true; continue }
-            if line.hasPrefix("m=") { inVideo = false; continue }
+            if line.hasPrefix("m=") {
+                if inVideo, hasScreenMSID {
+                    foundScreen = true
+                    if allows { return true }
+                }
+                inVideo = line.hasPrefix("m=video")
+                hasScreenMSID = false
+                allows = false
+                continue
+            }
             guard inVideo else { continue }
+            if line.hasPrefix("a=msid:screen-") {
+                hasScreenMSID = true
+            } else if line.hasPrefix("a=recvonly") || line.hasPrefix("a=sendrecv") {
+                allows = true
+            } else if line.hasPrefix("a=inactive") || line.hasPrefix("a=sendonly") {
+                allows = false
+            }
+        }
+        if inVideo, hasScreenMSID {
+            foundScreen = true
+            if allows { return true }
+        }
+        /* 找到了共享那条且它不收 —— 结论就是"不收"，不要拿别的 m-line 洗白。 */
+        if foundScreen { return false }
+
+        /* 远端没回 msid（个别网关会剥掉）：退回"最后一条 video"的老判定。 */
+        var result = false
+        var scanning = false
+        for raw in sdp.split(whereSeparator: { $0.isNewline }) {
+            let line = String(raw)
+            if line.hasPrefix("m=video") { scanning = true; continue }
+            if line.hasPrefix("m=") { scanning = false; continue }
+            guard scanning else { continue }
             if line.hasPrefix("a=recvonly") || line.hasPrefix("a=sendrecv") {
                 result = true
             } else if line.hasPrefix("a=inactive") || line.hasPrefix("a=sendonly") {
@@ -680,7 +722,9 @@ final class PeerSession: NSObject {
     /// 调整上行视频编码参数。屏幕共享是"文字优先"，需要比摄像头更高的码率上限，
     /// 否则 1080p 画面会被 WebRTC 按摄像头模型压到 1~2Mbps，文字边缘发糊。
     ///
-    /// `minBitrateBps` 是 1.8.1 加的"启动助推"：见 applyScreenEncodingBudget 的说明。
+    /// `minBitrateBps` 目前**没有调用方**。1.8.3 拿它当"启动助推"，
+    /// 但真正起作用的是 SDP 里的 `x-google-start-bitrate`（LiveKit 的做法），
+    /// 参数留着只为接口完整，不要靠它兜底。
     ///
     /// `forScreen` 必须显式指定：摄像头和共享是两条独立的 send stream，
     /// 共用一条 sender 引用会让"停止共享后把 8Mbps 配到摄像头"或反过来。
@@ -1091,10 +1135,14 @@ final class PeerSession: NSObject {
                不是"糊"而是编码器直接丢帧，浏览器看到的就是冻住。
                LiveKit 四端（swift / js / rust / android）都用这一招：
                取目标码率的 90% 写进 `x-google-start-bitrate`。
-               这里只在共享 sender 已经有码率上限时写——首轮协商时它还不存在，
-               那条路径由 RealRTCClient.applyScreenEncodingBudget 里的
-               seedBandwidthEstimate 兜。 */
-            let targetBps = screenTargetBps
+
+               **兜底值是关键。** 我们的共享 m-line 是入会首轮就预建的，
+               那时 `applyScreenEncodingBudget` 还没跑，sender 上没有
+               maxBitrateBps（读回 0）。如果只在"有上限"时才写，
+               入会那次协商就永远拿不到起始码率——而这正是唯一一次
+               会被 libwebrtc 读走的协商（共享开始时 m-line 已经在了，
+               不会重新协商）。所以这里退回配置档位的码率。 */
+            let targetBps = max(screenTargetBps, Self.fallbackVideoBitrateBps)
             if targetBps > 0 {
                 let kbps = Int((Double(targetBps) / 1000.0 * 0.9).rounded())
                 filtered = SDPCodecFilter.injectStartBitrate(filtered, kbps: kbps)

@@ -389,6 +389,10 @@ final class MeetingViewModel: ObservableObject {
         if let client = rtc as? RealRTCClient {
             stats["mLines"] = client.screenSdpOverview
             stats["h264Level"] = client.screenH264Level
+            /* 逐条 send stream 明细：mid / 包 / 编码帧 / 目标码率 / 受限原因。
+               聚合指标看不出"是共享这条断了还是整条连接断了"，这一项可以。 */
+            let dump = client.screenUplinkStreamDump
+            if !dump.isEmpty { stats["streams"] = dump }
         }
         DiagReporter.shared.report(
             room: meetingNumber,
