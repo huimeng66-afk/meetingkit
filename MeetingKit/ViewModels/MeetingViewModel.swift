@@ -1465,11 +1465,21 @@ extension MeetingViewModel: RTCClientDelegate {
         }
         // 切到共享展示时收起面板，保证画面完整。
         activePanel = nil
-        // 有人开始共享时把控件收起来：共享内容是全场焦点，
-        // 顶栏/底栏会直接压住 PPT 的第一行标题（与网页端观感一致）。
-        // 只在"刚切到共享"时收，避免观看者手动展开后又被每次快照推回隐藏。
-        if isNewSharer {
-            isChromeVisible = false
+        /* 这里**不再**收起顶栏/底栏。
+           以前"一进共享就自动藏控件"，用户想调音量、想静音、想离开，
+           第一反应是点屏幕，结果只是把控件唤回来，还得再点一次——
+           远程演示的场景里这是最容易被骂的交互。
+           控件是否自动隐藏交给设置项（默认关，见 AppSettings.Defaults）。 */
+    }
+
+    /// 远端停止共享：把舞台收回宫格，并把之前可能被收起的控件重新展开。
+    func rtcDidStopRemoteScreen(for userID: String) {
+        remoteScreenViews.removeValue(forKey: userID)
+        if remoteScreenPeerID == userID {
+            clearRemoteShareState()
+        }
+        if !isChromeVisible {
+            isChromeVisible = true
         }
     }
 

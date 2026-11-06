@@ -2617,7 +2617,8 @@ extension RealRTCClient: TianqiongSignalingDelegate {
             if screen {
                 delegate?.rtcDidReceiveRemoteScreen(peer.session.makeRemoteVideoView(), for: peerID)
             } else {
-                delegate?.rtcDidReceiveRemoteVideo(peer.session.makeRemoteVideoView(), for: peerID)
+                // 停止共享必须走专门的出口，不能复用摄像头轨的回调
+                delegate?.rtcDidStopRemoteScreen(for: peerID)
             }
         }
         publishParticipants()
@@ -2659,7 +2660,7 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         if on {
             delegate?.rtcDidReceiveRemoteScreen(view, for: peerID)
         } else {
-            delegate?.rtcDidReceiveRemoteVideo(view, for: peerID)
+            delegate?.rtcDidStopRemoteScreen(for: peerID)
         }
         publishParticipants()
     }

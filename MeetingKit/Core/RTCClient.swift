@@ -136,6 +136,13 @@ protocol RTCClientDelegate: AnyObject {
     /// 远端屏幕共享渲染视图可用。
     func rtcDidReceiveRemoteScreen(_ view: UIView, for userID: String)
 
+    /// 远端停止共享（服务端 screen:state on=false）。
+    ///
+    /// 必须和 `rtcDidReceiveRemoteVideo` 分开：共享期间对端的摄像头轨
+    /// 仍然会出帧，那条回调会被反复触发，所以它里面刻意不清共享态。
+    /// 以前停止共享也走那条路，结果就是共享者停了、观看端永远定格在最后一帧。
+    func rtcDidStopRemoteScreen(for userID: String)
+
     /// 远端媒体视图失效（对方离开 / 关闭摄像头 / 停止共享 / 断线）。
     /// 视频与共享共用此回调，UI 按 userID 清掉对应视图。
     func rtcDidLoseRemoteMedia(for userID: String)
@@ -332,4 +339,6 @@ extension RTCClientDelegate {
 
     /// 默认空实现：没有共享界面的调用方不需要响应。
     func rtcDidRestoreScreenShare() {}
+
+    func rtcDidStopRemoteScreen(for userID: String) {}
 }

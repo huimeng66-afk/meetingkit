@@ -206,7 +206,9 @@ final class AppSettings: ObservableObject {
         /// 流畅档保留给弱网用户手动切换。
         static let shareQuality: ShareQuality = .sharp
 
-        static let autoHideControlsDuringShare = true
+        /// 默认**不**自动收起：观看共享时用户仍要随时能静音、调音量、离开。
+        /// 想要沉浸观看的人可以在设置里自己打开。
+        static let autoHideControlsDuringShare = false
 
         static let hapticsEnabled = true
     }
