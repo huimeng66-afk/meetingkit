@@ -152,13 +152,13 @@ enum ScreenCaptureKitRuntime {
         guard !didBootstrap else { return }
         didBootstrap = true
 
-        if NSClassFromString("SCContentSharingPicker") == nil {
+        if resolveClass("SCContentSharingPicker") == nil {
             for path in frameworkPaths where loadedPath == nil {
                 if dlopen(path, RTLD_NOW | RTLD_GLOBAL) != nil {
                     loadedPath = path
                 }
             }
-            if NSClassFromString("SCContentSharingPicker") == nil {
+            if resolveClass("SCContentSharingPicker") == nil {
                 for path in frameworkPaths {
                     if let bundle = Bundle(path: path), bundle.load() {
                         loadedPath = path
@@ -170,14 +170,23 @@ enum ScreenCaptureKitRuntime {
             loadedPath = "已在进程内"
         }
 
-        pickerClass = NSClassFromString("SCContentSharingPicker")
-        streamClass = NSClassFromString("SCStream")
-        configurationClass = NSClassFromString("SCStreamConfiguration")
+        pickerClass = resolveClass("SCContentSharingPicker")
+        streamClass = resolveClass("SCStream")
+        configurationClass = resolveClass("SCStreamConfiguration")
 
         if pickerClass == nil { log.append("框架未加载") }
         if pickerClass == nil { log.append("缺 SCContentSharingPicker") }
         if streamClass == nil { log.append("缺 SCStream") }
         if configurationClass == nil { log.append("缺 SCStreamConfiguration") }
+    }
+
+    /// 按名字取类。
+    ///
+    /// Swift 原生的类注册名是 `模块名.类名`，纯 `NSClassFromString("SCStream")`
+    /// 会返回 nil。SCK 目前是 ObjC 框架，但 iOS 27 是它第一次进手机，
+    /// 两种写法都试一遍，省得为一个点号再跑一轮真机。
+    private static func resolveClass(_ name: String) -> AnyClass? {
+        NSClassFromString(name) ?? NSClassFromString("ScreenCaptureKit.\(name)")
     }
 
     /// 系统提供的内容选择器单例。取不到就说明这条路不可用。
@@ -523,13 +532,22 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
             return
         }
 
-        // SCStreamOutputType.screen 的原始值是 0。
-        guard ScreenCaptureKitRuntime.addStreamOutput(
-            newStream,
-            output: self,
-            type: 0,
-            queue: sampleQueue as AnyObject
-        ) else {
+        // SCStreamOutputType 的原始值：macOS 上是 screen=0 / audio=1。
+        // iOS 27 是这个枚举第一次进手机，顺序没有公开保证，所以两种都订阅：
+        // 订阅错的那个只会收到音频（没有图像缓冲区，处理时天然被过滤），
+        // 比赌一个数字然后整场黑屏划算。
+        var subscribed = false
+        for outputType in [0, 1] {
+            if ScreenCaptureKitRuntime.addStreamOutput(
+                newStream,
+                output: self,
+                type: outputType,
+                queue: sampleQueue as AnyObject
+            ) {
+                subscribed = true
+            }
+        }
+        guard subscribed else {
             fail("无法接收屏幕帧（addStreamOutput 被拒绝）")
             return
         }
