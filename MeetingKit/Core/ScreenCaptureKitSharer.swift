@@ -585,7 +585,8 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
             guard let self, self.running, self.stream == nil, !self.didReceivePickerCallback else {
                 return
             }
-            let active = ScreenCaptureKitRuntime.isPickerActive(self.picker)
+            guard let picker = self.picker else { return }
+            let active = ScreenCaptureKitRuntime.isPickerActive(picker)
             if active == false {
                 ScreenCaptureKitRuntime.note("present 后 4 秒无回调，active 已被复位")
                 self.fail("系统内容面板没有打开")
