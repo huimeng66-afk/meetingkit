@@ -131,8 +131,13 @@ final class MeetingViewModel: ObservableObject {
     /// 而 View 的 body 与每秒一次的时钟都会读它。
     private lazy var cachedNativeShareBackend: ScreenSharingBackend = ScreenSharingSessionFactory.backend
 
+    /// SCK 起播失败后是否已经退到 in-app 捕获。
+    /// 一旦退过就不再重试 SCK：同一台设备上它不会第二次变好，
+    /// 反复重试只会让用户每次点共享都先看到一次失败。
+    private var didFallbackToInApp = false
+
     var screenSharingBackend: ScreenSharingBackend {
-        cachedNativeShareBackend
+        didFallbackToInApp ? .inApp : cachedNativeShareBackend
     }
 
     var supportsNativeScreenShare: Bool {
@@ -646,7 +651,7 @@ final class MeetingViewModel: ObservableObject {
         if let existing = nativeShareSession {
             session = existing
         } else {
-            guard let created = ScreenSharingSessionFactory.make() else {
+            guard let created = ScreenSharingSessionFactory.make(forceInApp: didFallbackToInApp) else {
                 showToast(
                     ToastMessage(
                         text: "当前系统没有可用的屏幕共享通道",
@@ -697,6 +702,26 @@ final class MeetingViewModel: ObservableObject {
             nativeShareError = message
             nativeShareStartedAt = nil
             applyScreenSharing(false, isInitial: false, source: .screenCaptureKit)
+
+            /* SCK 起播失败时自动退到 in-app 捕获。
+               这条路只能共享会议自己的画面，但总比"点了没反应"强，
+               而且文案会明确说清楚能力变了。只退一次：
+               同一台设备上 SCK 不会第二次变好。 */
+            if screenSharingBackend == .screenCaptureKit, !didFallbackToInApp {
+                didFallbackToInApp = true
+                nativeShareSession?.stop()
+                nativeShareSession = nil
+                showToast(
+                    ToastMessage(
+                        text: "系统内容共享未能启动（\(message)），已切到「仅共享会议画面」模式",
+                        systemImage: "rectangle.on.rectangle.slash",
+                        style: .warning
+                    )
+                )
+                startNativeScreenShare()
+                return
+            }
+
             showToast(
                 ToastMessage(
                     text: "屏幕共享未能开始：\(message)",

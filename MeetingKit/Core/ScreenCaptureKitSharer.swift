@@ -94,10 +94,10 @@ enum ScreenSharingSessionFactory {
         return .inApp
     }
 
-    static func make() -> ScreenSharingSession? {
+    static func make(forceInApp: Bool = false) -> ScreenSharingSession? {
         guard #available(iOS 27.0, *) else { return nil }
 
-        if ScreenCaptureKitRuntime.isUsable {
+        if !forceInApp, ScreenCaptureKitRuntime.isUsable {
             return ScreenCaptureKitSharer()
         }
         return InAppScreenCapturer()

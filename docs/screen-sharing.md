@@ -8,18 +8,25 @@
 > 真机表现：系统弹出共享卡片（"天穹会议 00:04" + 转圈），但**永远不创建扩展进程**，
 > 诊断里就是"扩展进程：本次未启动 / 心跳无 / 0 帧"。
 >
-> 现在代码里是三条路径，按系统版本与构建 SDK 自动选：
+> 现在代码里是三条路径，按系统版本自动选，**一份 IPA 覆盖 iOS 16–27**：
 >
 > | 路径 | 生效条件 | 能共享什么 | 需要 App Group |
 > |---|---|---|---|
-> | `ScreenCaptureKitSharer` | iOS 27+ 且构建机有 iOS 27 SDK | 整个屏幕 / 单个 App | 否 |
-> | `InAppScreenCapturer` | iOS 27+ 但构建机只有 Xcode 26（`macos-15` / `macos-26` 镜像都是） | 仅本 App 的画面，切走即暂停 | 否 |
+> | `ScreenCaptureKitSharer` | iOS 27+（运行时绑定，不要求构建机有 iOS 27 SDK） | 整个屏幕 / 单个 App | 否 |
+> | `InAppScreenCapturer` | iOS 27+ 且 SCK 不可用（框架加载失败、被限制，或起播报错后自动降级） | 仅本 App 的画面，切走即暂停 | 否 |
 > | 广播扩展（本文） | iOS 26 及以下 | 整个屏幕，切 App 不断 | 是 |
 >
-> 前两条实现在 `MeetingKit/Core/ScreenCaptureKitSharer.swift` 与
-> `MeetingKit/Core/InAppScreenCapturer.swift`，用 `ScreenSharingSession` 协议隔离；
-> 构建机没有 `ScreenCaptureKit` 模块时，SCK 那段整段不参与编译。
-> 下文只描述第三条。
+> 三条实现都在 `MeetingKit/Core/` 下，用 `ScreenSharingSession` 协议隔离。
+>
+> **为什么 SCK 是运行时绑定而不是 `import ScreenCaptureKit`**：
+> 构建机（GitHub Actions 的 `macos-15` / `macos-26`）最高只有 iOS 26.x SDK，
+> 里面没有这个框架。`import` 会直接编译失败，`#if canImport` 则会让整段代码
+> 不进产物，iOS 27 用户装完仍然共享不了。现在改成 `dlopen` + `NSClassFromString`
+> + `method_getImplementation` 动态调用，Xcode 26 也能编出一份在 iOS 27 上
+> 真正可用的包。代价是没有编译期检查，所以每一步解析结果都会写进
+> `ScreenCaptureKitRuntime.resolutionLog`，诊断面板直接显示断在哪一环。
+>
+> 下文只描述第三条（广播扩展）。
 
 这份文档只讲一件事——**主 App 与 Broadcast Upload Extension 之间那条链路为什么这样设计**。
 UI 部分看代码即可，但这条链路如果改错，表现是"偶发不生效"，很难查。
