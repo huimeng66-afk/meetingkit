@@ -41,6 +41,7 @@ enum ShareBreadcrumb {
 
     private static var stepURL: URL? { directoryURL?.appendingPathComponent("share-last-step.txt") }
     private static var crashURL: URL? { directoryURL?.appendingPathComponent("share-last-crash.txt") }
+    private static var crashCountURL: URL? { directoryURL?.appendingPathComponent("share-sck-crashes.txt") }
 
     // MARK: - 启动时读取
 
@@ -50,6 +51,14 @@ enum ShareBreadcrumb {
     private(set) static var lastStep: String?
     /// 上一次的异常摘要（只有 NSException 才记得到）。
     private(set) static var lastException: String?
+
+    /// SCK 连续崩溃次数，跨启动累计。
+    ///
+    /// 「下次跳过」只能挡一次：用户杀掉 App 重开，还是会再点共享、再崩。
+    /// 这里记死次数，够数就永久改用 in-app——宁可只共享会议画面，
+    /// 也不能让用户每次点共享都掉线。
+    private(set) static var sckCrashCount = 0
+    static let sckCrashLimit = 2
 
     /// 在 App 启动时调用一次。
     static func loadAtLaunch() {
@@ -62,8 +71,45 @@ enum ShareBreadcrumb {
         if let text = read(crashURL), !text.isEmpty {
             lastException = text
         }
+
+        var count = 0
+        let version = currentVersion
+        // 计数带版本号：换了新版本就重新给一次机会。
+        // 否则 1.6.6 留下的账会算在已经修好的 1.6.7 头上 ——
+        // 用户装完新版第一次点共享还是 in-app，等于白装。
+        if let stored = read(crashCountURL) {
+            let parts = stored.trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(separator: ":")
+            if parts.count == 2, String(parts[0]) == version, let value = Int(parts[1]) {
+                count = value
+            }
+        }
+        // 只有死在 SCK 链路上（sck: 前缀）才计数：广播扩展、in-app 的
+        // 正常失败不该把 SCK 判死刑。
+        if previousAttemptUnfinished, let lastStep, lastStep.hasPrefix("attempt:sck:") {
+            count += 1
+            write("\(version):\(count)", to: crashCountURL)
+            // 现场已消费，清文件避免同一次崩溃被重复计数；
+            // lastStep / previousAttemptUnfinished 仍留在内存里给诊断面板用。
+            finish()
+        }
+        sckCrashCount = count
         installExceptionHandler()
     }
+
+    private static var currentVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+    }
+
+    /// SCK 真的跑起来了：连续崩溃计数清零。
+    static func recordSckSuccess() {
+        guard sckCrashCount != 0 else { return }
+        sckCrashCount = 0
+        write("\(currentVersion):0", to: crashCountURL)
+    }
+
+    /// 这台设备还值不值得再试 SCK。
+    static var isSckDisabled: Bool { sckCrashCount >= sckCrashLimit }
 
     // MARK: - 记录
 
@@ -84,7 +130,15 @@ enum ShareBreadcrumb {
             return "上次共享异常：\(lastException)"
         }
         if previousAttemptUnfinished, let lastStep {
-            return "上次共享崩溃于「\(lastStep)」（没有走到收尾）"
+            let step = lastStep.replacingOccurrences(of: "attempt:", with: "")
+            var text = "上次共享崩溃于「\(step)」（没有走到收尾）"
+            if sckCrashCount > 0 {
+                text += " · 第 \(sckCrashCount) 次"
+                if isSckDisabled {
+                    text += "，已停用系统捕获"
+                }
+            }
+            return text
         }
         return nil
     }

@@ -89,12 +89,11 @@ enum ScreenSharingSessionFactory {
         // 必须先看 SCK，再退 in-app，最后才轮到扩展。
         guard #available(iOS 27.0, *) else { return .broadcastExtension }
 
-        /* 上一次共享没有正常收尾，说明进程是在共享链路上被带走的
-           （最可能是运行时绑定的某个调用抛了异常或触发了系统断言）。
-           本次会话不再试 SCK，直接 in-app：同一台设备不该连续闪退两次。
-           诊断面板会写明上次停在哪个调用，修好后再放开。 */
-        if ShareBreadcrumb.previousAttemptUnfinished {
-            ScreenCaptureKitRuntime.note("上次共享未收尾，本次跳过 SCK")
+        /* 连续两次把进程带走，就不再让用户陪着试了。
+           计数按版本存：换新版本会重新给一次机会（见 ShareBreadcrumb）。
+           一次崩溃不足以禁用——上一次可能是别的环节，而这次已经修掉了。 */
+        if ShareBreadcrumb.isSckDisabled {
+            ScreenCaptureKitRuntime.note("SCK 已连续崩溃 \(ShareBreadcrumb.sckCrashCount) 次，本机改用 in-app")
             return .inApp
         }
 
@@ -681,28 +680,38 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
             fail("无法创建屏幕捕获配置")
             return
         }
+        ShareBreadcrumb.mark("sck:cfg-new")
 
         let size = outputSize(for: filter)
-        // iOS 上 width/height 的单位是**像素**，不是点。
-        // 不显式设置会按内容原始分辨率输出，3x 屏整屏就是 1179x2556，
-        // 编码器和上行带宽都吃不消。
-        ScreenCaptureKitRuntime.setInt(configuration, "setWidth:", size.width)
-        ScreenCaptureKitRuntime.setInt(configuration, "setHeight:", size.height)
-        // 30fps 上限：屏幕内容不需要 60fps，省一半码率。
-        // 注：minimumFrameInterval / pixelFormat / queueDepth / showsCursor 在
-        // iOS 上是 API_UNAVAILABLE，选择子不存在时 setInt/setBool 静默跳过；
-        // 留着是为了同一份代码在 macOS 上也能用。真正生效的只有宽高。
-        ScreenCaptureKitRuntime.setTime(
-            configuration,
-            "setMinimumFrameInterval:",
-            CMTime(value: 1, timescale: 30)
-        )
-        // BGRA 是 RTCCVPixelBuffer 唯一保证能直接吃的格式，避免每帧再做一次转换。
-        ScreenCaptureKitRuntime.setUInt32(configuration, "setPixelFormat:", 1_111_970_369)
-        ScreenCaptureKitRuntime.setBool(configuration, "setShowsCursor:", true)
-        // 音频走独立的 RTCAudioTrack，这里再采一次会双份。
-        ScreenCaptureKitRuntime.setBool(configuration, "setCapturesAudio:", false)
-        ScreenCaptureKitRuntime.setInt(configuration, "setQueueDepth:", 3)
+        ShareBreadcrumb.mark("sck:cfg-size(\(size.width)x\(size.height))")
+
+        /* 只设宽高，其余一个都不碰。
+           1.6.6 在这里连着设了 pixelFormat / minimumFrameInterval / queueDepth /
+           showsCursor / capturesAudio —— 这五个在 iOS 上都标了 API_UNAVAILABLE。
+           标了不代表调用会安全返回，iOS 27 的实际实现里但凡有一条抛异常，
+           而这段没有护盾，进程当场就被带走：黑匣子停在 sck:stream-init 正是这个原因。
+           分辨率交给系统默认（BGRA）也完全够用，RTCCVPixelBuffer 两种都吃。 */
+        var configError: String?
+        if let reason = ScreenCaptureKitRuntime.shield({
+            if let object = configuration as? NSObject {
+                if object.responds(to: NSSelectorFromString("setWidth:")) {
+                    object.setValue(NSNumber(value: size.width), forKey: "width")
+                }
+                if object.responds(to: NSSelectorFromString("setHeight:")) {
+                    object.setValue(NSNumber(value: size.height), forKey: "height")
+                }
+            }
+        }) {
+            configError = reason
+        }
+        if let configError {
+            // 配置失败不等于不能共享：不设宽高就是按内容原始分辨率输出，
+            // 画面会大一点、带宽高一点，但能出去。记一笔继续。
+            ScreenCaptureKitRuntime.note("设置输出尺寸失败：\(configError)")
+            ShareBreadcrumb.mark("sck:cfg-default")
+        } else {
+            ShareBreadcrumb.mark("sck:cfg-ok")
+        }
 
         var created: AnyObject?
         if let reason = ScreenCaptureKitRuntime.shield({
@@ -769,6 +778,9 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
                     return
                 }
                 ShareBreadcrumb.mark("sck:running")
+                // 真的跑起来了：把「连续崩溃」计数清零，
+                // 否则两次偶发崩溃会让这台机器永久失去系统捕获。
+                ShareBreadcrumb.recordSckSuccess()
                 self.notify(.running(startedAt: Date()))
             }
         }) {
@@ -783,22 +795,16 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     /// 3x 屏整屏是 393×852 点，不乘 pointPixelScale 就只编码到 1/3 分辨率，
     /// 对端看到的是糊的。
     private func outputSize(for filter: AnyObject) -> (width: Int, height: Int) {
-        var rect = pixelRect(of: filter)
+        let rect = pixelRect(of: filter)
 
-        // 拿不到 contentRect 时按整屏像素兜底：分享整屏是最常见的情况，
+        // 拿不到 contentRect 时按整屏兜底：分享整屏是最常见的情况，
         // 用 16:9 兜底反而会把手机竖屏画面压成一条。
-        if rect == nil {
-            let bounds = UIScreen.main.bounds
-            let scale = UIScreen.main.scale
-            rect = CGRect(
-                x: 0, y: 0,
-                width: bounds.width * scale,
-                height: bounds.height * scale
-            )
-        }
+        let full = screenPixelSize()
+        let rawWidth = rect?.width ?? full.width
+        let rawHeight = rect?.height ?? full.height
+        let width = sanitize(rawWidth, fallback: 390)
+        let height = sanitize(rawHeight, fallback: 844)
 
-        let width = max(rect?.width ?? 1280, 1)
-        let height = max(rect?.height ?? 720, 1)
         let ratio = width / height
         let longEdge: CGFloat = 1280
 
@@ -808,30 +814,55 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         return (even(Int((longEdge * ratio).rounded())), even(Int(longEdge)))
     }
 
+    /// 任何非有限值（NaN / ±Inf）或离谱值都换成安全值。
+    ///
+    /// 这一行是 1.6.6 闪退的真正元凶：`Int(Double.nan)` 在 Swift 里是
+    /// 运行时 trap（"Double value cannot be converted to Int"），
+    /// 直接 SIGILL 带走进程，`@try/@catch` 和 NSException 处理器都抓不到，
+    /// 表现出来和系统崩没有任何区别。而 `pointPixelScale` 是拿函数指针
+    /// 强转读的，一旦 ABI 对不上就会读回寄存器里的垃圾——正好是 NaN。
+    private func sanitize(_ value: CGFloat, fallback: CGFloat) -> CGFloat {
+        guard value.isFinite, value >= 2, value <= 8192 else { return fallback }
+        return value
+    }
+
+    private func screenPixelSize() -> CGSize {
+        let bounds = UIScreen.main.bounds
+        let scale = UIScreen.main.scale > 0 ? UIScreen.main.scale : 3
+        return CGSize(width: bounds.width * scale, height: bounds.height * scale)
+    }
+
     /// contentRect（点）× pointPixelScale → 像素。
+    ///
+    /// 一律走 KVC 而不是拿 IMP 强转：CGRect 是 32 字节，返回值要走 sret，
+    /// CGFloat 的位宽又随架构变。只要有一处和真实签名对不上，读回来的就是
+    /// 垃圾（NaN / 天文数字），后面 `Int()` 一步就 trap。KVC 由运行时按
+    /// 真实的 type encoding 取值，类型永远不会错。
     private func pixelRect(of filter: AnyObject) -> CGRect? {
-        guard let rect = contentRect(of: filter) else { return nil }
-        guard let scale = pixelScale(of: filter), scale > 0 else { return rect }
-        return CGRect(
-            x: 0,
-            y: 0,
-            width: rect.width * scale,
-            height: rect.height * scale
-        )
-    }
+        guard let object = filter as? NSObject else { return nil }
 
-    private func contentRect(of filter: AnyObject) -> CGRect? {
-        guard let imp = ScreenCaptureKitRuntime.instanceIMP(filter, "contentRect") else { return nil }
-        typealias F = @convention(c) (AnyObject, Selector) -> CGRect
-        let rect = unsafeBitCast(imp, to: F.self)(filter, NSSelectorFromString("contentRect"))
-        return rect.width > 1 && rect.height > 1 ? rect : nil
-    }
+        var rect: CGRect?
+        _ = ScreenCaptureKitRuntime.shield {
+            guard object.responds(to: NSSelectorFromString("contentRect")),
+                  let value = object.value(forKey: "contentRect") as? NSValue else { return }
+            let candidate = value.cgRectValue
+            guard candidate.width.isFinite, candidate.height.isFinite,
+                  candidate.width > 1, candidate.height > 1 else { return }
+            rect = candidate
+        }
+        guard var result = rect else { return nil }
 
-    private func pixelScale(of filter: AnyObject) -> CGFloat? {
-        guard let imp = ScreenCaptureKitRuntime.instanceIMP(filter, "pointPixelScale") else { return nil }
-        typealias F = @convention(c) (AnyObject, Selector) -> Double
-        let scale = unsafeBitCast(imp, to: F.self)(filter, NSSelectorFromString("pointPixelScale"))
-        return scale > 0 ? CGFloat(scale) : nil
+        var scale: CGFloat = 1
+        _ = ScreenCaptureKitRuntime.shield {
+            guard object.responds(to: NSSelectorFromString("pointPixelScale")),
+                  let number = object.value(forKey: "pointPixelScale") as? NSNumber else { return }
+            let candidate = CGFloat(number.doubleValue)
+            guard candidate.isFinite, candidate >= 1, candidate <= 4 else { return }
+            scale = candidate
+        }
+
+        result.size = CGSize(width: result.width * scale, height: result.height * scale)
+        return result
     }
 
     private func even(_ value: Int) -> Int {
@@ -932,7 +963,19 @@ extension ScreenCaptureKitSharer {
             }
             return
         }
-        startStream(with: filter)
+
+        // 建流必须回主线程。
+        // 选择器的回调线程没有公开保证，而 SCStream 的初始化会碰到
+        // UIKit / CoreAnimation 一侧的状态（UIScreen、CATransaction），
+        // 在后台线程进这一步，运气不好就是一句断言。
+        if Thread.isMainThread {
+            startStream(with: filter)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.running else { return }
+                self.startStream(with: filter)
+            }
+        }
     }
 
     private func handleCancel() {
