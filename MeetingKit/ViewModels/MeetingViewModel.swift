@@ -273,7 +273,7 @@ final class MeetingViewModel: ObservableObject {
             var videoLine = "RTC 视频：发送 \(video.packetsSent) 包 · 编码 \(video.framesEncoded) 帧 · "
                 + (video.screenAttached ? "共享轨已挂" : "共享轨未挂 ⚠️")
                 + " · 轨\(video.trackEnabled ? "开" : "关 ⚠️")"
-                + " · SDP上行\(video.sendsUpstream ? "允许" : "不允许 ⚠️")"
+                + " · 共享m-line\(video.sendsUpstream ? "已进SDP" : "未进SDP ⚠️")"
             if let sampledAt = video.sampledAt {
                 videoLine += String(format: " · 采样 %.1f 秒前", Date().timeIntervalSince(sampledAt))
             }

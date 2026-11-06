@@ -114,6 +114,9 @@ final class PeerSession: NSObject {
     /// 靠它把同一条麦克风轨重新挂回去。
     private var localAudio: RTCAudioTrack?
     private var localVideo: RTCVideoTrack?
+    /// 屏幕轨。**入会首轮协商就挂上，整个会话不再增删**。
+    /// 共享只是把它 enable，停止只是 disable——不产生任何重新协商。
+    private var localScreen: RTCVideoTrack?
 
     // MARK: 协商状态
 
@@ -124,6 +127,11 @@ final class PeerSession: NSObject {
     /// 轨也是开的，但 WebRTC 永远不会为它建 VideoSendStream——
     /// 诊断上就是"共享轨已挂 + 编码 0 帧"。
     private var offerSentAt: Date?
+    /// offer 已发出却没等到 answer 时的原样重发次数。
+    /// 浏览器在 glare 里丢一次 offer 是正常现象，以前只能干等，
+    /// 等到看门狗把整条连接拆掉——现在原样重发同一份 SDP 即可，代价几 KB。
+    private var offerRetryCount = 0
+    private var offerRetryTask: DispatchWorkItem?
 
     var pendingOfferAge: TimeInterval? {
         guard peerConnection.signalingState == .haveLocalOffer,
@@ -200,28 +208,24 @@ final class PeerSession: NSObject {
 
     // MARK: - 本地轨道
 
-    /// 加入本地收发轨道。重复调用安全（先移除旧 sender 再重加）。
+    /// 加入本地收发轨道。重复调用安全。
     ///
-    /// `screen == true` 表示 `video` 是本端的屏幕轨：这条轨要单独记在
-    /// `screenSender` 上，不能和摄像头 sender 混用——否则共享诊断与
-    /// 上行守护会把摄像头那条 m-line 当成共享通道。
-    func attachLocalTracks(audio: RTCAudioTrack?, video: RTCVideoTrack?, screen: Bool = false) {
+    /// `screenTrack` 是屏幕轨：它和摄像头轨**同时**进首轮 offer，
+    /// 各占一条 m-line。共享开始/结束时只改 `isEnabled`，不再 addTrack /
+    /// removeTrack——中途重新协商一旦被 glare 或丢包卡住，本端所有自检
+    /// （sender 挂着、轨开着、SDP 允许发）都会成立，而编码器一个包都发不出去。
+    func attachLocalTracks(
+        audio: RTCAudioTrack?,
+        video: RTCVideoTrack?,
+        screenTrack: RTCVideoTrack? = nil
+    ) {
         // 记住轨道本身：PeerConnection 重建换的是连接，不是麦克风。
         // 没有这两个引用，重建后的新连接就只能空着——人还在，声音没了。
         if let audio = audio { localAudio = audio }
         if let video = video { localVideo = video }
+        if let screenTrack = screenTrack { localScreen = screenTrack }
 
         ensureLocalSenders()
-        if screen {
-            screenSender = peerConnection.senders.first { $0.track?.trackId == video?.trackId }
-            screenTrackId = video?.trackId
-            if let sender = screenSender {
-                screenTransceiver = peerConnection.transceivers.first { $0.sender.senderId == sender.senderId }
-            }
-            if let transceiver = screenTransceiver {
-                _ = transceiver.setDirection(.sendRecv, error: nil)
-            }
-        }
         /* addTrack 之后主动推一次协商。
            WebRTC 的 negotiationNeeded 在部分版本/时序下不会回调
            （尤其是刚 new 出来的 pc 第一次 addTrack），只赌它就会两边互等。 */
@@ -234,10 +238,41 @@ final class PeerSession: NSObject {
     /// 应答里的 m-line 方向就定死了。此时本地还没有 audio sender，
     /// answer 就是 recvonly——之后 addTrack 只能靠重新协商补救，
     /// 而重新协商一旦被协商状态吞掉，就再也不会发生。
+    ///
+    /// 屏幕轨同样在这里补：对方先发 offer 时，answer 里也必须有一条
+    /// sendonly 的共享 m-line，否则共享阶段又得回头重新协商。
     func ensureLocalSenders() {
         let streamID = "tq-\(peerID)"
         if let audio = localAudio { ensureSender(for: audio, streamID: streamID) }
         if let video = localVideo { ensureSender(for: video, streamID: streamID) }
+        if let screen = localScreen { ensureScreenSender(screen) }
+    }
+
+    /// 建共享 sender（幂等，不触发协商）。
+    ///
+    /// 方向固定 `.sendOnly`：本端从不需要收自己的屏幕。这样 offer 里
+    /// 这条 m-line 是 `a=sendonly`，浏览器回 `a=recvonly`，方向天然正确，
+    /// 不会出现"谈成 inactive 却以为能发"的情况。
+    private func ensureScreenSender(_ track: RTCVideoTrack) {
+        localScreen = track
+        if let sender = screenSender, sender.track?.trackId == track.trackId {
+            screenTrackId = track.trackId
+            return
+        }
+        if let existing = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId }) {
+            screenSender = existing
+            screenTransceiver = peerConnection.transceivers.first { $0.sender.senderId == existing.senderId }
+            screenTrackId = track.trackId
+            _ = screenTransceiver?.setDirection(.sendOnly, error: nil)
+            return
+        }
+        peerConnection.add(track, streamIds: ["screen-\(peerID)"])
+        screenSender = peerConnection.senders.first { $0.track?.trackId == track.trackId }
+        if let sender = screenSender {
+            screenTransceiver = peerConnection.transceivers.first { $0.sender.senderId == sender.senderId }
+        }
+        _ = screenTransceiver?.setDirection(.sendOnly, error: nil)
+        screenTrackId = track.trackId
     }
 
     /// 诊断用：当前挂着几条上行音频、轨道是什么状态。
@@ -274,149 +309,45 @@ final class PeerSession: NSObject {
         negotiate()
     }
 
-    /// 屏幕共享：用 screen 替换当前的 video sender（Web 端同款 replaceTrack 策略）。
-    /// track 为 nil 时移除上行视频（结束共享且本端无摄像头）。
-    func replaceVideoTrack(with track: RTCVideoTrack?) {
-        guard let track = track else {
-            /* 停止共享：只摘轨、不发 offer。
-               m-line 不能删（SDP 里删 m-line 等于重新协商整条会话），
-               对端由 screen:false 信令收口。 */
-            (videoSender ?? senderForVideoTrack())?.track = nil
-            return
-        }
+    // MARK: - 屏幕共享（m-line 预建，只开关轨）
 
-        if let sender = videoSender ?? senderForVideoTrack() {
-            videoSender = sender
-            // 记录"当前该发哪条轨"：共享看门狗用它判断 sender 是否真的挂上了
-            // 屏幕轨；新 peer 在共享中接入时也靠它拿同一条轨。
-            localVideo = track
-            videoTransceiver = videoTransceiver ?? transceiverForVideoSender()
-
-            if let transceiver = videoTransceiver {
-                if transceiver.isStopped {
-                    // transceiver 被 stop 过就再也拨不回来，只能重建一条。
-                    rebuildVideoSender(with: track)
-                    return
-                }
-                /* 换轨本身不改变 SDP 方向。摄像头从没开过时，这条
-                   video transceiver 可能被谈成 recvonly；只把 track 塞进
-                   sender，本地看"挂了轨、在推帧"，对端一个包都收不到。
-                   先把 preferred direction 拨回 sendRecv，再显式协商。
-
-                   这里不先比较 `direction`：本 SDK 把同一个枚举导入成了
-                   不可比较的类型（和 currentDirection 一样），比较过不了编译；
-                   而 setDirection 本身就是幂等的，已经是 sendRecv 时是空操作。 */
-                _ = transceiver.setDirection(.sendRecv, error: nil)
-            }
-            sender.track = track
-        } else {
-            /* 一条 video sender 都没有（对端加入时本端摄像头是关的）：
-               补一条上行轨。addTrack 会新建 sendrecv transceiver。 */
-            peerConnection.add(track, streamIds: ["tq-\(peerID)"])
-            videoSender = senderForVideoTrack()
-            videoTransceiver = transceiverForVideoSender()
-        }
-
-        /* 必须显式协商，不能只赌 negotiationNeeded 回调。
-           真机现象：帧推了三百多帧，对端一帧没收到——offer 根本没发出去。 */
-        negotiate()
-    }
-
-    // MARK: - 屏幕共享（独占一条 m-line）
-
-    /// 开始/续接共享：把屏幕轨挂到一条**新的** sendrecv m-line 上。
+    /// 开始/续接共享：打开共享轨。
     ///
-    /// 为什么不再 replaceTrack：真机连续出现「sender.track 就是共享轨、
-    /// 轨 enabled、本端 SDP 写着 sendrecv，编码器 0 帧、发送 0 包」。
-    /// replaceTrack 只在一条已经存在的发送流里换源；这条流若在协商里被
-    /// 谈成 recvonly，或 send stream 根本没建起来，换轨既救不回它，
-    /// 也不会让远端收到新的 ontrack——浏览器就一直停在「正在接收画面」。
+    /// 共享 m-line 在入会首轮协商里就建好了（见 `ensureScreenSender`），
+    /// 这里**正常情况下不需要任何协商**：sender 上一直挂着同一条轨，
+    /// 打开 `isEnabled`、编码器收到帧就会发包，浏览器那条 receiver 也从头到尾
+    /// 没变过，`ontrack` 早在入会时就到过了。
     ///
-    /// addTrack 会新建一条 sendrecv m-line，远端必然收到 ontrack 和一条
-    /// 新的 receiver track，画面才有落点。旧 m-line 由 removeTrack 收掉，
-    /// 浏览器端对应轨 readyState 变 ended，选轨逻辑只取 live 轨，不会选错。
+    /// 只有一种例外会走到 `negotiate()`：sender 真的不在（老会话、
+    /// 或这条轨是后来新建的）。此时补挂一次并协商，仅此一次。
     func attachScreenTrack(_ track: RTCVideoTrack) {
         guard !isClosed else { return }
 
-        if screenTrackId == track.trackId, let sender = screenSender {
-            // 同一条轨重复调用：只把方向与轨拨正，不重复开 m-line。
-            localVideo = track
-            if let transceiver = screenTransceiver {
-                _ = transceiver.setDirection(.sendRecv, error: nil)
-            }
-            sender.track = track
+        let alreadyAttached = screenSender?.track?.trackId == track.trackId
+            && screenTrackId == track.trackId
+        /* 本地 sender 挂上 ≠ 这条 m-line 进了 SDP。
+           对方先发 offer 时，answer 不能新增 m-line：sender 建好了、
+           轨也开了，但它没有 mid，帧永远到不了编码器。这里以本地 SDP 为准，
+           没进就补一次 offer（只补一次，重发由 scheduleOfferRetry 负责）。 */
+        let inSDP = Self.containsScreenMSID(peerConnection.localDescription?.sdp)
+        localScreen = track
+        ensureScreenSender(track)
+        track.isEnabled = true
+
+        if !alreadyAttached || !inSDP {
             negotiate()
-            return
-        }
-
-        /* 连接重建 / ensureLocalSenders 可能已经把这条轨 add 进来了。
-           这种 m-line 是本次协商刚建的，直接接管，不再叠一条。 */
-        if let existing = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId }) {
-            screenSender = existing
-            screenTransceiver = peerConnection.transceivers.first { $0.sender.senderId == existing.senderId }
-            screenTrackId = track.trackId
-            localVideo = track
-            if let transceiver = screenTransceiver {
-                _ = transceiver.setDirection(.sendRecv, error: nil)
-            }
-            negotiate()
-            return
-        }
-
-        detachScreenTrack(renotify: false)
-        localVideo = track
-        peerConnection.add(track, streamIds: ["screen-\(peerID)"])
-        screenSender = peerConnection.senders.first { $0.track?.trackId == track.trackId }
-        if let sender = screenSender {
-            screenTransceiver = peerConnection.transceivers.first { $0.sender.senderId == sender.senderId }
-        }
-        if let transceiver = screenTransceiver {
-            _ = transceiver.setDirection(.sendRecv, error: nil)
-        }
-        screenTrackId = track.trackId
-        negotiate()
-
-        /* 每轮共享会新增一条 video m-line（removeTrack 只把旧轨置 inactive，
-           不会从 SDP 里消失）。超过 6 条就重建这条连接，避免 SDP 无限膨胀
-           把浏览器的协商拖慢。 */
-        if peerConnection.transceivers.filter({ $0.mediaType == .video }).count > 6 {
-            delegate?.peerSessionNeedsRebuild(self)
         }
     }
 
-    /// 停止共享：收掉共享那条 m-line。
-    /// 摄像头 m-line 全程没动过，所以不需要"恢复"动作。
+    /// 停止共享：只关轨，**不拆 m-line**。
+    ///
+    /// 拆掉 m-line 的代价是远端 receiver 变 ended、下一轮必须重新协商，
+    /// 而重新协商正是之前所有"0 包 0 帧"故障的入口。留着一条 sendonly
+    /// 的空 m-line 不占带宽（没有帧就没有 RTP），HTTP 时代之后这点 SDP
+    /// 体积可以忽略。
     func detachScreenTrack(renotify: Bool = true) {
-        let hadSender = screenSender != nil
-        if let sender = screenSender {
-            peerConnection.removeTrack(sender)
-        }
-        screenSender = nil
-        screenTransceiver = nil
-        screenTrackId = nil
-        if renotify && hadSender { negotiate() }
-    }
-
-    /// 共享结束后把"本端要发的那条轨"改回摄像头。
-    /// 摄像头 sender 一直挂在连接上，正常只需改引用；只有在它被销毁过
-    /// （连接重建）时才补一条。
-    func restoreCameraTrack(_ track: RTCVideoTrack) {
-        localVideo = track
-        if let sender = videoSender {
-            sender.track = track
-            return
-        }
-        peerConnection.add(track, streamIds: ["tq-\(peerID)"])
-        videoSender = peerConnection.senders.first { $0.track?.trackId == track.trackId }
-        videoTransceiver = transceiverForVideoSender()
-        negotiate()
-    }
-
-    /// 没有摄像头可回时调用：清掉"该发的轨"。
-    /// 不清的话，下一次远端 offer 会在 `ensureLocalSenders` 里把已经停掉的
-    /// 屏幕轨重新 add 回来，对端就又收到一条永远没有帧的轨。
-    func clearLocalVideoIntent() {
-        localVideo = nil
+        localScreen?.isEnabled = false
+        screenSender?.track?.isEnabled = false
     }
 
     /// 共享链路的一句话现场，进诊断面板。
@@ -424,7 +355,9 @@ final class PeerSession: NSObject {
     /// 把"看起来都对但就是 0 包"拆成三项可判定的证据：共享 m-line 有几条、
     /// 远端到底收不收、ICE 通不通。缺了这三项，前几轮只能靠猜。
     var screenLinkDebug: String {
-        let videoMLines = peerConnection.transceivers.filter { $0.mediaType == .video }.count
+        let localSDP = peerConnection.localDescription?.sdp
+        let videoMLines = Self.videoMLineCount(localSDP)
+        let screenInSDP = Self.containsScreenMSID(localSDP) && Self.lastVideoIsSendOnly(localSDP)
         let remote = Self.videoDirectionAllowsReceive(peerConnection.remoteDescription?.sdp) ? "可收" : "不可收 ⚠️"
         let ice: String
         switch peerConnection.iceConnectionState {
@@ -447,7 +380,53 @@ final class PeerSession: NSObject {
         case .closed: signaling = "closed"
         default: signaling = "其他"
         }
-        return "m-line \(videoMLines) · 远端\(remote) · 信令 \(signaling) · ICE \(ice)"
+        let screenSenderText = screenSender == nil ? "未建 ⚠️" : "已建"
+        let screenSDPText = screenInSDP ? "已进SDP" : "未进SDP ⚠️"
+        return "SDP video \(videoMLines) · 共享\(screenSDPText) · sender \(screenSenderText) · 远端\(remote) · 信令 \(signaling) · ICE \(ice)"
+    }
+
+    /// 本地 SDP 里有没有共享那条 m-line。
+    /// 认 `a=msid:screen-...`：这是本端给共享轨指定的 stream id，
+    /// 只有它真的被协商进 SDP 时才会出现。比数 m-line 条数可靠——
+    /// 摄像头没建起来时也会只有一条 video，但那条不是共享。
+    private static func containsScreenMSID(_ sdp: String?) -> Bool {
+        sdp?.contains("a=msid:screen-") ?? false
+    }
+
+    /// 本地 SDP 里有几条 video m-line。
+    /// 摄像头一条、共享一条；只有 1 条就说明共享那条根本没谈进去。
+    private static func videoMLineCount(_ sdp: String?) -> Int {
+        guard let sdp, !sdp.isEmpty else { return 0 }
+        return sdp.split(whereSeparator: { $0.isNewline })
+            .filter { $0.hasPrefix("m=video") }
+            .count
+    }
+
+    /// 本地 SDP 里最后一条 video m-line 是否 sendonly/sendrecv。
+    /// 共享 m-line 最后建，所以它是不是"能发"看这一条就够。
+    private static func lastVideoIsSendOnly(_ sdp: String?) -> Bool {
+        guard let sdp, !sdp.isEmpty else { return false }
+        var inVideo = false
+        var allows = false
+        for raw in sdp.split(whereSeparator: { $0.isNewline }) {
+            let line = String(raw)
+            if line.hasPrefix("m=video") {
+                inVideo = true
+                allows = false
+                continue
+            }
+            if line.hasPrefix("m=") {
+                inVideo = false
+                continue
+            }
+            guard inVideo else { continue }
+            if line.hasPrefix("a=sendonly") || line.hasPrefix("a=sendrecv") {
+                allows = true
+            } else if line.hasPrefix("a=recvonly") || line.hasPrefix("a=inactive") {
+                allows = false
+            }
+        }
+        return allows
     }
 
     /// 远端 SDP 里视频 m-line 是否允许本端发送。
@@ -471,107 +450,11 @@ final class PeerSession: NSObject {
         return result
     }
 
-    /// 本端 SDP 里的视频方向是否允许发送。
-    ///
-    /// 不用 `transceiver.currentDirection`：这个 SDK 把它导入成了一个
-    /// 带 UnsafeMutablePointer 参数的方法引用，直接和枚举比较编译不过。
-    /// SDP 是同一份事实的字符串形态，判起来反而更直接。
-    private var localVideoSendsUpstream: Bool {
-        guard let sdp = peerConnection.localDescription?.sdp, !sdp.isEmpty else {
-            // 还没协商出本地描述：先按可发处理，看门狗会在几秒后复核。
-            return true
-        }
-        var inVideo = false
-        var sawVideo = false
-        /* 取最后一条 video m-line 的方向。
-           以前发现一条 sendrecv 就 return true：共享新增的那条 m-line
-           明明是 inactive，却因为前面摄像头那条是 sendrecv 而被读成"允许发"，
-           诊断和自愈同时被带偏。最后一条才是当前共享用的那条。 */
-        var allows = false
-        for raw in sdp.split(whereSeparator: { $0.isNewline }) {
-            let line = String(raw)
-            if line.hasPrefix("m=video") {
-                inVideo = true
-                sawVideo = true
-                continue
-            }
-            if line.hasPrefix("m=") {
-                inVideo = false
-                continue
-            }
-            guard inVideo else { continue }
-            if line.hasPrefix("a=sendrecv") || line.hasPrefix("a=sendonly") {
-                allows = true
-            } else if line.hasPrefix("a=recvonly") || line.hasPrefix("a=inactive") {
-                allows = false
-            }
-        }
-        // 有 m=video 但没写方向：RFC 4566 默认 sendrecv。
-        return sawVideo ? allows : true
-    }
-
-    /// 共享上行看门狗的补救入口。
-    ///
-    /// 1.5.3 这里是 removeTrack + addTrack，会新增第二条 m-line；
-    /// 1.5.4 改为只拨方向 + 重新挂轨，保持单条 m-line。
-    func forceReattachVideo(_ track: RTCVideoTrack) {
-        guard !isClosed else { return }
-        localVideo = track
-
-        /* 共享轨走共享 sender。摄像头那条 sender 从头到尾没挂过屏幕轨，
-           往它上面塞轨只会让"已挂"这个判断变成假象。 */
-        if screenSender != nil || screenTrackId == track.trackId {
-            if let sender = screenSender, let transceiver = screenTransceiver, !transceiver.isStopped {
-                _ = transceiver.setDirection(.sendRecv, error: nil)
-                sender.track = track
-                negotiate()
-            } else {
-                // 共享 m-line 不在了：重开一条，而不是在死 sender 上打转。
-                attachScreenTrack(track)
-            }
-            return
-        }
-
-        if let transceiver = videoTransceiver ?? transceiverForVideoSender(), !transceiver.isStopped {
-            // 同 replaceVideoTrack：不比较枚举，直接幂等地拨回 sendRecv。
-            _ = transceiver.setDirection(.sendRecv, error: nil)
-            videoSender?.track = track
-            videoTransceiver = transceiver
-            negotiate()
-            return
-        }
-
-        rebuildVideoSender(with: track)
-    }
-
-    /// 仅在原 transceiver 被 stop 时使用。
-    ///
-    /// 这条路径确实会新增 m-line，但旧 m-line 已经是 stopped，
-    /// 浏览器侧对应轨道会 ended；网页端选轨逻辑也会优先取最新的 live 轨。
-    private func rebuildVideoSender(with track: RTCVideoTrack) {
-        if let old = videoSender ?? senderForVideoTrack() {
-            peerConnection.removeTrack(old)
-        }
-        videoSender = nil
-        videoTransceiver = nil
-        peerConnection.add(track, streamIds: ["tq-\(peerID)"])
-        videoSender = senderForVideoTrack()
-        videoTransceiver = transceiverForVideoSender()
-        negotiate()
-    }
-
-    /// 当前 video sender 是否真的挂着本端正在推的那条轨。
-    /// 共享期间 `localVideo` 就是屏幕轨；看门狗用它区分"没挂上"与"挂了没发包"。
-    var isVideoTrackAttached: Bool {
-        guard let current = localVideo else { return false }
-        return (videoSender ?? senderForVideoTrack())?.track?.trackId == current.trackId
-    }
-
     /// 视频上行的完整现场，供共享看门狗与诊断面板使用。
     ///
-    /// `isVideoTrackAttached` 只回答"sender 上是不是这条轨"，它答不了
-    /// "这条轨是开的吗""SDP 允许发吗"。少了后两项，诊断会出现
-    /// "共享轨已挂 + 编码 0 帧"这种自相矛盾的结论。
+    /// 只回答"sender 上是不是这条轨"还不够，它答不了"这条轨是开的吗"
+    /// "SDP 允许发吗"。少了后两项，诊断会出现"共享轨已挂 + 编码 0 帧"这种
+    /// 自相矛盾的结论。
     struct VideoUplinkSummary {
         var trackExists = false
         var trackEnabled = false
@@ -579,24 +462,34 @@ final class PeerSession: NSObject {
         var attached = false
         /// 本地 SDP 的视频 m-line 方向允许发送。
         var sendsUpstream = true
+        /// 共享 m-line 是否真的进了本地 SDP。false = 这条轨没有 mid，
+        /// 帧推进去也永远到不了编码器。
+        var screenInSDP = false
         /// sender 的数量（>1 通常意味着多了一条历史 m-line）。
         var senderCount = 0
     }
 
     var videoUplinkSummary: VideoUplinkSummary {
         var summary = VideoUplinkSummary()
-        guard let current = localVideo else { return summary }
+        /* 只看共享 sender。`localVideo` 现在是"摄像头那条"，拿它来判断
+           共享通道会把摄像头 m-line 的绿状态当成共享发得出去。 */
+        guard let track = localScreen else { return summary }
         summary.trackExists = true
-        summary.trackEnabled = current.isEnabled
-        /* 共享期间必须认共享 sender。以前只看一个 videoSender：
-           共享换了 m-line 之后，它仍指向摄像头那条，诊断就会把
-           "摄像头 m-line 挂着一条关掉的轨"读成"共享轨已挂"。 */
-        let sender = screenSender ?? videoSender ?? senderForVideoTrack()
-        summary.attached = sender?.track?.trackId == current.trackId
-        summary.sendsUpstream = localVideoSendsUpstream
+        summary.trackEnabled = track.isEnabled
+        summary.attached = screenSender?.track?.trackId == track.trackId
+        // 最后一条 video m-line 就是共享那条（摄像头先建，共享后建）。
+        let localSDP = peerConnection.localDescription?.sdp
+        summary.screenInSDP = Self.containsScreenMSID(localSDP)
+            && Self.lastVideoIsSendOnly(localSDP)
+        summary.sendsUpstream = summary.screenInSDP
         summary.senderCount = peerConnection.senders.filter { $0.track?.kind == "video" }.count
         return summary
     }
+
+    /// 共享轨的 trackId。看门狗用它把 `outbound-rtp` 统计里属于共享的那条
+    /// 挑出来——摄像头和共享是两条独立的 send stream，合计会把"共享没发"
+    /// 掩盖成"有包在发"。
+    var screenTrackIdentifier: String? { screenTrackId }
 
     /// 记录并返回当前 video sender。sender.track 可能为 nil（关闭视频时），
     /// 所以不能只靠 `track?.kind` 反查，必须缓存引用。
@@ -613,16 +506,22 @@ final class PeerSession: NSObject {
 
     /// 调整上行视频编码参数。屏幕共享是"文字优先"，需要比摄像头更高的码率上限，
     /// 否则 1080p 画面会被 WebRTC 按摄像头模型压到 1~2Mbps，文字边缘发糊。
-    func setVideoEncoding(maxBitrateBps: Int?, maxFramerate: Int?, keepResolution: Bool = false) {
-        // 同样不能只靠 track.kind 反查：共享结束、摄像头关闭之后 track 可能是 nil。
-        // 共享期间必须作用在共享 sender 上：摄像头那条 m-line 根本不是
-        // 当前画面，把 8Mbps 配到它身上，共享画面还按摄像头档位压。
-        guard let sender = screenSender ?? videoSender ?? senderForVideoTrack() else {
-            return
+    ///
+    /// `forScreen` 必须显式指定：摄像头和共享是两条独立的 send stream，
+    /// 共用一条 sender 引用会让"停止共享后把 8Mbps 配到摄像头"或反过来。
+    func setVideoEncoding(
+        maxBitrateBps: Int?,
+        maxFramerate: Int?,
+        keepResolution: Bool = false,
+        forScreen: Bool = false
+    ) {
+        let target: RTCRtpSender?
+        if forScreen {
+            target = screenSender
+        } else {
+            target = videoSender ?? senderForVideoTrack()
         }
-        if screenSender == nil {
-            videoSender = sender
-        }
+        guard let sender = target else { return }
         // RTCRtpSender.parameters 是非可选属性（M140 起），不能做可选绑定。
         let params = sender.parameters
         for encoding in params.encodings {
@@ -806,6 +705,9 @@ final class PeerSession: NSObject {
         isClosed = true
         makingOffer = false
         offerSentAt = nil
+        offerRetryTask?.cancel()
+        offerRetryTask = nil
+        offerRetryCount = 0
         ignoreOffer = false
         isNegotiating = false
         isRestartingIce = false
@@ -816,6 +718,7 @@ final class PeerSession: NSObject {
         // 只放引用，不 stop 轨道：同一条麦克风轨还要给别的 peer 用。
         localAudio = nil
         localVideo = nil
+        localScreen = nil
 
         if let track = remoteVideoTrack, let view = remoteVideoView {
             track.remove(view)
@@ -844,21 +747,29 @@ final class PeerSession: NSObject {
     }
 
     private func handleRemoteOffer(_ description: RTCSessionDescription) {
-        /* 先把本地轨挂上，再让对端的 offer 落地。
-           顺序反过来，answer 里 audio 就是 recvonly——本端从此只收不发。 */
-        ensureLocalSenders()
-
         // Perfect Negotiation 的 glare 处理（与 Web 端一致）：
         //  · 非礼貌方（impolite）在冲突时丢弃对方 offer；
         //  · 礼貌方 rollback 自己的 offer 后接受对方 offer。
         let collision = makingOffer || peerConnection.signalingState != .stable
         ignoreOffer = !polite && collision
         if ignoreOffer {
+            /* 我们自己的 offer 还在等 answer，这条远端 offer 不要。
+               轨道仍然要挂上——它们会进我们那一轮 offer 的 SDP，
+               白等一轮只会让共享晚几秒可用。 */
+            ensureLocalSenders()
             return
         }
 
-        isNegotiating = true
+        /* 先占住"正在应答"，再挂本地轨。
+           `addTrack` 会异步触发 negotiationneeded；如果此刻没占位，
+           它会立刻发一个 offer，把马上要落地的远端 offer 顶成 wrong-state。
+           占位后这次变化会被 `needsNegotiateAfterStable` 接住，
+           等 answer 落地再补——answer 本身**不能新增 m-line**。 */
         isAcceptingRemoteOffer = true
+        isNegotiating = true
+        /* 本地轨必须在 setRemoteDescription 之前挂上：
+           顺序反过来，answer 里 audio 就是 recvonly——本端从此只收不发。 */
+        ensureLocalSenders()
 
         if collision && polite {
             let rollback = RTCSessionDescription(type: .rollback, sdp: "")
@@ -896,15 +807,20 @@ final class PeerSession: NSObject {
                     Task { @MainActor in
                         guard let self = self else { return }
                         self.isNegotiating = false
-                        self.isAcceptingRemoteOffer = false
                         guard let answer = answer, error == nil else {
+                            self.isAcceptingRemoteOffer = false
                             self.delegate?.peerSessionNeedsRebuild(self)
                             return
                         }
                         self.applyLocalDescriptionAndSignal(answer, restart: false) { [weak self] in
                             Task { @MainActor in
                                 guard let self = self else { return }
-                                // answer 期间又有轨道变更（极少见）：补一轮协商。
+                                /* answer 真正落地之后才解除占位。
+                                   提前解除的话，这段时间里排队的 negotiate()
+                                   会插进来发 offer，把会话顶成 haveLocalOffer。 */
+                                self.isAcceptingRemoteOffer = false
+                                // answer 期间又挂上了新轨（answer 不能新增 m-line）：
+                                // 补一轮 offer，否则那条轨永远没有 mid。
                                 if self.needsNegotiateAfterStable {
                                     self.needsNegotiateAfterStable = false
                                     self.negotiate()
@@ -930,6 +846,9 @@ final class PeerSession: NSObject {
                     return
                 }
                 self.offerSentAt = nil
+                self.offerRetryTask?.cancel()
+                self.offerRetryTask = nil
+                self.offerRetryCount = 0
                 self.flushPendingRemoteCandidates()
             }
         }
@@ -950,6 +869,13 @@ final class PeerSession: NSObject {
                     let toSend = self.peerConnection.localDescription ?? description
                     self.offerSentAt = description.type == .offer ? Date() : nil
                     self.delegate?.peerSession(self, needsSignalSDP: toSend, restart: restart)
+                    if description.type == .offer {
+                        self.offerRetryCount = 0
+                        self.scheduleOfferRetry()
+                    } else {
+                        self.offerRetryTask?.cancel()
+                        self.offerRetryTask = nil
+                    }
                 } else {
                     self.offerSentAt = nil
                     self.delegate?.peerSessionNeedsRebuild(self)
@@ -971,8 +897,13 @@ final class PeerSession: NSObject {
     private func negotiate() {
         guard !isClosed else { return }
         guard !isAcceptingRemoteOffer else {
-            // 正在应答对端的 offer。这一轮的 m-line 由 answer 承载，
-            // 不能再发一个 offer——否则两端会陷入"你答我、我答你"的乒乓协商。
+            /* 正在应答对端的 offer。这一轮的 m-line 由 answer 承载，
+               但 answer **不能新增 m-line**：共享轨如果是在这段时间
+               addTrack 进来的，它没有 mid，也永远不会进 SDP。
+               必须记下来，等 answer 落地回到 stable 再补一次 offer——
+               1.7.0~1.7.2 的"共享轨挂了、编码 0 帧"有一半就死在这里：
+               addTrack 的 negotiationneeded 正好落进这个窗口，被静默吞掉。 */
+            needsNegotiateAfterStable = true
             return
         }
         guard !makingOffer, !isNegotiating else {
@@ -1014,6 +945,29 @@ final class PeerSession: NSObject {
                 }
             }
         }
+    }
+
+    /// offer 发出去 4 秒还没回到 stable，就原样再发一次（最多 3 次）。
+    ///
+    /// **不重建连接、不重新 createOffer**：同一份 SDP 重复投递是幂等的，
+    /// 浏览器只是把它当成一次迟到的 setRemoteDescription。之前遇到丢 offer
+    /// 只能等看门狗拆连接，结果把"重发一次就能好"的问题变成了"整场会话没了"。
+    private func scheduleOfferRetry() {
+        offerRetryTask?.cancel()
+        guard offerRetryCount < 3 else { return }
+        let item = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, !self.isClosed else { return }
+                guard self.peerConnection.signalingState == .haveLocalOffer,
+                      let description = self.peerConnection.localDescription else { return }
+                self.offerRetryCount += 1
+                self.offerSentAt = Date()
+                self.delegate?.peerSession(self, needsSignalSDP: description, restart: false)
+                self.scheduleOfferRetry()
+            }
+        }
+        offerRetryTask = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: item)
     }
 }
 
