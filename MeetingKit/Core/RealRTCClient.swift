@@ -199,6 +199,10 @@ final class RealRTCClient: NSObject, RTCClient {
     private var videoUplinkMonitor: DispatchSourceTimer?
     /// 连续多少次采样"在出帧但编码 0"。
     private var zeroEncodeStreak = 0
+    /// 本轮共享是否已经做过"轨脉冲"（关 0.2 秒再开）。
+    /// 编码器如果因为错过关键帧/首帧尺寸变更卡死，脉冲能逼它重建输入；
+    /// 一轮只做一次，避免正常链路上出现无谓的闪断。
+    private var screenTrackPulsed = false
     /// 上行守护把"已停"的共享拉回来的次数。最多 2 次：
     /// 万一 stop 没真正停掉 SCStream，也不能让用户按了停止却停不下来。
     private var guardReviveCount = 0
@@ -869,6 +873,7 @@ final class RealRTCClient: NSObject, RTCClient {
         track.isEnabled = true
         lastScreenShareStopAt = .distantPast
         zeroEncodeStreak = 0
+        screenTrackPulsed = false
         guardReviveCount = 0
 
         for peer in remotePeers.values {
@@ -924,6 +929,9 @@ final class RealRTCClient: NSObject, RTCClient {
             peer.session.peerConnection.statistics { report in
                 var peerPackets = 0
                 var peerEncoded = 0
+                var allVideoPackets = 0
+                var allVideoEncoded = 0
+                var matchedScreen = false
                 for (_, stat) in report.statistics where stat.type == "outbound-rtp" {
                     /* 只认视频。`kind` 在部分版本里叫 `mediaType`，
                        两个都看：判错一个键就会把"正在发"读成"0 包"，
@@ -931,15 +939,32 @@ final class RealRTCClient: NSObject, RTCClient {
                     let kind = (stat.values["kind"] as? String)
                         ?? (stat.values["mediaType"] as? String)
                     guard kind == "video" else { continue }
+                    let packets = (stat.values["packetsSent"] as? NSNumber)?.intValue ?? 0
+                    let encoded = (stat.values["framesEncoded"] as? NSNumber)?.intValue ?? 0
+                    allVideoPackets += packets
+                    allVideoEncoded += encoded
                     /* 摄像头与共享是两条独立的 send stream。合计会把
-                       "共享 0 包、摄像头在发" 掩盖成"共享正常"。 */
-                    if let trackID,
-                       let reported = stat.values["trackIdentifier"] as? String,
-                       reported != trackID {
-                        continue
+                       "共享 0 包、摄像头在发" 掩盖成"共享正常"。
+                       字段名在 M100~M140 之间改过（trackIdentifier /
+                       trackId），取到哪个用哪个；都取不到就不要过滤，
+                       否则会把"真的在发"读成 0 包，反过来诱发误自愈。 */
+                    if let trackID {
+                        let reported = (stat.values["trackIdentifier"] as? String)
+                            ?? (stat.values["trackId"] as? String)
+                        if let reported, !reported.isEmpty, reported != trackID {
+                            continue
+                        }
                     }
-                    peerPackets += (stat.values["packetsSent"] as? NSNumber)?.intValue ?? 0
-                    peerEncoded += (stat.values["framesEncoded"] as? NSNumber)?.intValue ?? 0
+                    matchedScreen = true
+                    peerPackets += packets
+                    peerEncoded += encoded
+                }
+                /* 一条都没匹配上共享轨：说明统计里没有 trackIdentifier，
+                   或者共享这条根本没建 send stream。前者按全部视频兜底，
+                   后者 0 包本来就该是 0 包，兜底也不会改变结论。 */
+                if !matchedScreen {
+                    peerPackets = allVideoPackets
+                    peerEncoded = allVideoEncoded
                 }
                 totals.merge(packets: peerPackets, encoded: peerEncoded)
                 group.leave()
@@ -995,11 +1020,50 @@ final class RealRTCClient: NSObject, RTCClient {
         /* 连续 0 包只记账，不动连接。
            浏览器刷新、信令抖动都会让链路自己恢复；拆连接反而把恢复路径堵死。 */
         zeroEncodeStreak += 1
+        if zeroEncodeStreak == 2 {
+            /* 码率与分辨率约束是"锦上添花"，0 包时它会变成负担：
+               maintainResolution 在带宽估计还没起来时会让编码器
+               宁可不出帧也不降分辨率。放开约束，先换来帧。 */
+            for peer in remotePeers.values {
+                peer.session.setVideoEncoding(
+                    maxBitrateBps: nil,
+                    maxFramerate: nil,
+                    keepResolution: false,
+                    forScreen: true
+                )
+            }
+            ScreenShareRuntime.note("上行守护：0 包，已放开分辨率约束（允许降分辨率换出帧）")
+        }
         if zeroEncodeStreak == 3 {
+            let facts = remotePeers.values.first?.session.screenSenderFacts ?? "-"
+            let ready = remotePeers.values.first?.session.screenSenderReady ?? false
             ScreenShareRuntime.note(
                 "上行守护：连续 3 次采样 0 包"
-                + "（挂轨=\(snapshot.attached ? 1 : 0) SDP上行=\(sendsUpstream ? 1 : 0)）"
+                + "（挂轨=\(snapshot.attached ? 1 : 0) SDP上行=\(sendsUpstream ? 1 : 0)"
+                + " \(facts)）"
             )
+            if !screenTrackPulsed {
+                screenTrackPulsed = true
+                if !ready {
+                    /* mid 为空 / 没有 encoding 槽位：这不是编码器的问题，
+                       是这条 m-line 根本没有传输通道。补一次 offer，
+                       让 WebRTC 真正为它建 VideoSendStream。 */
+                    for peer in remotePeers.values {
+                        peer.session.renegotiateForScreen()
+                    }
+                    ScreenShareRuntime.note("上行守护：共享 m-line 无传输通道，已补一次协商")
+                } else {
+                    /* 编码器一旦错过首帧（尺寸刚变、关键帧请求丢了），会一直不产帧，
+                       而轨、sender、SDP 全都正常。关 0.25 秒再开，等于给编码器一次
+                       "重新开始"的信号，同时强制它请求关键帧。一轮只做一次。 */
+                    track.isEnabled = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                        guard let self, self.isScreenSharing else { return }
+                        self.localScreenTrack?.isEnabled = true
+                        ScreenShareRuntime.note("上行守护：编码器 0 帧，已做一次轨脉冲（关 0.25s 再开）")
+                    }
+                }
+            }
             zeroEncodeStreak = 0
         }
     }

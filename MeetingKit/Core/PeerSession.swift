@@ -255,23 +255,41 @@ final class PeerSession: NSObject {
     /// 不会出现"谈成 inactive 却以为能发"的情况。
     private func ensureScreenSender(_ track: RTCVideoTrack) {
         localScreen = track
-        if let sender = screenSender, sender.track?.trackId == track.trackId {
-            screenTrackId = track.trackId
-            return
+        /* 1.7.4 起改用 `addTransceiver` 建这条 m-line。
+           1.7.3 用 `add(track, streamIds:)` 再回 `senders` 里按 trackId 反查，
+           真机上出现过「sender.track 就是共享轨、轨开着、SDP sendonly，
+           但 framesEncoded 恒为 0」——反查出来的 RTCRtpSender 与 transceiver
+           实际持有的 sender 不是同一个包装对象时，帧会推给一个没有
+           VideoSendStream 的 sender，编码器永远收不到。
+           `addTransceiver` 直接返回 transceiver 与它自己的 sender，
+           不存在"查错对象"的余地，方向也在创建时一次定死。 */
+        if let transceiver = screenTransceiver, !transceiver.isStopped {
+            let alreadyOnTrack = transceiver.sender.track?.trackId == track.trackId
+            if alreadyOnTrack || transceiver.sender.replaceTrack(track) {
+                _ = transceiver.setDirection(.sendOnly, error: nil)
+                screenSender = transceiver.sender
+                screenTrackId = track.trackId
+                return
+            }
+            /* replaceTrack 失败说明这个 transceiver 已经发不动了
+               （底层 sender 被停、或协商把它关成了 inactive）。丢掉引用，
+               往下走重建一条；不递归，避免"失败→重建→再失败"打转。 */
+            screenTransceiver = nil
+            screenSender = nil
+            screenTrackId = nil
         }
-        if let existing = peerConnection.senders.first(where: { $0.track?.trackId == track.trackId }) {
-            screenSender = existing
-            screenTransceiver = peerConnection.transceivers.first { $0.sender.senderId == existing.senderId }
-            screenTrackId = track.trackId
-            _ = screenTransceiver?.setDirection(.sendOnly, error: nil)
-            return
-        }
-        peerConnection.add(track, streamIds: ["screen-\(peerID)"])
-        screenSender = peerConnection.senders.first { $0.track?.trackId == track.trackId }
-        if let sender = screenSender {
-            screenTransceiver = peerConnection.transceivers.first { $0.sender.senderId == sender.senderId }
-        }
-        _ = screenTransceiver?.setDirection(.sendOnly, error: nil)
+        let initParams = RTCRtpTransceiverInit(
+            direction: .sendOnly,
+            streamIds: ["screen-\(peerID)"]
+        )
+        /* 不用可选绑定：M140 头文件里这个返回值在 NS_ASSUME_NONNULL 块内，
+           是 `RTCRtpTransceiver *`（非可选），写成 `guard let` 直接编译不过；
+           而旧版本又是隐式解包。直接接住，两种导入都能编。 */
+        let transceiver = peerConnection.addTransceiver(of: .video, init: initParams)
+        _ = transceiver.sender.replaceTrack(track)
+        _ = transceiver.setDirection(.sendOnly, error: nil)
+        screenTransceiver = transceiver
+        screenSender = transceiver.sender
         screenTrackId = track.trackId
     }
 
@@ -330,6 +348,7 @@ final class PeerSession: NSObject {
            轨也开了，但它没有 mid，帧永远到不了编码器。这里以本地 SDP 为准，
            没进就补一次 offer（只补一次，重发由 scheduleOfferRetry 负责）。 */
         let inSDP = Self.containsScreenMSID(peerConnection.localDescription?.sdp)
+            && (screenTransceiver?.mid?.isEmpty == false)
         localScreen = track
         ensureScreenSender(track)
         track.isEnabled = true
@@ -357,7 +376,15 @@ final class PeerSession: NSObject {
     var screenLinkDebug: String {
         let localSDP = peerConnection.localDescription?.sdp
         let videoMLines = Self.videoMLineCount(localSDP)
-        let screenInSDP = Self.containsScreenMSID(localSDP) && Self.lastVideoIsSendOnly(localSDP)
+        /* 除了"msid 在 SDP 里"，还必须真有 mid。
+           msid 只是本端写给 SDP 的字符串；mid 才是这条 m-line 被协商、
+           被分配传输通道的证据。mid 为空时 SDP 里照样能看到 msid
+           （本地描述里 transceiver 一旦创建就会带上），但 WebRTC 不会为它
+           建 VideoSendStream——这正是"已进SDP + 0 帧"的假象来源。 */
+        let midValue = screenTransceiver?.mid
+        let screenInSDP = Self.containsScreenMSID(localSDP)
+            && Self.lastVideoIsSendOnly(localSDP)
+            && (midValue?.isEmpty == false)
         let remote = Self.videoDirectionAllowsReceive(peerConnection.remoteDescription?.sdp) ? "可收" : "不可收 ⚠️"
         let ice: String
         switch peerConnection.iceConnectionState {
@@ -382,7 +409,18 @@ final class PeerSession: NSObject {
         }
         let screenSenderText = screenSender == nil ? "未建 ⚠️" : "已建"
         let screenSDPText = screenInSDP ? "已进SDP" : "未进SDP ⚠️"
-        return "SDP video \(videoMLines) · 共享\(screenSDPText) · sender \(screenSenderText) · 远端\(remote) · 信令 \(signaling) · ICE \(ice)"
+        /* 编码器事实（1.7.4）：
+           `mid` 为空 = 这条 m-line 没被协商；
+           `enc` 为 0 = sender 没有 encoding 槽位，WebRTC 不会为它建
+           VideoSendStream，帧推进去也一个包都发不出来；
+           `ssrc` 为空 = 协商没分配同步源，同样编不出包。
+           这三项是"挂轨/轨开/SDP 允许但 0 包"唯一能落地的判据。 */
+        let mid = screenTransceiver?.mid ?? "-"
+        let encodings = screenSender?.parameters.encodings ?? []
+        let ssrc = encodings.first?.ssrc?.stringValue ?? "-"
+        return "SDP video \(videoMLines) · 共享\(screenSDPText) · sender \(screenSenderText)"
+            + " · mid=\(mid)/enc=\(encodings.count)/ssrc=\(ssrc)"
+            + " · 远端\(remote) · 信令 \(signaling) · ICE \(ice)"
     }
 
     /// 本地 SDP 里有没有共享那条 m-line。
@@ -481,9 +519,34 @@ final class PeerSession: NSObject {
         let localSDP = peerConnection.localDescription?.sdp
         summary.screenInSDP = Self.containsScreenMSID(localSDP)
             && Self.lastVideoIsSendOnly(localSDP)
+            && (screenTransceiver?.mid?.isEmpty == false)
         summary.sendsUpstream = summary.screenInSDP
         summary.senderCount = peerConnection.senders.filter { $0.track?.kind == "video" }.count
         return summary
+    }
+
+    /// 共享 sender 的编码器事实，供 RealRTCClient 写进自愈流水。
+    var screenSenderFacts: String {
+        let mid = screenTransceiver?.mid ?? "-"
+        let encodings = screenSender?.parameters.encodings ?? []
+        let ssrc = encodings.first?.ssrc == nil ? "无" : "有"
+        return "mid=\(mid) enc=\(encodings.count) ssrc=\(ssrc)"
+    }
+
+    /// 共享 m-line 是否真的可以编码：既有 mid，又有 encoding 槽位。
+    /// 两者缺一，帧推进去也不会产生任何 RTP 包。
+    var screenSenderReady: Bool {
+        (screenTransceiver?.mid?.isEmpty == false)
+            && ((screenSender?.parameters.encodings.count ?? 0) > 0)
+    }
+
+    /// m-line 看似在 SDP 里、实际没有传输通道时，补一次 offer。
+    ///
+    /// 只在自愈里调用，且由调用方保证一轮只调一次：协商本身有代价，
+    /// 反复补会把连接拖进 glare。
+    func renegotiateForScreen() {
+        guard !isClosed else { return }
+        negotiate()
     }
 
     /// 共享轨的 trackId。看门狗用它把 `outbound-rtp` 统计里属于共享的那条
@@ -524,6 +587,13 @@ final class PeerSession: NSObject {
         guard let sender = target else { return }
         // RTCRtpSender.parameters 是非可选属性（M140 起），不能做可选绑定。
         let params = sender.parameters
+        /* 没有 encoding 槽位时**绝不能**把参数写回去。
+           协商尚未完成时 `parameters.encodings` 可能是空数组，此时
+           `sender.parameters = params` 会把"空 encoding"落到底层，
+           这条 sender 就再也不会有 VideoSendStream——画面上就是
+           "轨开着、帧在出、编码 0 帧、发送 0 包"，而且再也不会恢复。
+           宁可不设码率，也不能把通道写死。 */
+        guard !params.encodings.isEmpty else { return }
         for encoding in params.encodings {
             if let bps = maxBitrateBps {
                 encoding.maxBitrateBps = NSNumber(value: bps)

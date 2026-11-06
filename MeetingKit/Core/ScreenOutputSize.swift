@@ -17,19 +17,29 @@ import CoreGraphics
 
 enum ScreenOutputSize {
 
-    /// 按源尺寸等比缩到长边 `maxLongEdge` 以内，宽高取偶数。
+    /// 按源尺寸等比缩到长边 `maxLongEdge` 以内，宽高取 16 的倍数。
     ///
-    /// 偶数不是为了好看：H.264 的 4:2:0 编码对奇数宽高会触发补边，
-    /// 部分解码器（尤其是浏览器）补边后画面会整体偏移一个像素。
+    /// 16 对齐不是为了好看：H.264 的宏块是 16×16，宽高不是 16 的倍数时，
+    /// 硬件编码器要么补边（浏览器解出来整体偏移）、要么直接拒绝创建会话
+    /// （表现就是"帧推进去了，framesEncoded 恒为 0"）。手机上 886 这种
+    /// 宽度就踩过这个坑，改成 880 后编码器才正常出帧。
     static func fit(width: Int, height: Int, maxLongEdge: Int) -> (width: Int, height: Int) {
-        guard width > 1, height > 1 else { return (2, 2) }
+        guard width > 1, height > 1 else { return (16, 16) }
         let longEdge = max(width, height)
-        let limit = max(maxLongEdge, 2)
+        let limit = max(maxLongEdge, 16)
         let scale = longEdge > limit ? Double(limit) / Double(longEdge) : 1
 
-        let scaledWidth = even(Int((Double(width) * scale).rounded()))
-        let scaledHeight = even(Int((Double(height) * scale).rounded()))
+        let scaledWidth = align16(Int((Double(width) * scale).rounded()))
+        let scaledHeight = align16(Int((Double(height) * scale).rounded()))
         return (scaledWidth, scaledHeight)
+    }
+
+    /// 向下取 16 的倍数，且不小于 16。
+    ///
+    /// 只向下取整：宁可少 8 个像素（缩放到 1920 长边时肉眼不可见），
+    /// 也不能向上取整后超过源画面、把适配器逼进"放大再裁切"。
+    static func align16(_ value: Int) -> Int {
+        max((max(value, 16) / 16) * 16, 16)
     }
 
     /// 取不小于 2 的偶数。
