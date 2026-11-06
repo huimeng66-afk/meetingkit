@@ -222,10 +222,20 @@ final class MeetingViewModel: ObservableObject {
                 // "等待系统面板选择内容"，而画面明明已经在推——误导排查方向。
                 lines.append("状态：共享中")
             }
+        } else if let session = nativeShareSession, session.isRunning {
+            /* 会话真的在出帧，界面状态却是"未共享"。
+               这正是"浏览器不显示画面"的典型现场：本端 SCK 在推、
+               RTC 在发包，但 screen:state 没发出去，对端没切舞台。
+               单独标出来，别再混进"等待选择内容"里。 */
+            lines.append("状态：会话在推帧但界面未同步（异常，请反馈此行）")
         } else if nativeShareSession != nil {
             lines.append("状态：等待系统面板选择内容")
         } else {
             lines.append("状态：未共享")
+        }
+
+        if let session = nativeShareSession {
+            lines.append("会话：\(session.isRunning ? "运行中" : "已停止") · 已推 \(session.frameCount) 帧")
         }
 
         if let session = nativeShareSession {
@@ -702,21 +712,26 @@ final class MeetingViewModel: ObservableObject {
             break
 
         case .running(let startedAt):
-            let wasSharing = isScreenSharing
             nativeShareStartedAt = startedAt
             nativeShareError = nil
             // SCK 的 running 一定是"刚刚真的开始"，不存在冷启动同步，
             // 所以 isInitial 固定为 false：要让 RTC 发一次 screen:state。
             applyScreenSharing(true, isInitial: false, source: .screenCaptureKit)
-            /* applyScreenSharing 里有 `isScreenSharing != broadcasting` 的短路：
-               状态若已被别的路径置成 true，它就不会再调一次挂轨，
-               对端便永远收不到画面。这里补一次——该方法是幂等的。 */
-            if wasSharing {
-                rtc.beginNativeScreenPush()
-            }
+            /* applyScreenSharing 对"状态没变化"的情况会跳过 UI 重置，
+               但 screen:state 现在无论状态是否变化都会重发（见该方法的实现）。
+               浏览器端就是靠这条信令把舞台从摄像头切到共享画面的：
+               少了它，本端 SCK 在出帧、RTC 在发包，浏览器却一直显示摄像头。 */
             showToast(.screenShareStarted())
 
         case .stopped:
+            /* 迟到事件核对：停止回调到了，但会话其实还在出帧，
+               说明这是上一轮排队的消息（用户"关了再开"时必然出现）。
+               照单全收的后果就是本端明明在共享，诊断却回到"未共享"，
+               同时 screen:false 把浏览器端的共享舞台关掉。 */
+            if nativeShareSession?.isRunning == true {
+                ScreenCaptureKitRuntime.note("忽略过期的 .stopped（会话仍在运行）")
+                return
+            }
             let wasSharing = isScreenSharing
             nativeShareStartedAt = nil
             applyScreenSharing(false, isInitial: false, source: .screenCaptureKit)
@@ -725,6 +740,11 @@ final class MeetingViewModel: ObservableObject {
             }
 
         case .failed(let message):
+            // 同上：会话如果还在跑，这条失败属于上一轮。
+            if nativeShareSession?.isRunning == true {
+                ScreenCaptureKitRuntime.note("忽略过期的 .failed（会话仍在运行）")
+                return
+            }
             nativeShareError = message
             nativeShareStartedAt = nil
             applyScreenSharing(false, isInitial: false, source: .screenCaptureKit)
@@ -1503,20 +1523,30 @@ private extension MeetingViewModel {
         isInitial: Bool,
         source: ScreenShareSource = .broadcastExtension
     ) {
-        guard isScreenSharing != broadcasting else { return }
+        let changed = isScreenSharing != broadcasting
         isScreenSharing = broadcasting
 
         if broadcasting {
-            // 共享时优先保证画面与警示条可见，任何面板都让位。
-            activePanel = nil
-            isChromeVisible = true
-            pendingStopAt = nil
-            didWarnPendingShare = false
-            // 新一轮共享：诊断计数从零开始，否则面板里会混着上一场的数字。
-            ScreenShareRuntime.reset()
-            shareFailure = nil
+            if changed {
+                // 共享时优先保证画面与警示条可见，任何面板都让位。
+                activePanel = nil
+                isChromeVisible = true
+                pendingStopAt = nil
+                didWarnPendingShare = false
+                // 新一轮共享：诊断计数从零开始，否则面板里会混着上一场的数字。
+                ScreenShareRuntime.reset()
+                shareFailure = nil
+            }
             nativeShareError = nil
-            // 首次同步不调：扩展早就在跑，重复 start 只是往日志里灌噪音。
+
+            /* 下面两件事**不受 changed 约束**，每轮都要做。
+               以前整个方法被 `isScreenSharing != broadcasting` 一句话挡住：
+               用户停止后再开，若状态因为迟到回调停在 true，这里就整段跳过——
+               既没发 screen:state，也没重挂共享轨。浏览器端收不到信令，
+               一直把共享画面挂在"摄像头舞台"外面，表现就是"这次没有画面"。
+
+               screen:state 与 replaceTrack 都是幂等的，重复发没有副作用；
+               而漏发一次，对端就永远等不到。 */
             if !isInitial {
                 rtc.startScreenShare()
             }
@@ -1529,7 +1559,9 @@ private extension MeetingViewModel {
                 rtc.beginNativeScreenPush()
             }
         } else {
-            shareDurationText = "00:00"
+            if changed {
+                shareDurationText = "00:00"
+            }
             pendingStopAt = nil
             // 真实链路：停止推流并换回摄像头轨。
             // SCK 路径下 screenPusher 本来就是 nil，endScreenFramePush 同样适用。

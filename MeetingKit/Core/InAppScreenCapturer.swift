@@ -41,8 +41,28 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
     private var lastPushAt: CFTimeInterval = 0
     private var pushInterval: CFTimeInterval = 1.0 / 24.0
 
+    /// 轮次号，用途与 SCK 通道一致：让排队的旧回调自动作废。
+    private var epoch = 0
+    private let stateLock = NSLock()
+
+    var isRunning: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return running
+    }
+
     func start(source: RTCVideoSource) {
-        guard !running else { return }
+        // 重复点共享：静默收掉上一轮再重来，不能被 `guard !running` 吞掉。
+        if isRunning || recorder.isRecording {
+            recorder.stopCapture { _ in }
+            stateLock.lock()
+            running = false
+            stateLock.unlock()
+        }
+        stateLock.lock()
+        epoch += 1
+        stateLock.unlock()
+
         guard recorder.isAvailable else {
             lastError = "当前设备不支持屏幕捕获"
             notify(.failed(lastError ?? "当前设备不支持屏幕捕获"))
@@ -63,15 +83,16 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
            再让 ReplayKit 采一次会产生两路麦克风，对端听到回声。 */
         recorder.isMicrophoneEnabled = false
 
+        stateLock.lock()
         running = true
+        stateLock.unlock()
         notify(.picking)
 
         recorder.startCapture { [weak self] sampleBuffer, sampleType, error in
             guard let self else { return }
             if let error = error {
                 self.lastError = error.localizedDescription
-                self.notify(.failed(error.localizedDescription))
-                self.running = false
+                self.fail(error.localizedDescription)
                 return
             }
             guard sampleType == .video else { return }
@@ -79,9 +100,8 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
         } completionHandler: { [weak self] error in
             guard let self else { return }
             if let error = error {
-                self.running = false
                 self.lastError = error.localizedDescription
-                self.notify(.failed(error.localizedDescription))
+                self.fail(error.localizedDescription)
                 return
             }
             self.notify(.running(startedAt: Date()))
@@ -89,18 +109,32 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
     }
 
     func stop() {
-        guard running else {
+        stateLock.lock()
+        let wasRunning = running
+        running = false
+        // 先占票号：此后排队的旧回调一律作废。
+        epoch += 1
+        stateLock.unlock()
+
+        guard wasRunning else {
             notify(.stopped)
             return
         }
-        running = false
         recorder.stopCapture { [weak self] _ in
             self?.notify(.stopped)
         }
     }
 
+    private func fail(_ message: String) {
+        stateLock.lock()
+        running = false
+        epoch += 1
+        stateLock.unlock()
+        notify(.failed(message))
+    }
+
     private func handle(_ sampleBuffer: CMSampleBuffer) {
-        guard running,
+        guard isRunning,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let source,
               let capturer else { return }
@@ -148,12 +182,22 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
     }
 
     private func notify(_ state: ScreenSharingSessionState) {
+        // 票号机制与 SCK 通道一致：旧一轮排队的回调不会影响新一轮。
+        stateLock.lock()
+        let token = epoch
+        stateLock.unlock()
+        let deliver = { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            let current = self.epoch
+            self.stateLock.unlock()
+            guard current == token else { return }
+            self.onStateChange?(state)
+        }
         if Thread.isMainThread {
-            onStateChange?(state)
+            deliver()
         } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.onStateChange?(state)
-            }
+            DispatchQueue.main.async(execute: deliver)
         }
     }
 }

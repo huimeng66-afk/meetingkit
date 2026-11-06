@@ -42,6 +42,10 @@ protocol ScreenSharingSession: AnyObject {
     /// 被 SCK 的 idle 帧挡下的次数（画面没变化）。诊断用。
     var idleFrameCount: Int { get }
     var lastFrameAt: Date? { get }
+    /// 这一轮是不是真的在出帧。
+    /// ViewModel 用它识别"迟到事件"：停止回调到了，但会话其实还在跑，
+    /// 说明那是上一轮排队的消息，不能把当前状态打回去。
+    var isRunning: Bool { get }
     func start(source: RTCVideoSource)
     func stop()
 }
@@ -54,6 +58,16 @@ enum ScreenSharingSessionState {
     /// 已停止（用户取消、或从系统共享条点了停止）。
     case stopped
     case failed(String)
+
+    /// 诊断日志用。
+    var label: String {
+        switch self {
+        case .picking: return "picking"
+        case .running: return "running"
+        case .stopped: return "stopped"
+        case .failed: return "failed"
+        }
+    }
 }
 
 /// 当前设备实际会用哪条通道。UI 要据此显示不同的操作说明。
@@ -633,6 +647,19 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     /// 选择器是否已经给过回应（选中或取消）。用于区分"面板还开着"和"面板没起来"。
     private var didReceivePickerCallback = false
 
+    /* 轮次号：每次 start / stop 都 +1。
+       用途是给异步回调发"票"——旧一轮排队的 .stopped 在新一轮 .running
+       之后到达时，票号对不上，直接丢弃。
+       没有这个，用户"关了再开"会看到：SCK 明明在出帧，诊断却回到
+       "等待系统面板选择内容"，浏览器那边也被 screen:false 关了舞台。 */
+    private var epoch = 0
+    /// 这一轮是不是真的在推帧（给 ViewModel 做状态对账用）。
+    var isRunning: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return running && stream != nil
+    }
+
     /// 已经设过的输出画布。只在首帧与尺寸变化时重设：
     /// `adaptOutputFormat` 内部会重建适配器，能少调一次就少调一次。
     private var adaptedCanvas: (width: Int, height: Int)?
@@ -661,7 +688,16 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
             DispatchQueue.main.async { [weak self] in self?.start(source: source) }
             return
         }
-        guard !running else { return }
+        /* 重复点「共享屏幕」不再被 `guard !running` 静默吞掉。
+           以前第二次点共享时 running 还是 true，这里直接 return——
+           用户看到的就是"点了没反应"，面板不弹、状态也不变。
+           现在先静默收掉上一轮（不通知 ViewModel），再完整重来一次。 */
+        if running || stream != nil {
+            teardown(notifyState: false)
+        }
+        stateLock.lock()
+        epoch += 1
+        stateLock.unlock()
         self.source = source
         self.capturer = RTCVideoCapturer(delegate: source)
         frameCount = 0
@@ -726,7 +762,9 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         ScreenCaptureKitRuntime.note("active=\(setter)")
         ShareBreadcrumb.mark("sck:activated(\(setter))")
 
+        stateLock.lock()
         running = true
+        stateLock.unlock()
         notify(.picking)
 
         ShareBreadcrumb.mark("sck:presenting")
@@ -772,6 +810,13 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     }
 
     func stop() {
+        teardown(notifyState: true)
+    }
+
+    /// 收掉当前这一轮：停流、退观察者、关选择器。
+    /// `notifyState == false` 用于"重复点共享"时的静默重启——
+    /// 不能让中间那条 .stopped 把 ViewModel 的共享态打回去。
+    private func teardown(notifyState: Bool) {
         let runningStream: AnyObject?
         stateLock.lock()
         runningStream = stream
@@ -792,6 +837,14 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
                 }
             }
         }
+        picker = nil
+
+        guard notifyState else { return }
+        // 先占一个新票号，再把 .stopped 发出去：
+        // 此后任何排队的旧回调都对不上票，全部作废。
+        stateLock.lock()
+        epoch += 1
+        stateLock.unlock()
         notify(.stopped)
     }
 
@@ -992,7 +1045,12 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
 
     private func fail(_ message: String) {
         lastError = message
+        stateLock.lock()
         running = false
+        // 失败也占一个新票号：之后排队的旧回调一律作废，
+        // 否则一条迟到的 .running 会把已经降级的状态又点亮。
+        epoch += 1
+        stateLock.unlock()
         // 走到这里是一条完整的失败路径，不是崩溃——把现场清掉，
         // 免得下次启动被误判成"上次闪退"。
         ShareBreadcrumb.finish()
@@ -1000,12 +1058,27 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     }
 
     private func notify(_ state: ScreenSharingSessionState) {
-        if Thread.isMainThread {
-            onStateChange?(state)
-        } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.onStateChange?(state)
+        /* 票号在下发这一刻取，投递时再核对一次。
+           采集队列、SCK 回调、主队列延时块都可能晚到——
+           只要期间发生过 start/stop，票号就变了，这条事件自动作废。 */
+        stateLock.lock()
+        let token = epoch
+        stateLock.unlock()
+        let deliver = { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            let current = self.epoch
+            self.stateLock.unlock()
+            guard current == token else {
+                ScreenCaptureKitRuntime.note("丢弃过期状态事件 \(state.label)（轮次 \(token) ≠ \(current)）")
+                return
             }
+            self.onStateChange?(state)
+        }
+        if Thread.isMainThread {
+            deliver()
+        } else {
+            DispatchQueue.main.async(execute: deliver)
         }
     }
 }
@@ -1081,8 +1154,10 @@ extension ScreenCaptureKitSharer {
         let hasStream = stream != nil
         stateLock.unlock()
         guard !hasStream else { return }
-        running = false
-        notify(.stopped)
+        // 走统一收尾：退观察者、关选择器、占新票号。
+        // 以前只置 running = false 就发 .stopped，选择器还留在 active 状态，
+        // 下一次点共享时 present 会被系统当成"面板已存在"而不再弹出。
+        teardown(notifyState: true)
     }
 }
 
@@ -1224,7 +1299,9 @@ extension ScreenCaptureKitSharer {
         guard isCurrent else { return }
 
         lastError = (error as? NSError)?.localizedDescription
-        ShareBreadcrumb.finish()
-        notify(.stopped)
+        /* 统一收尾：这里以前只发一条 .stopped，选择器仍停在 active。
+           用户下次点共享时 present 会被系统当作"面板已存在"而不弹，
+           真机表现就是"第二次点共享没反应"。 */
+        teardown(notifyState: true)
     }
 }
