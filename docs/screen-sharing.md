@@ -1,5 +1,26 @@
 # 屏幕共享：跨进程设计说明
 
+> **2026-11 起：iOS 27 上本文描述的广播扩展路径已经失效。**
+>
+> Apple 在 iOS 27 SDK 里把 `RPBroadcastSampleHandler` 标成
+> `API_DEPRECATED("No longer supported", ios(10.0, 27.0))`，
+> `RPSystemBroadcastPickerView` 标成 "Use ScreenCaptureKit `SCContentSharingPicker` instead"。
+> 真机表现：系统弹出共享卡片（"天穹会议 00:04" + 转圈），但**永远不创建扩展进程**，
+> 诊断里就是"扩展进程：本次未启动 / 心跳无 / 0 帧"。
+>
+> 现在代码里是三条路径，按系统版本与构建 SDK 自动选：
+>
+> | 路径 | 生效条件 | 能共享什么 | 需要 App Group |
+> |---|---|---|---|
+> | `ScreenCaptureKitSharer` | iOS 27+ 且构建机有 iOS 27 SDK | 整个屏幕 / 单个 App | 否 |
+> | `InAppScreenCapturer` | iOS 27+ 但构建机只有 Xcode 26（`macos-15` / `macos-26` 镜像都是） | 仅本 App 的画面，切走即暂停 | 否 |
+> | 广播扩展（本文） | iOS 26 及以下 | 整个屏幕，切 App 不断 | 是 |
+>
+> 前两条实现在 `MeetingKit/Core/ScreenCaptureKitSharer.swift` 与
+> `MeetingKit/Core/InAppScreenCapturer.swift`，用 `ScreenSharingSession` 协议隔离；
+> 构建机没有 `ScreenCaptureKit` 模块时，SCK 那段整段不参与编译。
+> 下文只描述第三条。
+
 这份文档只讲一件事——**主 App 与 Broadcast Upload Extension 之间那条链路为什么这样设计**。
 UI 部分看代码即可，但这条链路如果改错，表现是"偶发不生效"，很难查。
 

@@ -100,7 +100,7 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let timeStampNs = Int64(CMTimeGetSeconds(timestamp) * 1_000_000_000)
         let buffer = RTCCVPixelBuffer(pixelBuffer: pixelBuffer)
-        let frame = RTCVideoFrame(buffer: buffer, rotation: .deg0, timeStampNs: timeStampNs)
+        let frame = RTCVideoFrame(buffer: buffer, rotation: ._0, timeStampNs: timeStampNs)
         source.capturer(capturer, didCapture: frame)
 
         frameCount += 1
