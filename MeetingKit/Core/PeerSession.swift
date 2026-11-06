@@ -271,7 +271,9 @@ final class PeerSession: NSObject {
            状态都作用在这个包装上，帧却推给了没有 VideoSendStream 的底层
            sender——真机上就是"轨开着、SDP sendonly、编码 0 帧"。
            返回值就是这条轨自己的 sender，不存在查错的余地。 */
-        let newSender = peerConnection.add(track, streamIds: ["screen-\(peerID)"])
+        guard let newSender = peerConnection.add(track, streamIds: ["screen-\(peerID)"]) else {
+            return
+        }
         screenSender = newSender
         screenTransceiver = peerConnection.transceivers.first { $0.sender.senderId == newSender.senderId }
         _ = screenTransceiver?.setDirection(.sendOnly, error: nil)
