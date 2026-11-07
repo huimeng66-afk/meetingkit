@@ -55,6 +55,8 @@ final class RealRTCClient: NSObject, RTCClient {
     private var screenStateHeartbeat: Timer?
     /// 被服务端回显误判、真的回了 off 的次数（诊断用）。
     private var screenFalseCorrections = 0
+    /// 延迟 3 秒的 off 复核；期间开始推流就作废。
+    private var screenFalseCorrectionWork: DispatchWorkItem?
     /// 服务端是否已经确认共享位在我身上（收到过自己的 screen:state on）。
     ///
     /// 只用于区分 `screen:busy` 是回声还是真冲突：没被确认过的 busy
@@ -900,6 +902,10 @@ final class RealRTCClient: NSObject, RTCClient {
     }
 
     func stopScreenShare() {
+        /* 停止时取消还没执行的 off 复核：那是上一轮的事，
+           留到下一轮开始后触发会把新共享拆掉。 */
+        screenFalseCorrectionWork?.cancel()
+        screenFalseCorrectionWork = nil
         /* 这里**不能用 isJoined 当门**。
            结束会议的路径是「停共享 → 立刻离会」，等 SCK 的 .stopped 回调回来时
            isJoined 已经是 false 了，这条屏幕共享结束广播会被整条吞掉。
@@ -947,6 +953,10 @@ final class RealRTCClient: NSObject, RTCClient {
 
         isScreenSharing = true
         lastScreenShareStartAt = Date()
+        /* 这三条路径都能把共享拉起来，请求时刻必须每条都刷新：
+           只在 startScreenShare() 里记一次的话，走 bridge 直连的场次
+           会带着 .distantPast 进来，20 秒保护整条失效，回显一到就回 off。 */
+        screenStartRequestedAt = Date()
         /* 新一轮共享从"未确认"开始：服务端还没认这个位。 */
         screenStateConfirmed = false
 
@@ -1008,6 +1018,7 @@ final class RealRTCClient: NSObject, RTCClient {
         isScreenSharing = true
         track.isEnabled = true
         lastScreenShareStartAt = Date()
+        screenStartRequestedAt = Date()
         screenStateConfirmed = false
         lastScreenShareStopAt = .distantPast
         zeroEncodeStreak = 0
@@ -1486,6 +1497,7 @@ final class RealRTCClient: NSObject, RTCClient {
             guard guardReviveCount < 2 else { return }
             guardReviveCount += 1
             isScreenSharing = true
+            screenStartRequestedAt = Date()
             if let track = localScreenTrack {
                 for peer in remotePeers.values {
                     peer.session.attachScreenTrack(track)
@@ -2868,10 +2880,21 @@ extension RealRTCClient: TianqiongSignalingDelegate {
                    screen:false，服务端据此清空共享位并向全场广播 off——
                    共享者自己把舞台拆了。 */
                 if Date().timeIntervalSince(screenStartRequestedAt) < 20 { return }
-                screenFalseCorrections += 1
-                signaling.sendMediaState(audio: nil, video: nil, screen: false)
+                /* 回显到达时 isScreenSharing 常常还是 false：SCK 起播、
+                   bridge 握手都比一条 socket 消息慢。直接回 off 会让服务端
+                   清空共享位并向全场广播 off，等于自己把舞台拆了。
+                   延迟 3 秒复核，这期间真的开始推流就当作时序抖动放掉。 */
+                screenFalseCorrectionWork?.cancel()
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self, !self.isScreenSharing else { return }
+                    self.screenFalseCorrections += 1
+                    self.signaling?.sendMediaState(audio: nil, video: nil, screen: false)
+                }
+                screenFalseCorrectionWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
                 return
             }
+            screenFalseCorrectionWork?.cancel()
             /* 服务端**确认**共享位在我身上了。
                这个标志只有一个用途：区分 screen:busy 是"回声"还是"真冲突"。
                之前用"共享超过 2 秒"当回声判据，结果把真正的冲突也吞了：
