@@ -114,6 +114,7 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 编解码器和线程池，重复创建会让音频设备在"上一场会的旧实例"和
     /// "这一场的新实例"之间来回切，真机上表现为第一场正常、第二场没声。
     /// Jitsi 也是全局单例（`RTCPeerConnectionFactory` 只初始化一次）。
+    /// 全局唯一的 PeerConnectionFactory。
     private static let sharedFactory = RTCPeerConnectionFactory()
 
     private var localAudioTrack: RTCAudioTrack?
@@ -274,6 +275,12 @@ final class RealRTCClient: NSObject, RTCClient {
     ]
     /// 已经降到第几档。等于 ladder.count 表示降无可降。
     private var screenCanvasStage = 0
+    /// 上一次降档的时刻。降档是"保命刀"，不能每 2 秒砍一刀：
+    /// 编码器重配本身要 1~2 秒，砍太密会让它一直在重建、永远出不了首帧。
+    private var lastCanvasDowngradeAt = Date.distantPast
+    /// 上行连续健康的采样次数，用来把降级走过的画布升回去。
+    /// 没有它就会出现"开局抖一下，整场共享都是 320x240"。
+    private var healthyUplinkStreak = 0
     /// 本轮共享是否已经做过"轨脉冲"（关 0.2 秒再开）。
     /// 编码器如果因为错过关键帧/首帧尺寸变更卡死，脉冲能逼它重建输入；
     /// 一轮只做一次，避免正常链路上出现无谓的闪断。
@@ -307,6 +314,22 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 音频会话恢复失败后的重试节流。失败时（例如正在通话中）每 0.6 秒
     /// 重试一次会白白耗电，2 秒一次足够。
     private var lastAudioRecoveryAt = Date.distantPast
+
+    /// 音频上行看门狗。
+    ///
+    /// 真机现场："本地麦克风 开启/live · 权限已授权 · 音频会话 active=true
+    /// enabled=true"，但 `outbound-rtp audio packetsSent` 恒为 0 ——
+    /// 会话状态每个字段都对，audio unit 其实没跑，采集一帧都没有。
+    /// 这种状态不会自愈：`isEnabled` 是 true、`RTCAudioSession.isActive`
+    /// 也是 true，所有"看起来该重连"的条件都不成立。
+    /// 唯一可靠的判据是**实际发出去的 RTP 包数**。
+    private var audioUplinkTimer: DispatchSourceTimer?
+    /// 上一轮采样到的音频包总数（所有 peer 求和）。
+    private var lastAudioPackets = 0
+    /// 连续多少次采样包数没有增长。
+    private var audioSilentStreak = 0
+    /// 已经因为"完全没声音"重建过几次轨，用于限制重建频率。
+    private var audioRebuildCount = 0
 
     /// join 是否已经走完（防止重复 join）。
     private var hasCompletedJoin = false
@@ -405,6 +428,7 @@ final class RealRTCClient: NSObject, RTCClient {
         reactivateAudioSession()
         syncTeardownBox()
         startAudioLevelPolling()
+        startAudioUplinkWatchdog()
         startLifecycleObservers()
     }
 
@@ -645,6 +669,7 @@ final class RealRTCClient: NSObject, RTCClient {
         }
         isJoined = false
         stopAudioLevelPolling()
+        stopAudioUplinkWatchdog()
         hasCompletedJoin = false
         options = nil
         // 先告诉服务端"主动离开"（释放位置，不等断线宽限），
@@ -1467,16 +1492,23 @@ final class RealRTCClient: NSObject, RTCClient {
 
         guard snapshot.packets == 0 else {
             zeroEncodeStreak = 0
+            recoverCanvasIfHealthy()
             return
         }
 
-        /* 冷启动窗口一过还是 0 包 0 帧，就立刻换一档更小的画布。
+        /* 冷启动窗口一过还是 0 包 0 帧，就换一档更小的画布。
            旧逻辑要等"连续 3 次采样"（≈6 秒）才动第一刀，加上 8 秒门槛，
            用户要盯着黑屏 14 秒才等到第一次自救——那时他早就退出了。
-           降级只影响这一轮共享，停共享会复位（见 endScreenFramePush）。 */
-        if snapshot.encoded == 0, screenCanvasStage < Self.screenCanvasLadder.count {
+           降级只影响这一轮共享，停共享会复位（见 endScreenFramePush）。
+           两刀之间至少隔 6 秒：编码器每重配一次都要 1~2 秒才出首帧，
+           砍太密等于让它一直在重启。 */
+        if snapshot.encoded == 0,
+           screenCanvasStage < Self.screenCanvasLadder.count,
+           Date().timeIntervalSince(lastCanvasDowngradeAt) >= 6 {
             let step = Self.screenCanvasLadder[screenCanvasStage]
             screenCanvasStage += 1
+            lastCanvasDowngradeAt = Date()
+            healthyUplinkStreak = 0
             ScreenShareRuntime.forceCanvas(width: step.width, height: step.height)
             ScreenShareRuntime.note(
                 "上行守护：编码器 0 帧，画布降到 \(step.width)x\(step.height) 重建编码器"
@@ -1608,6 +1640,32 @@ final class RealRTCClient: NSObject, RTCClient {
         videoUplinkMonitor?.cancel()
         videoUplinkMonitor = nil
         zeroEncodeStreak = 0
+        healthyUplinkStreak = 0
+    }
+
+    /// 上行恢复后把降级走过的画布阶梯撤回来。
+    ///
+    /// 降级是保命：0 包时先把画布砍小，换编码器出帧。但以前出包之后
+    /// **没有任何回升路径**——共享第一秒只要抖一下，阶梯就一路走到
+    /// 320x240，整场共享都是糊的。用户的原话就是"能看见，但是很糊"。
+    /// 这里每连续 3 次采样（约 6 秒）有包，就把画布升回一档。
+    private func recoverCanvasIfHealthy() {
+        guard screenCanvasStage > 0 else {
+            healthyUplinkStreak = 0
+            return
+        }
+        healthyUplinkStreak += 1
+        guard healthyUplinkStreak >= 3 else { return }
+        healthyUplinkStreak = 0
+        screenCanvasStage -= 1
+        if screenCanvasStage == 0 {
+            ScreenShareRuntime.clearForcedCanvas()
+            ScreenShareRuntime.note("上行守护：上行已恢复，画布回到默认档")
+        } else {
+            let step = Self.screenCanvasLadder[screenCanvasStage - 1]
+            ScreenShareRuntime.forceCanvas(width: step.width, height: step.height)
+            ScreenShareRuntime.note("上行守护：上行已恢复，画布回升到 \(step.width)x\(step.height)")
+        }
     }
 
     /// 按当前人数重新分配共享上行码率。
@@ -2056,6 +2114,127 @@ final class RealRTCClient: NSObject, RTCClient {
         audioLevelTimer?.invalidate()
         audioLevelTimer = nil
         delegate?.rtcDidUpdateLocalAudioLevel(0)
+    }
+
+    // MARK: - 音频上行看门狗
+
+    /// 每 3 秒数一次"真正发出去的音频包"。
+    ///
+    /// 只判 `isEnabled` / `isActive` 会被假绿灯骗过去：现场那台机器的每个
+    /// 状态位都是对的，包数却是 0。所以这里只认 `packetsSent`。
+    private func startAudioUplinkWatchdog() {
+        audioUplinkTimer?.cancel()
+        audioUplinkTimer = nil
+        lastAudioPackets = 0
+        audioSilentStreak = 0
+        audioRebuildCount = 0
+
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 4, repeating: 3.0, leeway: .milliseconds(250))
+        timer.setEventHandler { [weak self] in
+            Task { @MainActor in self?.tickAudioUplinkWatchdog() }
+        }
+        audioUplinkTimer = timer
+        timer.resume()
+    }
+
+    private func stopAudioUplinkWatchdog() {
+        audioUplinkTimer?.cancel()
+        audioUplinkTimer = nil
+    }
+
+    private func tickAudioUplinkWatchdog() {
+        guard isJoined, let track = localAudioTrack, track.isEnabled else {
+            audioSilentStreak = 0
+            return
+        }
+        let peers = Array(remotePeers.values)
+        guard !peers.isEmpty else { return }
+
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var total = 0
+        for peer in peers {
+            group.enter()
+            peer.session.peerConnection.statistics { report in
+                var sent = 0
+                for (_, st) in report.statistics where st.type == "outbound-rtp" {
+                    guard (st.values["kind"] as? String) == "audio" else { continue }
+                    sent += (st.values["packetsSent"] as? NSNumber)?.intValue ?? 0
+                }
+                lock.lock(); total += sent; lock.unlock()
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { [weak self] in
+            self?.handleAudioUplinkSample(total, peers: peers.count)
+        }
+    }
+
+    private func handleAudioUplinkSample(_ total: Int, peers: Int) {
+        guard isJoined, localAudioTrack?.isEnabled == true else { return }
+
+        /* 计数变小只可能是"重建了 peer / 新一轮会话"：把它当成新基线，
+           否则下一次采样会被误判成"没有增长"。 */
+        if total < lastAudioPackets {
+            lastAudioPackets = total
+            audioSilentStreak = 0
+            return
+        }
+        let previous = lastAudioPackets
+        lastAudioPackets = total
+        if previous == 0 { return }   // 首轮采样只建基线
+        if total > previous {
+            if audioSilentStreak > 0 {
+                ScreenShareRuntime.note("音频守护：音频包恢复增长（\(peers) 条连接）")
+            }
+            audioSilentStreak = 0
+            audioRebuildCount = 0
+            return
+        }
+
+        audioSilentStreak += 1
+        /* 3 秒一次：第 2 次 = 6 秒完全没发包。正常人说话不可能 6 秒
+           一个包都没有（Opus 即使静音也有 DTX 包），这一定是采集断了。 */
+        guard audioSilentStreak >= 2 else { return }
+
+        if audioSilentStreak == 2 {
+            /* 只把 isAudioEnabled 设成 true 是空操作（它本来就是 true）。
+               先 false 再 true 才会让 WebRTC 真正 stop + start 一次
+               audio unit —— 这是唯一能让"会话全绿但采集不跑"重启的开关。 */
+            let session = RTCAudioSession.sharedInstance()
+            session.lockForConfiguration()
+            session.isAudioEnabled = false
+            session.isAudioEnabled = true
+            session.unlockForConfiguration()
+            reactivateAudioSession(force: true)
+            ScreenShareRuntime.note("音频守护：6 秒没有发出音频包，已重启音频单元并强制重激活会话")
+            return
+        }
+
+        /* 第 4 次 = 12 秒仍无包：会话重激活不解决问题，说明 audio unit
+           本身起不来。重建一条全新的音频轨能逼 WebRTC 重建 audio unit。 */
+        if audioSilentStreak == 4, audioRebuildCount < 2 {
+            guard let rebuilt = rebuildAudioTrack() else { return }
+            rebuilt.isEnabled = true
+            audioRebuildCount += 1
+            for peer in remotePeers.values {
+                peer.session.replaceAudioTrack(with: rebuilt)
+            }
+            setMicEnabled(true)
+            ScreenShareRuntime.note("音频守护：重激活无效，已重建麦克风轨并重挂 \(remotePeers.count) 条连接")
+            return
+        }
+
+        /* 第 7 次 = 21 秒仍无包：sender 层面也拆了重来。 */
+        if audioSilentStreak >= 7, let track = localAudioTrack, audioRebuildCount < 4 {
+            audioRebuildCount += 1
+            for peer in remotePeers.values {
+                peer.session.forceReattachAudio(track)
+            }
+            ScreenShareRuntime.note("音频守护：仍无音频包，已拆掉音频 sender 重新 addTrack")
+            audioSilentStreak = 0
+        }
     }
 
     private func pollLocalAudioLevel() {

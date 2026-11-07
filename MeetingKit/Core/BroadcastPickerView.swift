@@ -50,6 +50,16 @@ enum BroadcastPickerPresenter {
     /// - Returns: 找到了并已触发返回 true；找不到（例如阶段 2 忘了挂载 picker）返回 false。
     @discardableResult
     static func present() -> Bool {
+        /* 广播扩展**不要**麦克风。
+           
+           系统面板里的那个麦克风开关，采到的是扩展进程的音频，
+           和主 App 的 WebRTC audio unit 抢同一个输入设备：扩展一旦拿到麦，
+           主 App 的 `outbound-rtp audio packetsSent` 会直接停在 0，
+           会话状态却是 `isActive=true / isAudioEnabled=true` 全绿——
+           现场就是"共享起来了，但全场听不见我说话"。
+           语音由主 App 的 audioTrack 走 RTP，扩展只负责画面。 */
+        RPScreenRecorder.shared().isMicrophoneEnabled = false
+
         guard let picker = findPickerInAllWindows() else { return false }
         guard let control = findControl(in: picker) else { return false }
 
