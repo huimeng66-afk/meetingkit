@@ -163,7 +163,7 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
     @ViewBuilder
     private func glassBody(_ content: Content) -> some View {
         #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
+        if #available(iOS 26.0, *), usesBlur {
             nativeGlass(content)
         } else {
             compatGlass(content)
@@ -312,7 +312,7 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
         }
         switch variant {
         case .regular:
-            return colorScheme == .dark ? Color.black.opacity(0.16) : Color.white.opacity(0.50)
+            return colorScheme == .dark ? Theme.Palette.surface.opacity(0.84) : Color.white.opacity(0.82)
         case .clear:
             return colorScheme == .dark ? Color.black.opacity(0.05) : Color.white.opacity(0.26)
         case .tinted(let color):
@@ -337,9 +337,9 @@ struct LiquidGlassModifier<S: Shape>: ViewModifier {
     private var strokeStyle: LinearGradient {
         let isDark = colorScheme == .dark
         let boost: Double = reduceTransparency ? 0.15 : 0.0
-        let top = min((isDark ? 0.55 : 0.85) + boost, 1.0)
-        let mid = isDark ? 0.06 : 0.18
-        let bottom = min((isDark ? 0.28 : 0.45) + boost, 1.0)
+        let top = min((isDark ? 0.18 : 0.65) + boost, 1.0)
+        let mid = isDark ? 0.08 : 0.16
+        let bottom = min((isDark ? 0.12 : 0.30) + boost, 1.0)
 
         return LinearGradient(
             stops: [

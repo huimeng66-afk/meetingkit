@@ -39,8 +39,11 @@ struct LiquidPressStyle: ButtonStyle {
     /// 按下高光的强度。0 表示只要缩放（列表行这类大面积的元素用）。
     var highlight: Double = 1
 
+    @Environment(\.isEnabled) private var isEnabled
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
+            .opacity(isEnabled ? 1 : 0.5)
             .scaleEffect(configuration.isPressed ? GlassMotion.scale(pressedScale) : 1)
             .overlay(
                 LensBloom(

@@ -456,7 +456,10 @@ final class RealRTCClient: NSObject, RTCClient {
             object: nil,
             queue: main
         ) { [weak self] _ in
-            Task { @MainActor in self?.reactivateAudioSession() }
+            Task { @MainActor in
+                guard let self, self.isJoined else { return }
+                self.reactivateAudioSession()
+            }
         })
     }
 
@@ -468,6 +471,7 @@ final class RealRTCClient: NSObject, RTCClient {
     }
 
     private func handleEnterBackground() {
+        guard isJoined else { return }
         // 本 App 声明了 audio 后台模式：只要音频单元还在跑，进程就不会被冻住，
         // Socket.IO 的心跳也就能继续发。这一步是"后台保活"的地基。
         reactivateAudioSession()
@@ -481,6 +485,7 @@ final class RealRTCClient: NSObject, RTCClient {
     }
 
     private func handleEnterForeground() {
+        guard isJoined else { return }
         endBackgroundTask()
         reactivateAudioSession()
 
@@ -494,6 +499,7 @@ final class RealRTCClient: NSObject, RTCClient {
     }
 
     private func handleAudioInterruptionEnded(rawType: UInt?) {
+        guard isJoined else { return }
         guard
             let raw = rawType,
             let type = AVAudioSession.InterruptionType(rawValue: raw),

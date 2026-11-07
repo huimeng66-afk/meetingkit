@@ -353,6 +353,7 @@ struct PreJoinView: View {
 
                 ZStack(alignment: .leading) {
                     TextField("", text: $numberText)
+                        .accessibilityLabel("会议号")
                         .font(.system(size: 15))
                         .foregroundColor(Theme.Palette.ink)
                         .accentColor(Theme.Palette.accent)
@@ -380,10 +381,10 @@ struct PreJoinView: View {
                     }
                 }
                 .padding(.horizontal, 16)
-                .frame(height: 50)
+                .frame(minHeight: 50)
                 .background(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.white.opacity(0.06))
+                        .fill(Theme.Palette.surfaceSubtle)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -398,6 +399,7 @@ struct PreJoinView: View {
 
                 ZStack(alignment: .leading) {
                     TextField("", text: $displayName)
+                        .accessibilityLabel("你的名称")
                         .font(.system(size: 15))
                         .foregroundColor(Theme.Palette.ink)
                         .accentColor(Theme.Palette.accent)
@@ -416,10 +418,10 @@ struct PreJoinView: View {
                     }
                 }
                 .padding(.horizontal, 16)
-                .frame(height: 50)
+                .frame(minHeight: 50)
                 .background(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.white.opacity(0.06))
+                        .fill(Theme.Palette.surfaceSubtle)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -440,10 +442,10 @@ struct PreJoinView: View {
                         .accentColor(Theme.Palette.accent)
                         .keyboardType(.asciiCapable)
                         .padding(.horizontal, 16)
-                        .frame(height: 50)
+                        .frame(minHeight: 50)
                         .background(
                             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .fill(Color.white.opacity(0.06))
+                                .fill(Theme.Palette.surfaceSubtle)
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -490,7 +492,7 @@ struct PreJoinView: View {
                     .foregroundColor(.white)
             }
             .frame(maxWidth: .infinity)
-            .frame(height: 52)
+            .frame(minHeight: 52)
             .background(
                 RoundedRectangle(cornerRadius: Theme.Metrics.buttonRadius, style: .continuous)
                     .fill(Theme.Palette.brandGradient)
@@ -516,7 +518,7 @@ struct PreJoinView: View {
                 .frame(height: 44)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .disabled(isJoining)
         .accessibilityLabel("发起新会议")
     }

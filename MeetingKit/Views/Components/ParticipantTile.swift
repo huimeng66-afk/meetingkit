@@ -50,9 +50,12 @@ struct ParticipantTile: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         .overlay(borderOverlay)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(displayName)
+        .accessibilityValue("\(user.isMicOn ? "麦克风已开启" : "已静音")，\(user.isCameraOn ? "摄像头已开启" : "摄像头已关闭")\(isActiveSpeaker ? "，正在发言" : "")\(user.isHandRaised ? "，已举手" : "")\(showsSharingBadge ? "，正在共享" : "")")
         .shadow(
-            color: isActiveSpeaker ? speakerHighlight.opacity(0.45) : Color.clear,
-            radius: isActiveSpeaker ? 10 : 0,
+            color: isActiveSpeaker ? speakerHighlight.opacity(0.18) : Color.clear,
+            radius: isActiveSpeaker ? 4 : 0,
             x: 0,
             y: 0
         )
@@ -108,7 +111,7 @@ struct ParticipantTile: View {
 
             Text(displayName)
                 .font(.system(size: 11.5, weight: .semibold))
-                .foregroundColor(Theme.Palette.textPrimary)
+                .foregroundColor(.white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
 

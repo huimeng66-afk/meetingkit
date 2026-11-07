@@ -196,7 +196,7 @@ struct EnterpriseView: View {
             .frame(width: 44, height: 44)
             .contentShape(Circle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .liquidGlass(.clear, cornerStyle: .circle, isInteractive: true, castsShadow: false)
         .disabled(refreshDisabled)
         .opacity(refreshDisabled ? 0.4 : 1.0)
@@ -293,10 +293,10 @@ struct EnterpriseView: View {
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundColor(Theme.Palette.ink)
                     .frame(maxWidth: .infinity)
-                    .frame(height: 48)
+                    .frame(minHeight: 48)
                     .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .liquidGlass(
                 .tinted(Theme.Palette.accent),
                 cornerStyle: .continuous(14),
@@ -380,7 +380,7 @@ struct EnterpriseView: View {
                     .frame(height: 44)
                     .contentShape(Capsule())
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .liquidGlass(.regular, cornerStyle: .capsule, isInteractive: true, castsShadow: false)
             .accessibilityLabel("重试")
         }
@@ -620,10 +620,10 @@ struct EnterpriseView: View {
             }
             .foregroundColor(Theme.Palette.ink)
             .frame(maxWidth: .infinity)
-            .frame(height: 50)
+            .frame(minHeight: 50)
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .liquidGlass(
             .tinted(Theme.Palette.accent),
             cornerStyle: .continuous(14),
@@ -703,7 +703,7 @@ struct EnterpriseView: View {
             .frame(height: 44)
             .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .liquidGlass(
             .regular,
             cornerStyle: .continuous(12),

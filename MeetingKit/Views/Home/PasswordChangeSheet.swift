@@ -90,11 +90,11 @@ struct PasswordChangeSheet: View {
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(Theme.Palette.ink2)
                         .frame(width: 30, height: 30)
-                        .background(Circle().fill(Color.white.opacity(0.08)))
+                        .background(Circle().fill(Theme.Palette.surfaceSubtle))
                         .frame(width: 44, height: 44)
                         .contentShape(Circle())
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                 .accessibilityLabel("关闭")
             }
             .padding(.horizontal, 18)
@@ -157,7 +157,7 @@ struct PasswordChangeSheet: View {
                             .foregroundColor(.white)
                     }
                     .frame(maxWidth: .infinity)
-                    .frame(height: 50)
+                    .frame(minHeight: 50)
                     .background(
                         RoundedRectangle(cornerRadius: 14, style: .continuous)
                             .fill(Theme.Palette.accent)
@@ -216,7 +216,7 @@ struct PasswordChangeSheet: View {
                             .frame(width: 40, height: 40)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(PlainButtonStyle())
+                    .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                     .accessibilityLabel(showsPassword ? "隐藏新密码" : "显示新密码")
                 }
             }
@@ -225,7 +225,7 @@ struct PasswordChangeSheet: View {
             .frame(height: 46)
             .background(
                 RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
+                    .fill(Theme.Palette.surfaceSubtle)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 11, style: .continuous)

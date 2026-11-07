@@ -216,7 +216,7 @@ struct SettingsView: View {
                     .frame(minWidth: 44, minHeight: 44)
                     .contentShape(Rectangle())
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .accessibilityLabel("编辑个人资料")
         }
         .padding(.horizontal, 14)
@@ -236,10 +236,10 @@ struct SettingsView: View {
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 14)
-            .frame(height: 48)
+            .frame(minHeight: 48)
             .contentShape(Rectangle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .accessibilityLabel("退出登录")
     }
 
@@ -287,7 +287,7 @@ struct SettingsView: View {
                     .frame(minHeight: 44)
                     .contentShape(Rectangle())
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .accessibilityLabel("登录")
         }
         .padding(.horizontal, 14)
@@ -652,7 +652,7 @@ struct SettingsView: View {
                 .frame(height: 44)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .padding(.top, 2)
         .accessibilityLabel("恢复默认设置")
     }
@@ -706,7 +706,7 @@ struct SettingsView: View {
     private func iconBlock(_ symbol: String) -> some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.white.opacity(0.06))
+                .fill(Theme.Palette.surfaceSubtle)
 
             Image(systemName: symbol)
                 .font(.system(size: 14, weight: .medium))
@@ -793,7 +793,7 @@ struct SettingsView: View {
             .frame(minHeight: 58)
             .contentShape(Rectangle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .accessibilityLabel(title)
         .accessibilityValue(trailingText ?? subtitle)
     }
@@ -837,7 +837,7 @@ struct SettingsView: View {
             .frame(minHeight: 58)
             .contentShape(Rectangle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .disabled(!enabled)
         .opacity(enabled ? 1.0 : 0.4)
         .accessibilityLabel(title)
@@ -897,10 +897,10 @@ struct SettingsView: View {
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundColor(Theme.Palette.accent)
                         .frame(maxWidth: .infinity)
-                        .frame(height: 48)
+                        .frame(minHeight: 48)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                 .accessibilityLabel("关闭\(kind.title)")
             }
             .frame(maxWidth: 340)

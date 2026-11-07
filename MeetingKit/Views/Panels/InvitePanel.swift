@@ -108,7 +108,7 @@ struct InvitePanel: View {
                 .frame(height: 30)
                 .liquidGlass(.clear, cornerStyle: .capsule, isInteractive: true)
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .accessibilityLabel("复制会议号")
         }
     }
@@ -193,7 +193,7 @@ struct InvitePanel: View {
             .frame(height: 44)
             .background(
                 RoundedRectangle(cornerRadius: Theme.Metrics.buttonRadius, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
+                    .fill(Theme.Palette.surfaceSubtle)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: Theme.Metrics.buttonRadius, style: .continuous)

@@ -99,7 +99,7 @@ struct LoginView: View {
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundColor(Theme.Palette.ink)
                     .frame(width: 36, height: 36)
-                    .background(Circle().fill(Color.white.opacity(0.08)))
+                    .background(Circle().fill(Theme.Palette.surfaceSubtle))
                     .overlay(Circle().stroke(Theme.Palette.glassStroke, lineWidth: 1))
                     .contentShape(Circle())
             }
@@ -184,6 +184,8 @@ struct LoginView: View {
                     .foregroundColor(Theme.Palette.ink3)
 
                 TextField("手机号或邮箱", text: $account)
+                    .accessibilityLabel("手机号或邮箱")
+                    .textContentType(.username)
                     .font(.system(size: 15))
                     .foregroundColor(Theme.Palette.ink)
                     .accentColor(Theme.Palette.accent)
@@ -192,10 +194,10 @@ struct LoginView: View {
                     .disableAutocorrection(true)
                     .textContentType(.username)
                     .padding(.horizontal, 16)
-                    .frame(height: 50)
+                    .frame(minHeight: 50)
                     .background(
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(Color.white.opacity(0.06))
+                            .fill(Theme.Palette.surfaceSubtle)
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -214,6 +216,8 @@ struct LoginView: View {
                             TextField("请输入密码", text: $password)
                         } else {
                             SecureField("请输入密码", text: $password)
+                                .accessibilityLabel("密码")
+                                .textContentType(.password)
                         }
                     }
                     .font(.system(size: 15))
@@ -233,15 +237,15 @@ struct LoginView: View {
                             .frame(width: 44, height: 44)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(PlainButtonStyle())
+                    .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                     .accessibilityLabel(showsPassword ? "隐藏密码" : "显示密码")
                 }
                 .padding(.leading, 16)
                 .padding(.trailing, 2)
-                .frame(height: 50)
+                .frame(minHeight: 50)
                 .background(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.white.opacity(0.06))
+                        .fill(Theme.Palette.surfaceSubtle)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -293,7 +297,7 @@ struct LoginView: View {
                     .foregroundColor(.white)
             }
             .frame(maxWidth: .infinity)
-            .frame(height: 52)
+            .frame(minHeight: 52)
             .background(
                 RoundedRectangle(cornerRadius: Theme.Metrics.buttonRadius, style: .continuous)
                     .fill(Theme.Palette.brandGradient)
@@ -334,7 +338,7 @@ struct LoginView: View {
             .frame(height: 40)
             .contentShape(Rectangle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .accessibilityLabel("还没有账号，去网页端注册")
     }
 

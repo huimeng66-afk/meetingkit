@@ -215,7 +215,7 @@ struct VideoCanvasView: View {
                                 )
                         )
                     }
-                    .buttonStyle(PlainButtonStyle())
+                    .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                     .accessibilityLabel("固定 \(user.name) 为主画面")
                 }
             }
@@ -296,7 +296,7 @@ struct VideoCanvasView: View {
                         )
                         .aspectRatio(CGFloat(3.0 / 4.0), contentMode: .fill)
                     }
-                    .buttonStyle(PlainButtonStyle())
+                    .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                     .accessibilityLabel("将 \(user.name) 设为主画面")
                 }
             }
@@ -369,7 +369,7 @@ struct VideoCanvasView: View {
                     .frame(height: 38)
                     .liquidGlass(.clear, cornerStyle: .capsule, isInteractive: true)
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                 .accessibilityLabel("复制会议邀请")
             }
             .padding(.horizontal, Theme.Metrics.space6)

@@ -173,8 +173,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         ScreenShareStore.state = .active
         // 暂停期间系统不一定继续回调采样；恢复的瞬间先补一次，
         // 否则主 App 可能在首个新采样到达之前就拿着旧心跳判死。
-        ScreenShareStore.touchHeartbeat(frames: currentFrameCount)
-        lastHeartbeatTime = CACurrentMediaTime()
+        publishHeartbeat()
         DarwinNotifier.post(ScreenShareSignal.stateChanged)
     }
 
@@ -254,16 +253,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
     /// 从 sample buffer 附件读取画面方向（RPVideoSampleOrientationKey）。
     private func orientation(of sampleBuffer: CMSampleBuffer) -> CGImagePropertyOrientation {
         guard
-            let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            let value = CMGetAttachment(
                 sampleBuffer,
-                createIfNecessary: false
-            ) as? [[CFString: Any]],
-            let first = attachments.first,
-            let rawValue = first[RPVideoSampleOrientationKey as CFString] as? UInt32
+                key: RPVideoSampleOrientationKey as CFString,
+                attachmentModeOut: nil
+            ) as? NSNumber
         else {
             return .up
         }
-        return CGImagePropertyOrientation(rawValue: rawValue) ?? .up
+        return CGImagePropertyOrientation(rawValue: value.uint32Value) ?? .up
     }
 
     /// 纠正方向、缩放到目标边长并发布 JPEG。只在 encodeQueue 上执行。
@@ -373,12 +371,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         )
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
-            self.stateLock.lock()
-            let isStopping = self.stopping
-            let frames = self.frameCount
-            self.stateLock.unlock()
-            guard !isStopping else { return }
-            ScreenShareStore.touchHeartbeat(frames: frames)
+            self.publishHeartbeat()
         }
         heartbeatTimer = timer
         timer.resume()
@@ -399,10 +392,16 @@ final class SampleHandler: RPBroadcastSampleHandler {
     /// 按 2 秒节流刷新心跳。与帧节流/编码重入全部解耦：
     /// 被 FrameInterval 或 isEncoding 丢掉的帧，同样算"进程还活着"。
     private func touchHeartbeatIfNeeded() {
-        let now = CACurrentMediaTime()
-        guard now - lastHeartbeatTime >= Self.heartbeatInterval else { return }
-        lastHeartbeatTime = now
-        ScreenShareStore.touchHeartbeat(frames: currentFrameCount)
+        // Independent timer owns heartbeat cadence; samples need not write state.
+    }
+
+    private func publishHeartbeat() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !stopping else { return }
+        // Keep this write within the same lock as markStopping: no late heartbeat
+        // can recreate a snapshot after reset during broadcast teardown.
+        ScreenShareStore.touchHeartbeat(frames: frameCount)
     }
 
     private func beginEncoding() -> Bool {

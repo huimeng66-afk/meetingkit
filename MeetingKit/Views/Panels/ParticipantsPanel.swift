@@ -95,7 +95,7 @@ struct ParticipantsPanel: View {
                 .frame(height: 30)
                 .liquidGlass(.clear, cornerStyle: .capsule, isInteractive: true)
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .accessibilityLabel("邀请参会人")
         }
         .padding(.horizontal, Theme.Metrics.horizontal)
@@ -133,7 +133,7 @@ struct ParticipantsPanel: View {
                 }
                 .contentShape(Rectangle())
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .padding(.horizontal, Theme.Metrics.horizontal)
             .accessibilityLabel(
                 selectedForRemoval.contains(user.id)
@@ -321,7 +321,7 @@ struct ParticipantsPanel: View {
             .foregroundColor(Theme.Palette.textSecondary)
             .frame(maxWidth: .infinity)
             .frame(height: 34)
-            .background(Capsule().fill(Color.white.opacity(0.06)))
+            .background(Capsule().fill(Theme.Palette.surfaceSubtle))
             .overlay(Capsule().stroke(Theme.Palette.glassStroke, lineWidth: 1))
             .contentShape(Capsule())
             .opacity(isEnabled ? 1.0 : 0.4)

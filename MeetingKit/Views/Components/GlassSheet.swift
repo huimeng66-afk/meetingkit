@@ -196,13 +196,13 @@ struct GlassSheet<Content: View>: View {
                 Image(systemName: "xmark")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(Theme.Palette.textSecondary)
-                    .frame(width: 30, height: 30)
+                    .frame(width: 44, height: 44)
                     .background(Circle().fill(Color.white.opacity(0.10)))
                     .contentShape(Circle())
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .padding(.trailing, 10)
-            .padding(.top, 8)
+            .padding(.top, 0)
             .accessibilityLabel("关闭")
         }
         .frame(maxWidth: .infinity)

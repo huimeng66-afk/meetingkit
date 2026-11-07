@@ -1,29 +1,8 @@
 #!/usr/bin/env bash
-#
-# sign-ipa.sh — 用一张开发证书给「未签名 IPA」签名，并保证广播扩展也拿到描述文件。
-#
-# ── 为什么不能直接 `zsign -m profile in.ipa` ──────────────────────────
-# zsign 只给**主 bundle** 写 embedded.mobileprovision，PlugIns/*.appex 不写。
-# 而本项目的跨进程共享链路是这么定位 App Group 的（见 Shared/AppGroupConfig.swift）：
-#   启动 → 读自己 bundle 里的 embedded.mobileprovision → 扫出 profile 授权的 group 名
-#        → 逐个 containerURL 实测 → 取第一个可用的
-# 主 App 有 profile，能扫到 `group.e2904eee920f2ee6.1`；
-# 扩展没有 profile，只剩工程里写死的 `group.com.tianqiong.meetingkit`，
-# 而这个名字证书并没授权 → containerURL 返回 nil → 扩展写帧写不进去。
-# 结果：用户点了共享、扩展确实在录，主 App 一帧都收不到，对端永远黑屏。
-#
-# 所以流程必须是：**先解包 → 把 profile 复制进 App 与每个 .appex → 再对 .app 目录签名**。
-# 顺序反了不行：签名后再往 bundle 里加文件会破坏 CodeResources 封印，安装直接失败。
-#
-# 用法：
-#   ./scripts/sign-ipa.sh \
-#       --ipa build/MeetingKit-unsigned.ipa \
-#       --p12 /path/cert.p12 --password 1 \
-#       --profile /path/profile.mobileprovision \
-#       --output build/MeetingKit-signed.ipa
-#
-# 依赖：zsign（https://github.com/zhlynn/zsign）、unzip、python3
-#
+# sign-ipa.sh — legacy single-main-bundle signing entry.
+# Extensions require independently audited profiles and a verified signing workflow.
+# This entry refuses extension IPAs; use audit-signing.py to review authorization.
+# No recursive zsign options are changed or assumed verified here.
 
 set -euo pipefail
 
@@ -73,19 +52,24 @@ APP_PATH="$(find "${WORK}/src/Payload" -maxdepth 1 -name '*.app' -type d | head 
 APP_NAME="$(basename "${APP_PATH}" .app)"
 echo "  主 App: ${APP_NAME}.app"
 
-# 1) 主 App + 每一个扩展都放同一份 profile
-cp "${PROFILE}" "${APP_PATH}/embedded.mobileprovision"
-echo "  ✓ ${APP_NAME}.app/embedded.mobileprovision"
-
-if [ -d "${APP_PATH}/PlugIns" ]; then
-    while IFS= read -r appex; do
-        [ -n "${appex}" ] || continue
-        cp "${PROFILE}" "${appex}/embedded.mobileprovision"
-        echo "  ✓ $(basename "${appex}")/embedded.mobileprovision"
-    done < <(find "${APP_PATH}/PlugIns" -maxdepth 1 -name '*.appex' -type d)
+# Fail closed: never distribute one profile to nested app/extension bundles.
+if find "${APP_PATH}" -mindepth 1 -type d \( -name '*.appex' -o -name '*.app' \) | grep -q .; then
+    echo "拒绝签名：内嵌 bundle 必须分别审计 profile；当前递归签名流程未经核验。" >&2
+    exit 1
 fi
+python3 - "${APP_PATH}" "${PROFILE}" "${WORK}/audit.json" "${PROJECT_ROOT}" <<'PY'
+import json, plistlib, sys
+from pathlib import Path
+app, profile, out, root = map(Path, sys.argv[1:])
+info = plistlib.loads((app / 'Info.plist').read_bytes())
+Path(out).write_text(json.dumps([dict(bundle_id=info['CFBundleIdentifier'],
+    profile=str(profile.resolve()), info=str(app / 'Info.plist'),
+    entitlements=str(root / 'MeetingKit/MeetingKit.entitlements'))]))
+PY
+python3 "${SCRIPT_DIR}/audit-signing.py" --manifest "${WORK}/audit.json"
+cp "${PROFILE}" "${APP_PATH}/embedded.mobileprovision"
 
-# 2) 对 .app 目录签名（zsign 会递归处理 Frameworks 与 PlugIns）
+# 2) Existing zsign invocation; recursive behavior is not validated by this script.
 echo "▸ 签名"
 "${ZSIGN}" \
     -k "${P12}" \
@@ -99,7 +83,8 @@ echo "▸ 签名"
 
 # 3) 校验：profile 是否双端都在、bundle id 是否被意外改写
 echo "▸ 校验产物"
-VERIFY="$(mktemp -d "${TMPDIR:-/tmp}/tqverify.XXXXXX")"
+VERIFY="${WORK}/verify"
+mkdir -p "${VERIFY}"
 unzip -q "${OUTPUT}" -d "${VERIFY}"
 
 python3 - "${VERIFY}" <<'PY'
