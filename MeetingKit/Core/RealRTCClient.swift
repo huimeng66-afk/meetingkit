@@ -2886,6 +2886,15 @@ extension RealRTCClient: TianqiongSignalingDelegate {
     }
 
     func signaling(_ signaling: TianqiongSignaling, screenBusy peerID: String) {
+        /* 共享期间每 6 秒重申一次 screen:true。服务端共享位如果正好处在
+           迁移窗口（旧 socket 还没清、新 socket 还没接），会对这条重申回一条
+           screen:busy —— 那是回声，不是真冲突。
+           已经稳定共享超过 2 秒就把它当回声忽略：否则一次心跳就能把自己
+           正在跑的共享掐断，用户看到的是"共享莫名其妙自己停了"。 */
+        if isScreenSharing, Date().timeIntervalSince(lastScreenShareStartAt) > 2 {
+            ScreenShareRuntime.note("共享位回声 busy，已忽略")
+            return
+        }
         // 别的参会者正在共享：停掉本地共享推流，提示由 VM 层转 toast。
         abortScreenShare(reason: "已有参会者正在共享屏幕，请稍后再试")
     }
