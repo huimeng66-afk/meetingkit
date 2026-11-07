@@ -249,8 +249,13 @@ final class MeetingViewModel: ObservableObject {
 
         if let session = nativeShareSession {
             let runningText = session.isRunning ? "运行中" : "已停止"
+            /* 停止之后轨一定是关的，这是正常收尾，不是故障。
+               以前这里照样打 ⚠️，用户每次停完共享再看诊断都会以为出了问题；
+               真正要看的编码器数字也全是上一轮的，于是"发送 0 包"被读成
+               "共享又坏了"。停止时明确标注，读数才不会被误判。 */
+            let trackText = session.isRunning ? screenTrackEnabledText : "关（正常，已停止）"
             lines.append(
-                "会话：\(runningText) · 已推 \(session.frameCount) 帧 · 共享轨 \(screenTrackEnabledText)"
+                "会话：\(runningText) · 已推 \(session.frameCount) 帧 · 共享轨 \(trackText)"
             )
         }
 
@@ -276,10 +281,13 @@ final class MeetingViewModel: ObservableObject {
 
         let video = ScreenShareRuntime.videoStats
         if video.sampled {
-            var videoLine = "RTC 视频：发送 \(video.packetsSent) 包 · 编码 \(video.framesEncoded) 帧 · "
-                + (video.screenAttached ? "共享轨已挂" : "共享轨未挂 ⚠️")
-                + " · 轨\(video.trackEnabled ? "开" : "关 ⚠️")"
-                + " · 共享m-line\(video.sendsUpstream ? "已进SDP" : "未进SDP ⚠️")"
+            /* 停止共享后这一整行都是上一轮的快照：轨已经关了、编码器自然归零，
+               再按"⚠️ 故障"去读会把正常收尾当成新问题。 */
+            let live = isScreenSharing
+            var videoLine = "RTC 视频" + (live ? "" : "（上一轮快照）") + "：发送 \(video.packetsSent) 包 · 编码 \(video.framesEncoded) 帧 · "
+                + (video.screenAttached ? "共享轨已挂" : (live ? "共享轨未挂 ⚠️" : "共享轨已摘"))
+                + " · 轨\(video.trackEnabled ? "开" : (live ? "关 ⚠️" : "关（已停止）"))"
+                + " · 共享m-line\(video.sendsUpstream ? "已进SDP" : "未进SDP")"
             /* 码率是"糊不糊"的唯一硬指标。880x1920 低于 1.5Mbps 一定糊，
                WebRTC 的码率上限设得再高也没用——真正发出去多少看这里。
                摄像头单独列：它和共享抢同一条连接的带宽。 */
@@ -1235,6 +1243,11 @@ final class MeetingViewModel: ObservableObject {
         text: String = "你可以关闭页面或重新入会",
         canRejoin: Bool = true
     ) {
+        /* 顺序：先广播"我不共享了"，再断信令。
+           反过来的话，rtc.leave() 会立刻把 signaling 置空，随后的
+           stopScreenShare 找不到通道、整条静默丢弃；服务端就永远记着
+           我是共享者，下一个人进会看到的是一块写着我名字的黑屏。 */
+        if isScreenSharing { rtc.stopScreenShare() }
         rtc.leave()
         // iOS 27：共享在本进程内，离会必须停掉 SCStream，
         // 否则系统"正在共享"的红条会留在状态栏上。

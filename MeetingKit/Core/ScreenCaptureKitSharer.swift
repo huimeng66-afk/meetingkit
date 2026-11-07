@@ -898,6 +898,11 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         running = false
         stateLock.unlock()
         stopKeepAlive()
+        /* 丢掉缓存的最后一帧。不清的话，下一次共享的首帧可能在"新画面还没来"
+           时把上一场的画面重推出去——用户会看到共享一开始闪一下旧内容。 */
+        lastPixelBuffer = nil
+        lastSourcePtsNs = -1
+        didSignalRunning = false
         ShareBreadcrumb.finish()
 
         if let runningStream {

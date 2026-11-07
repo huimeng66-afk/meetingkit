@@ -110,7 +110,15 @@ final class RealRTCClient: NSObject, RTCClient {
     /// iOS 27 的 ScreenCaptureKit 需要直接往这个 source 推帧。
     /// 广播扩展那条路是"扩展写 JPEG → 主 App 解码 → 推 source"，
     /// SCK 没有中间文件，帧从 SCStream 直接进来。
-    var screenVideoSource: RTCVideoSource? { localScreenSource }
+    var screenVideoSource: RTCVideoSource? {
+        /* 共享源必须"要的时候一定有"。
+           重连重建过 PeerConnection、或上一次 teardownLocalMedia 把它清掉的
+           情况下，这里返回 nil 会让上层直接弹出"共享通道还没准备好"，
+           而真正的问题是没人补建。补建是幂等的：有就直接返回。 */
+        if let source = localScreenSource { return source }
+        _ = ensureScreenTrack()
+        return localScreenSource
+    }
     /// 共享轨是否 enabled。诊断用：轨关着的时候，采集侧照样在出帧，
     /// 但所有帧都会被 WebRTC 丢掉，编码器一帧都拿不到。
     var isScreenTrackEnabled: Bool { localScreenTrack?.isEnabled ?? false }
@@ -860,13 +868,20 @@ final class RealRTCClient: NSObject, RTCClient {
     }
 
     func stopScreenShare() {
-        guard isJoined else { return }
-        signaling?.sendMediaState(audio: nil, video: nil, screen: false)
+        /* 这里**不能用 isJoined 当门**。
+           结束会议的路径是「停共享 → 立刻离会」，等 SCK 的 .stopped 回调回来时
+           isJoined 已经是 false 了，这条屏幕共享结束广播会被整条吞掉。
+           服务端于是永远留着 room.screenPeerId 指向我，之后任何人进会都会看到
+           "某某正在共享屏幕"，而我的轨早就关了——安卓端会直接弹出一块
+           「正在共享屏幕中」的黑屏。
+           只要信令还在，就把 off 送出去；重复发是幂等的。 */
+        guard let signaling = signaling else { return }
+        signaling.sendMediaState(audio: nil, video: nil, screen: false)
     }
 
     /// Broadcast 扩展确认在共享后调用：把共享帧推上所有 peer 的 video sender。
     func beginScreenFramePush() {
-        guard let source = localScreenSource, let track = localScreenTrack else { return }
+        guard let track = ensureScreenTrack(), let source = localScreenSource else { return }
         guard screenPusher == nil else { return }
 
         isScreenSharing = true
@@ -910,7 +925,7 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 与 `beginScreenFramePush` 的唯一区别是**不启动 ScreenFramePusher**：
     /// 那个是轮询 App Group 里 JPEG 的，SCK 路径下容器里什么都没有。
     func beginNativeScreenPush() {
-        guard let track = localScreenTrack else { return }
+        guard let track = ensureScreenTrack() else { return }
 
         /* 这里刻意不调 adaptOutputFormat：
            它在 M140 内部会重建 video adapter，与 SCK 的帧回调并发会崩在
@@ -949,6 +964,25 @@ final class RealRTCClient: NSObject, RTCClient {
         scheduleVideoUplinkWatchdog()
         startNativeUplinkGuard()
         syncTeardownBox()
+    }
+
+    /// 拿到共享用的 source/track，没有就补建。
+    ///
+    /// 只补 track 不补 source 会得到一个更坏的状态：SCK 把帧推进了一个
+    /// 没人消费的 source，sender 上挂的却是另一条轨——诊断上"共享轨已挂、
+    /// 编码器 impl=VideoToolbox、0x0 零帧"，每个数字都正常，就是没有画面。
+    /// 所以两者必须一起建、一起换。
+    @discardableResult
+    private func ensureScreenTrack() -> RTCVideoTrack? {
+        if let track = localScreenTrack, localScreenSource != nil { return track }
+        guard let factory = factory else { return nil }
+        let source = factory.videoSource()
+        let track = factory.videoTrack(with: source, trackId: "screen-\(UUID().uuidString)")
+        track.isEnabled = true
+        localScreenSource = source
+        localScreenTrack = track
+        ScreenShareRuntime.note("共享轨缺失，已重建 source/track")
+        return track
     }
 
     /// 共享起播后核对"视频包到底发出去了没有"。
@@ -1460,6 +1494,12 @@ final class RealRTCClient: NSObject, RTCClient {
             peer.session.detachScreenTrack()
         }
         localScreenTrack?.isEnabled = false
+        /* 停止共享必须在这里再广播一次 off，而不是只指望 ViewModel 那条路径。
+           实测漏发点有三个：SCK 的 .stopped 迟到（被会话核对挡掉）、
+           结束会议时先 leave 后停流、上行守护和 ViewModel 抢着改状态。
+           任何一条漏掉，服务端的共享位就留着我，别人一进会就看到
+           "我正在共享"。sendMediaState 幂等，多发一次没有副作用。 */
+        signaling?.sendMediaState(audio: nil, video: nil, screen: false)
         /* 复位降级阶梯：下一轮共享从原始画布重新开始，
            万一这次只是偶发的编码器抽风，不该永远卡在 320x240。 */
         screenCanvasStage = 0
@@ -2696,7 +2736,16 @@ extension RealRTCClient: TianqiongSignalingDelegate {
     }
 
     func signaling(_ signaling: TianqiongSignaling, screenState peerID: String, on: Bool, resumed: Bool) {
-        if peerID == selfPeerID { return }
+        if peerID == selfPeerID {
+            /* 服务端把我记成共享者，而本机并没有在推流。
+               这条通常是上一轮停止时 off 没送到留下的残影。
+               只忽略不够：不纠正的话，之后每个进会的人都会看到
+               "我正在共享屏幕"，而我的共享轨早就关了。 */
+            if on, !isScreenSharing {
+                signaling.sendMediaState(audio: nil, video: nil, screen: false)
+            }
+            return
+        }
 
         /* 竞态：新成员加入的瞬间，服务端的 screen:state 可能先于 peer:joined
            到达。之前这里直接 return，屏幕共享就永远不出现；先挂起，等
