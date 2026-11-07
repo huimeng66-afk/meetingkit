@@ -466,39 +466,33 @@ final class PeerSession: NSObject {
         let streamID = "tq-\(peerID)"
         if let audio = localAudio { ensureSender(for: audio, streamID: streamID) }
         if let video = localVideo { ensureSender(for: video, streamID: streamID) }
-        /* 没有摄像头也必须有一条 video m-line：共享要复用它。
-           旧版本靠"共享单开一条 m-line"回避了这个问题，代价是那条 m-line
-           永远谈不下来。现在改成复用，就必须保证落点始终存在。 */
-        ensureVideoSenderIfNeeded(streamID: streamID)
         if isSendingScreen, let screen = localScreen { ensureScreenSender(screen) }
     }
 
-    /// 保证连接上有一条 video transceiver / sender，哪怕本端没有摄像头。
-    ///
-    /// 触发场景：摄像头权限被拒、设备被别的 App 占用、`setupLocalMedia` 失败、
-    /// 或者用户以"只投屏"的方式入会。这些情况下 `localVideo == nil`，
-    /// `ensureSender` 不会 add，`videoSender` 就是 nil——而
-    /// `ensureScreenSender` 会因此在 guard 里静默 return：共享按钮亮着、
-    /// 帧在推、一个包都发不出去，诊断上还看不出任何异常。
-    private func ensureVideoSenderIfNeeded(streamID: String) {
-        guard videoSender == nil else { return }
-        let configuration = RTCRtpTransceiverInit()
-        configuration.direction = .sendRecv
-        configuration.streamIds = [streamID]
-        guard let transceiver = peerConnection.addTransceiver(of: .video, init: configuration) else {
-            ScreenShareRuntime.note("无法创建 video transceiver：共享将没有发送通道")
-            return
-        }
-        videoTransceiver = transceiver
-        videoSender = transceiver.sender
-    }
-
     /// 把屏幕轨 replace 到摄像头那条 sender 上（等价 replaceTrack，不产生协商）。
+    ///
+    /// 正常路径**不会新增 m-line**：camera mid 在入会首轮就谈好，
+    /// 这里只换 sender 上挂的轨。
+    ///
+    /// 唯一的例外是本端根本没有 video m-line（摄像头权限被拒、设备被占用、
+    /// 以"只投屏"方式入会）。这种情况下连 replace 的落点都没有，
+    /// 只能补一条。补的时候刻意用 `addTransceiver(with:init:)` 而不是
+    /// `addTransceiverOfType:init:`——后者的 Swift 导入名在不同 WebRTC 版本里
+    /// 不一致（`of:` / `for:` 都出现过），而前者在本项目 1.7.x 就一直在用。
     private func ensureScreenSender(_ track: RTCVideoTrack) {
         localScreen = track
         isSendingScreen = true
 
-        ensureVideoSenderIfNeeded(streamID: "tq-\(peerID)")
+        if videoSender == nil {
+            let configuration = RTCRtpTransceiverInit()
+            configuration.direction = .sendRecv
+            configuration.streamIds = ["tq-\(peerID)"]
+            if let transceiver = peerConnection.addTransceiver(with: track, init: configuration) {
+                videoTransceiver = transceiver
+                videoSender = transceiver.sender
+                ScreenShareRuntime.note("本端没有摄像头通道，已为共享补建一条")
+            }
+        }
         guard let sender = videoSender else {
             ScreenShareRuntime.note("共享：本条连接没有 video sender，无法挂载")
             return
