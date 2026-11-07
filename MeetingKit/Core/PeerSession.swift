@@ -406,9 +406,33 @@ final class PeerSession: NSObject {
         ensureScreenSender(track)
         track.isEnabled = true
 
+        /* 再核一次 sender 上到底连着哪条轨。
+           `RTCRtpSender.track` 每次读都会包一个新的 ObjC 对象，所以只能用
+           trackId 比，不能用 `===`。id 不一致说明 sender 还连着上一轮/重建前
+           的那条轨——帧推到新轨上没人消费，编码器就是 0x0 零帧。
+           属性 setter 在 M140 里直通原生 SetTrack（等价 replaceTrack），
+           换轨不产生协商。 */
+        if let sender = screenSender, sender.track?.trackId != track.trackId {
+            sender.track = track
+            screenTrackId = track.trackId
+            ScreenShareRuntime.note("共享 sender 已重新绑定到当前轨")
+        }
+
         if !alreadyAttached || !inSDP {
             negotiate()
         }
+    }
+
+    /// 只换 sender 上的轨，不协商、不动 m-line。
+    ///
+    /// 用在"回环接收器明明有帧、编码器却 0 帧"的自愈里：这条 m-line 是好的，
+    /// 坏的只是 sender 指向了另一条轨对象。
+    func rebindScreenTrack(_ track: RTCVideoTrack) {
+        guard !isClosed, let sender = screenSender else { return }
+        sender.track = track
+        screenTrackId = track.trackId
+        localScreen = track
+        track.isEnabled = true
     }
 
     /// 停止共享：只关轨，**不拆 m-line**。
@@ -526,10 +550,15 @@ final class PeerSession: NSObject {
         let level = SDPCodecFilter.h264Level(in: localSDP)
         let capBps = encodings.first?.maxBitrateBps?.intValue ?? 0
         let capText = capBps > 0 ? String(format: "%.1fM", Double(capBps) / 1_000_000) : "未设"
+        /* sender 上连的到底是不是当前这条共享轨。
+           "shared m-line 在、ssrc 在、编码器在"都能成立而帧进不去，
+           剩下的唯一解释就是 sender 连着另一条轨。 */
+        let bound = screenSender != nil && screenTrackId == (localScreen?.trackId ?? "")
         return "SDP video \(videoMLines) · 共享\(screenSDPText) · sender \(screenSenderText)"
             + " · mid=\(mid)/enc=\(encodings.count)/ssrc=\(ssrc)"
             + " · \(codec)/\(level)/上限\(capText)"
             + " · 远端\(remote) · 信令 \(signaling) · ICE \(ice)"
+            + " · 挂轨\(bound ? "一致" : "不一致 ⚠️")"
             + " · \(negotiationTrace)"
     }
 

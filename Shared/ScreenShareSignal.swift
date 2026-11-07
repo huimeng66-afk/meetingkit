@@ -396,6 +396,35 @@ enum ScreenShareRuntime {
     private static var _nativeFrames = 0
     private static var _nativeLastAt: Double?
 
+    /// 1.9.1：直接挂在 `localScreenTrack` 上的回环接收器数到的帧数。
+    ///
+    /// 它回答的是一个此前没法回答的问题：**帧到底有没有进"这条轨"**。
+    /// 采集侧计数（`_nativeFrames`）只证明 `RTCVideoSource.capturer` 被调用了，
+    /// 不证明被推的那个 source 就是 sender 正在消费的那条轨的 source。
+    /// 两者一旦不是同一个对象，现场就是：
+    ///   已推 164 帧 · 轨开 · mid/ssrc/编码器全在 · framesEncoded=0 · 0x0。
+    /// 有回环计数以后：
+    ///   镜像 > 0 而编码 = 0 → 断在"轨 → sender"，重挂 sender 的轨即可；
+    ///   镜像 = 0            → 断在"source → 轨"，推错了 source。
+    private static var _loopbackFrames = 0
+
+    static var loopbackFrames: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _loopbackFrames
+    }
+
+    static func noteLoopbackFrame() {
+        lock.lock()
+        _loopbackFrames += 1
+        lock.unlock()
+    }
+
+    static func resetLoopbackFrames() {
+        lock.lock()
+        _loopbackFrames = 0
+        lock.unlock()
+    }
+
     /// 自愈动作的流水账。共享链路上每一次"发现不对、动手修"都记一行：
     /// 真机复验时这几行比任何状态码都直接——它告诉你哪条兜底被触发了。
     private static var _notes: [String] = []
@@ -558,6 +587,7 @@ enum ScreenShareRuntime {
         _video = ScreenVideoStats()
         _nativeFrames = 0
         _nativeLastAt = nil
+        _loopbackFrames = 0
         lock.unlock()
     }
 }

@@ -111,13 +111,21 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 广播扩展那条路是"扩展写 JPEG → 主 App 解码 → 推 source"，
     /// SCK 没有中间文件，帧从 SCStream 直接进来。
     var screenVideoSource: RTCVideoSource? {
-        /* 共享源必须"要的时候一定有"。
-           重连重建过 PeerConnection、或上一次 teardownLocalMedia 把它清掉的
-           情况下，这里返回 nil 会让上层直接弹出"共享通道还没准备好"，
-           而真正的问题是没人补建。补建是幂等的：有就直接返回。 */
+        /* 以"共享轨自己的 source"为准，而不是另存一份引用。
+           帧只有推进这条轨的 source，sender（挂在同一条轨上）才一定消费得到。
+           1.9.0 的现场就是两者脱钩：采集侧把帧推进了 `localScreenSource`，
+           而 sender 消费的是更早一条轨的 source —— 面板上"已推 164 帧、
+           轨开、mid/ssrc/编码器齐全"，编码器却是 0x0 零帧。
+           `RTCVideoTrack.source` 返回的就是这条轨真正订阅的那个对象，
+           从它取，构造上就不可能推错。 */
+        if let track = localScreenTrack {
+            let source = track.source
+            localScreenSource = source
+            return source
+        }
         if let source = localScreenSource { return source }
         _ = ensureScreenTrack()
-        return localScreenSource
+        return localScreenTrack?.source ?? localScreenSource
     }
     /// 共享轨是否 enabled。诊断用：轨关着的时候，采集侧照样在出帧，
     /// 但所有帧都会被 WebRTC 丢掉，编码器一帧都拿不到。
@@ -131,9 +139,14 @@ final class RealRTCClient: NSObject, RTCClient {
         // 不再要求 isScreenSharing：停止后再看诊断，也要能看到上一轮的
         // m-line / 信令 / ICE 现场，否则最难复现的那几秒反而没有证据。
         guard !remotePeers.isEmpty else { return "" }
-        return remotePeers.values
+        let peers = remotePeers.values
             .map { "\($0.peerID)：\($0.session.screenLinkDebug)" }
             .joined(separator: " · ")
+        /* 回环帧数：证明"这条共享轨自己"有没有在出帧。
+           已推 > 0 而镜像 = 0，说明帧推进了另一个 source；
+           镜像 > 0 而编码 = 0，说明 sender 连的不是这条轨。
+           没有这个数，"0 帧"永远只能靠猜。 */
+        return peers + " · 本轨镜像 \(ScreenShareRuntime.loopbackFrames) 帧"
     }
     /// 本地 SDP 里所有 m-line 的清单。诊断回传用它判断
     /// "多出来的那条 video" 是无害的 recvonly，还是重复的共享通道。
@@ -664,6 +677,7 @@ final class RealRTCClient: NSObject, RTCClient {
         previewView = nil
         localAudioTrack = nil
         localVideoTrack = nil
+        detachScreenLoopbackProbe()
         localScreenTrack = nil
         localScreenSource = nil
         resetOutboundAudioTracking()
@@ -927,6 +941,12 @@ final class RealRTCClient: NSObject, RTCClient {
     func beginNativeScreenPush() {
         guard let track = ensureScreenTrack() else { return }
 
+        /* 采集侧推的 source 必须就是这条轨的 source。
+           构造上 `screenVideoSource` 已经从轨上取，这里再校正一次：
+           这行之后，"帧进了哪个 source"和"哪条轨在发"不再有机会分叉。 */
+        localScreenSource = track.source
+        attachScreenLoopbackProbe(to: track)
+
         /* 这里刻意不调 adaptOutputFormat：
            它在 M140 内部会重建 video adapter，与 SCK 的帧回调并发会崩在
            AdaptedVideoTrackSource::OnFrame。画布由 SCK 在首帧按真实比例
@@ -974,7 +994,14 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 所以两者必须一起建、一起换。
     @discardableResult
     private func ensureScreenTrack() -> RTCVideoTrack? {
-        if let track = localScreenTrack, localScreenSource != nil { return track }
+        /* 只要轨还在，就绝不再造一对新的 source/track。
+           旧实现的条件是 `track != nil && source != nil`，一旦 source 被谁清掉
+           就会连轨一起换 —— 而 sender 上挂的还是旧轨，帧推到新 source 上，
+           编码器一帧都收不到。现在轨是唯一真相，source 永远从轨上取。 */
+        if let track = localScreenTrack {
+            if localScreenSource == nil { localScreenSource = track.source }
+            return track
+        }
         guard let factory = factory else { return nil }
         let source = factory.videoSource()
         let track = factory.videoTrack(with: source, trackId: "screen-\(UUID().uuidString)")
@@ -983,6 +1010,30 @@ final class RealRTCClient: NSObject, RTCClient {
         localScreenTrack = track
         ScreenShareRuntime.note("共享轨缺失，已重建 source/track")
         return track
+    }
+
+    /// 挂在共享轨上的回环接收器。见 ScreenLoopbackProbe。
+    private var screenLoopbackProbe: ScreenLoopbackProbe?
+    private var screenLoopbackTrack: RTCVideoTrack?
+
+    private func attachScreenLoopbackProbe(to track: RTCVideoTrack) {
+        /* 同一条轨重复开始共享时不要越挂越多：旧接收器先摘掉。 */
+        if let old = screenLoopbackProbe, let oldTrack = screenLoopbackTrack {
+            oldTrack.remove(old)
+        }
+        let probe = ScreenLoopbackProbe()
+        screenLoopbackProbe = probe
+        screenLoopbackTrack = track
+        ScreenShareRuntime.resetLoopbackFrames()
+        track.add(probe)
+    }
+
+    private func detachScreenLoopbackProbe() {
+        if let probe = screenLoopbackProbe, let track = screenLoopbackTrack {
+            track.remove(probe)
+        }
+        screenLoopbackProbe = nil
+        screenLoopbackTrack = nil
     }
 
     /// 共享起播后核对"视频包到底发出去了没有"。
@@ -1134,13 +1185,19 @@ final class RealRTCClient: NSObject, RTCClient {
                     let fw = (stat.values["frameWidth"] as? NSNumber)?.intValue ?? 0
                     let fh = (stat.values["frameHeight"] as? NSNumber)?.intValue ?? 0
                     let retrans = (stat.values["retransmittedPacketsSent"] as? NSNumber)?.intValue ?? 0
+                    /* 编码器累计耗时。这是"帧到底有没有进编码器"最硬的一条：
+                       > 0 说明帧进去了、只是没产出（尺寸/编码器问题）；
+                       = 0 说明编码器一次都没被调用（sender 绑的还是别的轨）。 */
+                    let encodeTime = (stat.values["totalEncodeTime"] as? NSNumber)?.doubleValue ?? 0
 
                     /* 这三个数决定"0 帧"到底断在哪一环：
                          impl 空       → 编码器没建（sender/source 没接上）
                          key=0 尺寸 0  → 帧没进编码器（source 侧就丢了）
                          key=0 尺寸正常→ 每帧都被硬件编码器拒绝 */
                     peerEncoderFacts = "impl=\(impl.isEmpty ? "无" : impl)"
-                        + " key=\(keys) sent=\(fSent) \(fw)x\(fh) 重传=\(retrans)"
+                        + " key=\(keys) sent=\(fSent) \(fw)x\(fh)"
+                        + " 重传=\(retrans)"
+                        + String(format: " 编码耗时=%.2fs", encodeTime)
                     /* 编码器自己的目标码率，以及 WebRTC 判定的受限原因。
                        `qualityLimitationReason` 只有四个值：
                          none       — 没受限，糊就是画布/缩放/内容本身的问题
@@ -1261,6 +1318,19 @@ final class RealRTCClient: NSObject, RTCClient {
             return
         }
 
+        /* 冷启动窗口一过还是 0 包 0 帧，就立刻换一档更小的画布。
+           旧逻辑要等"连续 3 次采样"（≈6 秒）才动第一刀，加上 8 秒门槛，
+           用户要盯着黑屏 14 秒才等到第一次自救——那时他早就退出了。
+           降级只影响这一轮共享，停共享会复位（见 endScreenFramePush）。 */
+        if snapshot.encoded == 0, screenCanvasStage < Self.screenCanvasLadder.count {
+            let step = Self.screenCanvasLadder[screenCanvasStage]
+            screenCanvasStage += 1
+            ScreenShareRuntime.forceCanvas(width: step.width, height: step.height)
+            ScreenShareRuntime.note(
+                "上行守护：编码器 0 帧，画布降到 \(step.width)x\(step.height) 重建编码器"
+            )
+        }
+
         /* 0 包时只确认一件事：sender 上还是这条轨。
            这里刻意不调 negotiate——m-line 是入会时建好的，
            中途重协商只会制造 glare，把本来能恢复的链路彻底卡死。 */
@@ -1286,6 +1356,16 @@ final class RealRTCClient: NSObject, RTCClient {
             }
             ScreenShareRuntime.note("上行守护：0 包，已放开分辨率约束（允许降分辨率换出帧）")
         }
+        if zeroEncodeStreak == 2, ScreenShareRuntime.loopbackFrames > 0 {
+            /* 回环接收器能收到帧 → 轨本身是活的，问题只可能在这一步：
+               sender 消费的是另一条轨（旧轨/重建前的轨）。
+               `RTCRtpSender.track` 的 setter 在 M140 里就是原生 SetTrack，
+               直接换回去即可，不需要任何协商。 */
+            for peer in remotePeers.values {
+                peer.session.rebindScreenTrack(track)
+            }
+            ScreenShareRuntime.note("上行守护：本轨有帧但编码 0，已重挂 sender 的轨")
+        }
         if zeroEncodeStreak == 3 {
             let facts = remotePeers.values.first?.session.screenSenderFacts ?? "-"
             let ready = remotePeers.values.first?.session.screenSenderReady ?? false
@@ -1302,29 +1382,6 @@ final class RealRTCClient: NSObject, RTCClient {
                     peer.session.renegotiateForScreen()
                 }
                 ScreenShareRuntime.note("上行守护：共享 m-line 无传输通道，已补一次协商")
-            } else if screenCanvasStage < Self.screenCanvasLadder.count {
-                /* 编码器建了、encoding 槽位在、m-line 可发，帧却一帧没编。
-                   libwebrtc 的发送链路绑的是 `track->GetSource()`，
-                   **根本不读 track.isEnabled** —— 所以 1.8.0~1.8.6
-                   反复做的"关 0.25 秒再开"的轨脉冲对 framesEncoded
-                   没有任何作用，纯属安慰剂。
-                   剩下最可能的解释是硬件编码器按这个画布逐帧拒绝：
-                   宏块数 / level 超过 VideoToolbox 的门槛时它不报错，
-                   只让 framesEncoded 永远停在 0。
-                   所以改成**降画布**：一档一档往下走，能出帧就说明是尺寸问题，
-                   降到底还不出就说明编码器本身没建起来。 */
-                let step = Self.screenCanvasLadder[screenCanvasStage]
-                screenCanvasStage += 1
-                /* 只写"想要多大"，真正的 adaptOutputFormat 交给采集队列去调。
-                   这里在主线程直接调会撞上 didCapture 里的同一次调用，
-                   RTCVideoSource 内部重建 adapter 时会崩在
-                   AdaptedVideoTrackSource::OnFrame（1.5.x 踩过）。
-                   sharer 在每一帧（含静止保活重推）前会检查这个值，
-                   最迟 50ms 就生效。 */
-                ScreenShareRuntime.forceCanvas(width: step.width, height: step.height)
-                ScreenShareRuntime.note(
-                    "上行守护：编码器 0 帧，画布降到 \(step.width)x\(step.height) 重建编码器"
-                )
             }
             zeroEncodeStreak = 0
         }
@@ -1493,6 +1550,7 @@ final class RealRTCClient: NSObject, RTCClient {
         for peer in remotePeers.values {
             peer.session.detachScreenTrack()
         }
+        detachScreenLoopbackProbe()
         localScreenTrack?.isEnabled = false
         /* 停止共享必须在这里再广播一次 off，而不是只指望 ViewModel 那条路径。
            实测漏发点有三个：SCK 的 .stopped 迟到（被会话核对挡掉）、
