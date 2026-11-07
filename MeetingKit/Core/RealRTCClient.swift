@@ -2793,12 +2793,19 @@ extension RealRTCClient: TianqiongSignalingDelegate {
 
 extension RealRTCClient: PeerSessionDelegate {
 
-    func peerSession(_ session: PeerSession, needsSignalSDP sdp: RTCSessionDescription, restart: Bool) {
+    func peerSession(
+        _ session: PeerSession,
+        needsSignalSDP sdp: RTCSessionDescription,
+        restart: Bool,
+        round: String?
+    ) {
         let raw: [String: Any] = [
             "type": Self.sdpTypeString(sdp.type),
             "sdp": sdp.sdp,
         ]
-        signaling?.sendSignal(to: session.peerID, sdp: raw, candidate: nil, restart: restart)
+        signaling?.sendSignal(
+            to: session.peerID, sdp: raw, candidate: nil, restart: restart, round: round
+        )
     }
 
     func peerSession(_ session: PeerSession, needsSignalCandidate candidate: RTCIceCandidate) {

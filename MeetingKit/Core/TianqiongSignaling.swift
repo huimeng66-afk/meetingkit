@@ -257,10 +257,16 @@ final class TianqiongSignaling {
         to peerID: String,
         sdp: [String: Any]?,
         candidate: [String: Any]?,
-        restart: Bool = false
+        restart: Bool = false,
+        round: String? = nil
     ) {
         var data: [String: Any] = [:]
-        if let sdp = sdp { data["sdp"] = sdp }
+        if var sdp = sdp {
+            /* 轮次号塞进 sdp 字典：服务器只白名单透传 sdp.type / sdp.sdp，
+               放在外层 data 上会被直接丢掉。 */
+            if let round = round { sdp["rid"] = round }
+            data["sdp"] = sdp
+        }
         if let candidate = candidate { data["candidate"] = candidate }
         if restart { data["restart"] = true }
         guard !data.isEmpty else { return }

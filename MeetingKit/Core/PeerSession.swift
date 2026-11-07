@@ -27,7 +27,14 @@ import WebRTC
 protocol PeerSessionDelegate: AnyObject {
 
     /// 需要把 SDP 发给对端。restart 标记这是 ICE restart 产生的 offer。
-    func peerSession(_ session: PeerSession, needsSignalSDP sdp: RTCSessionDescription, restart: Bool)
+    /// `round` 是这一轮协商的轮次号（offer 由本端生成，answer 回带对方的）。
+    /// 对端必须用同一个值回话，否则无法判断一条 answer 属于哪一轮 offer。
+    func peerSession(
+        _ session: PeerSession,
+        needsSignalSDP sdp: RTCSessionDescription,
+        restart: Bool,
+        round: String?
+    )
 
     /// 需要把 ICE 候选发给对端。
     func peerSession(_ session: PeerSession, needsSignalCandidate candidate: RTCIceCandidate)
@@ -134,6 +141,54 @@ final class PeerSession: NSObject {
     /// 等到看门狗把整条连接拆掉——现在原样重发同一份 SDP 即可，代价几 KB。
     private var offerRetryCount = 0
     private var offerRetryTask: DispatchWorkItem?
+
+    /* ------------------------- 协商轮次（rid） ------------------------- */
+
+    /*
+     * 为什么必须有这个东西：
+     *
+     * 安卓那边是"按 peerId 应答"的——它不区分这条 answer 属于哪一轮 offer。
+     * 而本端一旦判定连接需要重建，会立刻 close 旧 session、建新 session、
+     * 马上再发一份 offer，全程几百毫秒。于是出现这个闭环：
+     *
+     *   ① 旧 session 的 offer A 到了安卓，安卓答了 answer A；
+     *   ② 本端此时已经换成新 session，并且发了 offer B；
+     *   ③ answer A 到达，新 session 的 signalingState 恰好也是 haveLocalOffer，
+     *      旧代码只看状态、不看内容，于是拿 answer A 去配 offer B；
+     *   ④ setRemoteDescription 报 "answer 与当前 offer 不匹配"；
+     *   ⑤ 失败回调直接触发重建 → 回到 ①。
+     *
+     * 现场表现就是每 240ms 一轮 offer/answer、永远 `等answer · ICE new`、
+     * 编码器一次都没启动、连带音频也不通。日志里能直接数到
+     * 8545B 的 offer 连续来两遍、9681B 再来两遍。
+     *
+     * 修法：给每份 offer 编一个进程内唯一（跨 session 也不重复）的轮次号，
+     * 随信令一起发；answer 必须回带同一个号。号对不上就**丢弃**，
+     * 既不 setRemote，也绝不重建——它本来就只是一条迟到的旧答案。
+     */
+    private static var roundSeq: Int = 0
+    /// 当前这一轮发出去、还没被应答的 offer 轮次号。
+    private var pendingOfferRound: String?
+    /// 收到的远端 offer 的轮次号，本端生成 answer 时原样回带。
+    private var remoteOfferRound: String?
+    /// 最近一条 answer 的轮次号（无论是否被接受），供诊断核对。
+    private var lastAnswerRound: String?
+    /// 因轮次不匹配被丢弃的 answer 条数。
+    private var droppedAnswerCount = 0
+    /// 最近一次 setRemoteDescription 失败的错误原文。
+    /// 以前这里只写 `if error != nil { rebuild }`，把唯一的现场证据扔了，
+    /// 结果连续几轮都在编码器上找原因。
+    private var lastRemoteSetError: String?
+    /// answer 连续落地失败的次数。用于区分"偶发错配"和"这条连接真的不可救"。
+    private var answerSetFailureCount = 0
+
+    /// 诊断用：把轮次现场拼成一行。
+    var negotiationTrace: String {
+        let pending = pendingOfferRound ?? "-"
+        let last = lastAnswerRound ?? "-"
+        let err = lastRemoteSetError.map { " err=\($0.prefix(90))" } ?? ""
+        return "rid 待=\(pending) 收=\(last) 丢=\(droppedAnswerCount)\(err)"
+    }
 
     var pendingOfferAge: TimeInterval? {
         guard peerConnection.signalingState == .haveLocalOffer,
@@ -475,6 +530,7 @@ final class PeerSession: NSObject {
             + " · mid=\(mid)/enc=\(encodings.count)/ssrc=\(ssrc)"
             + " · \(codec)/\(level)/上限\(capText)"
             + " · 远端\(remote) · 信令 \(signaling) · ICE \(ice)"
+            + " · \(negotiationTrace)"
     }
 
     /// 本地 SDP 里有没有共享那条 m-line。
@@ -839,12 +895,15 @@ final class PeerSession: NSObject {
         else { return }
 
         let description = RTCSessionDescription(type: Self.sdpType(from: type), sdp: sdpString)
+        let round = raw["rid"] as? String
 
         switch description.type {
         case .offer:
+            // 记下这轮的号，本端生成的 answer 要原样回带（对端靠它配对）。
+            remoteOfferRound = round
             handleRemoteOffer(description)
         case .answer:
-            handleRemoteAnswer(description)
+            handleRemoteAnswer(description, round: round)
         default:
             break
         }
@@ -958,6 +1017,8 @@ final class PeerSession: NSObject {
         offerRetryTask?.cancel()
         offerRetryTask = nil
         offerRetryCount = 0
+        pendingOfferRound = nil
+        remoteOfferRound = nil
         ignoreOffer = false
         isNegotiating = false
         isRestartingIce = false
@@ -1100,18 +1161,58 @@ final class PeerSession: NSObject {
         }
     }
 
-    private func handleRemoteAnswer(_ description: RTCSessionDescription) {
+    private func handleRemoteAnswer(_ description: RTCSessionDescription, round: String?) {
+        lastAnswerRound = round
+
         guard peerConnection.signalingState == .haveLocalOffer else {
             // 过期 answer（对方在 glare 中让路的残留），直接丢弃。
             return
         }
+
+        /* 轮次校验：这是止住「240ms 重建死循环」的那道闸。
+           号对不上＝这条 answer 属于上一轮已经作废的 offer，
+           拿它去配当前 offer 只会失败，而失败又会触发重建。
+           直接丢掉，等当前这轮的 answer 到。 */
+        if let round = round {
+            /* 带号就必须等于当前这一轮。pendingOfferRound 为 nil 时同样拒绝：
+               那表示本端此刻并没有待应答的 offer（刚重建、offer 还没发出去），
+               这条 answer 无论属于谁都是错配。 */
+            guard round == pendingOfferRound else {
+                droppedAnswerCount += 1
+                return
+            }
+        }
+
         peerConnection.setRemoteDescription(description) { [weak self] error in
             Task { @MainActor in
                 guard let self = self else { return }
-                if error != nil {
+                if let error = error {
+                    /* 把原文留下来。以前这里只判 nil 就重建，等于把唯一的
+                       现场证据扔了；诊断里只能看到"等answer"，看不出为什么。 */
+                    self.lastRemoteSetError = error.localizedDescription
+                    self.answerSetFailureCount += 1
+
+                    /* 不要立刻重建。
+                       旧逻辑失败即 rebuild，而 rebuild 是同步的：close → 新建
+                       → 立刻再发 offer，200~300ms 就转一圈。对端刚生成的
+                       answer 又是一条"配不上"的，于是无限循环，编码器一次
+                       都没机会启动。
+                       先原样重投当前 offer（同一轮次号），让对端重答一次；
+                       只有连续两次都失败，才认定这条连接真的不可救。 */
+                    if self.answerSetFailureCount < 2, let local = self.peerConnection.localDescription {
+                        self.delegate?.peerSession(
+                            self, needsSignalSDP: local, restart: false,
+                            round: self.pendingOfferRound
+                        )
+                        return
+                    }
+                    self.answerSetFailureCount = 0
                     self.delegate?.peerSessionNeedsRebuild(self)
                     return
                 }
+                self.lastRemoteSetError = nil
+                self.answerSetFailureCount = 0
+                self.pendingOfferRound = nil
                 self.offerSentAt = nil
                 self.offerRetryTask?.cancel()
                 self.offerRetryTask = nil
@@ -1165,8 +1266,23 @@ final class PeerSession: NSObject {
                 defer { onDone?() }
                 if error == nil {
                     let toSend = self.peerConnection.localDescription ?? target
-                    self.offerSentAt = description.type == .offer ? Date() : nil
-                    self.delegate?.peerSession(self, needsSignalSDP: toSend, restart: restart)
+                    /* 轮次号在这里生成：
+                       · offer：进程内自增，跨 session 也不重复（重建后从 1 开始
+                         会与旧 session 的 1 撞号，旧 answer 就会被误收）；
+                       · answer：原样回带远端 offer 的号，对端据此配对。 */
+                    let round: String?
+                    if description.type == .offer {
+                        Self.roundSeq += 1
+                        round = "\(self.peerID)-\(Self.roundSeq)"
+                        self.pendingOfferRound = round
+                        self.offerSentAt = Date()
+                    } else {
+                        round = self.remoteOfferRound
+                        self.offerSentAt = nil
+                    }
+                    self.delegate?.peerSession(
+                        self, needsSignalSDP: toSend, restart: restart, round: round
+                    )
                     if description.type == .offer {
                         self.offerRetryCount = 0
                         self.scheduleOfferRetry()
@@ -1268,7 +1384,13 @@ final class PeerSession: NSObject {
                       let description = self.peerConnection.localDescription else { return }
                 self.offerRetryCount += 1
                 self.offerSentAt = Date()
-                self.delegate?.peerSession(self, needsSignalSDP: description, restart: false)
+                /* 重发必须带**同一份**轮次号：它就是同一轮 offer 的重投，
+                   换号等于告诉对端"这是新的一轮"，对端会把刚生成的 answer
+                   作废。 */
+                self.delegate?.peerSession(
+                    self, needsSignalSDP: description, restart: false,
+                    round: self.pendingOfferRound
+                )
                 self.scheduleOfferRetry()
             }
         }
