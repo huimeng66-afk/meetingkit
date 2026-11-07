@@ -1791,6 +1791,21 @@ final class RealRTCClient: NSObject, RTCClient {
         }
         screenRefreshWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: work)
+
+        /* 第二遍只补关键帧，不再动协商。
+           安卓的 MediaCodec 硬解要等 SPS/PPS + IDR 才肯出第一帧，而它建
+           解码器的时机比 RTP 晚 —— 开局那个 IDR 很可能是在解码器还没就绪
+           时到的，之后收到的全是 P 帧，于是一黑到底。+9 秒再补一个，
+           覆盖"解码器晚起"这一档。 */
+        DispatchQueue.main.asyncAfter(deadline: .now() + 9.0) { [weak self] in
+            Task { @MainActor in
+                guard let self, self.isScreenSharing, !self.remotePeers.isEmpty else { return }
+                for peer in self.remotePeers.values {
+                    peer.session.forceVideoKeyFrame()
+                }
+                ScreenShareRuntime.note("共享：+9 秒补了一个关键帧（覆盖解码器晚起）")
+            }
+        }
     }
 
     private func auditScreenUplinkAndHeal() {
