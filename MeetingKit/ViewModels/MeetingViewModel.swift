@@ -810,21 +810,56 @@ final class MeetingViewModel: ObservableObject {
 
     // MARK: - 屏幕共享
 
-    /// 点"共享屏幕"只打开选择面板。
-    /// 真正的广播必须由系统弹窗发起（ReplayKit 的硬性规定）。
+    /// 点"共享"= 直接叫出系统面板，不再先弹一层自己的抽屉。
     ///
-    /// 这里**不再**用 `AppGroupConfig.isAvailable` 直接拦截：
-    /// 拦掉之后用户只看到一条 2 秒就消失的 Toast，面板根本不开，
-    /// 体感就是"点了共享没反应"。是否可用改成在面板里说明，
-    /// 并给出"复制网页版链接"的兜底路径——决定权交给用户，
-    /// 而不是让一次签名能力探测把整个入口吞掉。
+    /// ── 为什么改掉"先开面板、再点开始共享" ─────────────────────────────
+    /// 用户的原话是"按了共享就应该弹出来询问共享屏幕"。原来的两段式在真机上的
+    /// 表现是：点共享 → 升起一张半屏面板（把底栏全挡住）→ 再找"开始共享屏幕"→
+    /// 才看到系统面板。多出来的一层既挡视线又多一次点击，而且一旦用户把面板
+    /// 当成"设置说明"，就会以为按钮坏了。
+    /// 现在的路径：
+    ///   · iOS 27+（SCK）→ 直接弹系统内容选择器；
+    ///   · iOS 26-（广播扩展）→ 直接弹系统「开始直播」面板；
+    ///   · 签名没有 App Group / 系统面板弹不出来 → 才回退到说明面板（含网页版兜底）。
+    /// 想主动查看共享说明与诊断，长按这颗按钮即可（见 BottomControlBar）。
     func toggleScreenShare() {
-        // 打开面板的这一刻就试着收掉系统里残留的旧广播：
-        // 用户从开面板到点「开始共享」通常要几秒，足够上一个扩展进程退出。
-        // 等到点按钮时才发，往往来不及——系统会在 picker 上直接弹
-        // "停止与 (null) 共享屏幕？"，那正是旧广播占着位置。
+        if isScreenSharing {
+            stopScreenShare()
+            return
+        }
+
+        // 收掉系统里残留的旧广播：不清理的话系统会在 picker 上直接弹
+        // "停止与 (null) 共享屏幕？"，那正是上一次的扩展占着位置。
         shareBridge.disposeStaleBroadcast()
-        openPanel(.sharePicker)
+
+        if supportsNativeScreenShare {
+            startNativeScreenShare()
+            return
+        }
+
+        // iOS 26-：没有 App Group 时广播扩展根本写不回画面，
+        // 直接弹系统面板只会让用户对着黑屏等——这时先说明再给网页版。
+        guard AppGroupConfig.isAvailable else {
+            openPanel(.sharePicker)
+            return
+        }
+
+        // 残留扩展进程收到停止请求后需要一点时间落盘退出，
+        // 等 250ms 再弹面板：太早会撞上"停止与 (null) 共享"，太晚用户以为没反应。
+        prepareForScreenShare()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self else { return }
+            guard !BroadcastPickerPresenter.present() else { return }
+            // 面板弹不出来时给一条可走的路径，不能只留一个 2 秒的 Toast。
+            self.openPanel(.sharePicker)
+            self.showToast(
+                ToastMessage(
+                    text: "系统共享面板未能打开，可改用网页版共享",
+                    systemImage: "exclamationmark.triangle.fill",
+                    style: .warning
+                )
+            )
+        }
     }
 
     /// iOS 27：在本进程内发起系统级共享。

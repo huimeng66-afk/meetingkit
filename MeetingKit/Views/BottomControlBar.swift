@@ -138,7 +138,11 @@ struct BottomControlBar: View {
             appearance: viewModel.isScreenSharing ? .broadcast : .neutral,
             isPrimary: !viewModel.isScreenSharing,
             size: keySize,
-            accessibilityText: viewModel.isScreenSharing ? "停止共享屏幕" : "共享屏幕"
+            accessibilityText: viewModel.isScreenSharing ? "停止共享屏幕" : "共享屏幕",
+            /* 长按看说明：短按已经改成"直接叫系统面板"，
+               共享来源、诊断、网页版兜底这些内容不能就此消失，
+               但它们不该挡在每一次共享前面——长按是第二层，不占主路径。 */
+            onLongPress: { viewModel.openPanel(.sharePicker) }
         ) {
             if viewModel.isScreenSharing {
                 viewModel.stopScreenShare()

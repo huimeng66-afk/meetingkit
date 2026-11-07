@@ -61,6 +61,11 @@ struct ControlButton: View {
     /// 朗读用的完整语义。nil 时回退到 title。
     var accessibilityText: String? = nil
 
+    /// 长按动作。用于给一颗键补"第二层入口"：
+    /// 共享键短按直接弹系统面板，长按才打开共享说明/诊断。
+    /// nil 时这颗键只有短按一种行为。
+    var onLongPress: (() -> Void)? = nil
+
     var action: () -> Void
 
     var body: some View {
@@ -106,7 +111,24 @@ struct ControlButton: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(ControlButtonPressStyle())
+        /* 长按用 highPriorityGesture，而不是再包一层 simultaneousGesture：
+           后者会让"长按"和"点击"同时成立——手指抬起时长按已经走完、
+           Button 的 action 也照发，用户长按一次会既开面板又弹系统选择器。
+           高优先级手势在 0.55s 后接管，短按因手势失败而落回 Button，互不干扰。 */
+        .highPriorityGesture(
+            longPressGesture,
+            including: onLongPress == nil ? GestureMask.none : GestureMask.all
+        )
         .accessibilityLabel(accessibilityText ?? title)
+    }
+
+    private var longPressGesture: some Gesture {
+        LongPressGesture(minimumDuration: 0.55)
+            .onEnded { _ in
+                guard let onLongPress else { return }
+                Haptics.impact(.medium)
+                onLongPress()
+            }
     }
 
     // MARK: - 着色

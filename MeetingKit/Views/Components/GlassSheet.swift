@@ -162,25 +162,54 @@ struct GlassSheet<Content: View>: View {
         )
     }
 
-    /// 拖拽只挂在这条 36pt 的顶部条上。
-    /// 如果挂在整块面板上，参会人列表、聊天记录的滚动会和外层拖拽抢手势。
+    /// 顶部把手条：拖拽关闭 + 右上角关闭键。
+    ///
+    /// ── 为什么必须补一个 ✕ ────────────────────────────────────────────
+    /// 用户反馈"诊断面板把底栏全挡住了，而且怎么都划不下去"。原因不是手势写错，
+    /// 而是**手势只挂在这条 36pt 的把手条上**：诊断/聊天/参会人面板的主体都是
+    /// ScrollView，手指落在文字上往下拖，事件被滚动视图吃掉，抽屉一动也不动。
+    /// 把手条又只有 4pt 的胶囊看得见，用户根本不知道该抓哪里。
+    /// 所以这里做两件事：
+    ///   1. 把手条加高到 44pt，整条（含两侧留白）都是可拖区域；
+    ///   2. 右上角给一个明确的 ✕ —— 手势可以学，按钮不需要学。
+    /// 关闭键放在把手条里而不是各面板内部：所有面板共用一条退出路径，
+    /// 新加面板不会因为忘写关闭而再次变成"关不掉的弹窗"。
     private var dragStrip: some View {
-        VStack(spacing: 0) {
-            Capsule()
-                .fill(Color.white.opacity(0.22))
-                .frame(width: 36, height: 4)
-                .padding(.top, Theme.Metrics.space2)
-                .padding(.bottom, Theme.Metrics.space2)
+        ZStack(alignment: .topTrailing) {
+            VStack(spacing: 0) {
+                Capsule()
+                    .fill(Color.white.opacity(0.22))
+                    .frame(width: 40, height: 4)
+                    .padding(.top, 11)
+                    .padding(.bottom, 9)
 
-            Color.clear.frame(height: Theme.Metrics.space3)
+                Color.clear.frame(height: 20)
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+            .gesture(dragGesture)
+
+            Button {
+                Haptics.impact(.light)
+                onClose()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(Theme.Palette.textSecondary)
+                    .frame(width: 30, height: 30)
+                    .background(Circle().fill(Color.white.opacity(0.10)))
+                    .contentShape(Circle())
+            }
+            .buttonStyle(PlainButtonStyle())
+            .padding(.trailing, 10)
+            .padding(.top, 8)
+            .accessibilityLabel("关闭")
         }
         .frame(maxWidth: .infinity)
         // 顶部高光：面板上沿那道自上而下衰减的亮边。
         // 玻璃感有一半来自这条边——没有它，面板在亮画面上就是一块灰板。
         // 用「视图参数」版本的 background（iOS 13 就有），闭包版是 15 起。
         .background(topHighlight, alignment: .top)
-        .contentShape(Rectangle())
-        .gesture(dragGesture)
     }
 
     /// 只在上沿 34pt 内衰减到透明，与面板圆角一起被外层 clipShape 裁掉。
