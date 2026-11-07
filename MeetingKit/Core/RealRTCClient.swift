@@ -1302,6 +1302,14 @@ final class RealRTCClient: NSObject, RTCClient {
     ) {
         guard let track = localScreenTrack else { return }
 
+        /* 先做一次"真实挂轨"核对，2 秒一次，不受下面 8 秒门槛限制。
+           帧推进的是这条轨，sender 上挂的却可能是重建前的旧轨——
+           那时所有记账值都对、编码器却永远 0x0 零帧。
+           换轨是 SetTrack（等价 replaceTrack），不产生协商，随时可以做。 */
+        for peer in remotePeers.values where peer.session.ensureScreenBinding(track) {
+            ScreenShareRuntime.note("上行守护：sender 上的轨不是当前共享轨，已换回")
+        }
+
         /* 共享刚启动的 8 秒内一律不判"0 包"。
            编码器冷启动要 1~2 秒，首帧还要等 SCK 建流；这段时间 packets 必然是 0。
            旧逻辑在共享第 2 秒就把 maintainResolution 和码率上限一起放开，

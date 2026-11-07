@@ -435,6 +435,25 @@ final class PeerSession: NSObject {
         track.isEnabled = true
     }
 
+    /// 核对并纠正 sender 上真实挂着的轨。
+    ///
+    /// 用在两处：每次上行采样前（2 秒一次）和 attachScreenTrack 里。
+    /// 返回 true 表示这次真的换过轨。
+    ///
+    /// 为什么要以"真实读数"为准：`screenTrackId` 只是本端的记账。
+    /// 一旦 sender 上留的是重建前的旧轨，记账值照样是对的——
+    /// 面板会显示"共享轨已挂"，编码器却是 0x0 零帧，这正是 1.9.0 的现场。
+    @discardableResult
+    func ensureScreenBinding(_ track: RTCVideoTrack) -> Bool {
+        guard !isClosed, let sender = screenSender else { return false }
+        guard sender.track?.trackId != track.trackId else { return false }
+        sender.track = track
+        screenTrackId = track.trackId
+        localScreen = track
+        track.isEnabled = true
+        return true
+    }
+
     /// 停止共享：只关轨，**不拆 m-line**。
     ///
     /// 拆掉 m-line 的代价是远端 receiver 变 ended、下一轮必须重新协商，
@@ -553,7 +572,8 @@ final class PeerSession: NSObject {
         /* sender 上连的到底是不是当前这条共享轨。
            "shared m-line 在、ssrc 在、编码器在"都能成立而帧进不去，
            剩下的唯一解释就是 sender 连着另一条轨。 */
-        let bound = screenSender != nil && screenTrackId == (localScreen?.trackId ?? "")
+        let bound = screenSender != nil
+            && screenSender?.track?.trackId == (localScreen?.trackId ?? "")
         return "SDP video \(videoMLines) · 共享\(screenSDPText) · sender \(screenSenderText)"
             + " · mid=\(mid)/enc=\(encodings.count)/ssrc=\(ssrc)"
             + " · \(codec)/\(level)/上限\(capText)"
@@ -698,7 +718,10 @@ final class PeerSession: NSObject {
         guard let track = localScreen else { return summary }
         summary.trackExists = true
         summary.trackEnabled = track.isEnabled
-        summary.attached = screenSender != nil && screenTrackId == track.trackId
+        /* 这里必须读 sender 上**真实**挂着的轨，不能读 screenTrackId。
+           那个只是本端的记账值：记账写对了、sender 上却仍是旧轨时，
+           记账会给出一个"已挂"的假绿，正好把 0x0 零帧掩盖掉。 */
+        summary.attached = screenSender?.track?.trackId == track.trackId
         // 最后一条 video m-line 就是共享那条（摄像头先建，共享后建）。
         let localSDP = peerConnection.localDescription?.sdp
         summary.screenInSDP = Self.screenMLineAcceptsSend(localSDP)
