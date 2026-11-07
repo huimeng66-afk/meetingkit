@@ -13,6 +13,8 @@ struct SearchField: View {
     var placeholder: String = "搜索参会人"
     @Binding var text: String
 
+    @FocusState private var isFocused: Bool
+
     var body: some View {
         HStack(spacing: Theme.Metrics.space2) {
             Image(systemName: SymbolCompat.name("magnifyingglass"))
@@ -27,6 +29,11 @@ struct SearchField: View {
                         .foregroundColor(Theme.Palette.textTertiary)
                 }
                 TextField("", text: $text)
+                    .focused($isFocused)
+                    .accessibilityLabel(placeholder)
+                    .submitLabel(.search)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
                     .font(Theme.Typography.body)
                     .foregroundColor(Theme.Palette.textPrimary)
                     .accentColor(Theme.Palette.accent)
@@ -42,19 +49,24 @@ struct SearchField: View {
                         .foregroundColor(Theme.Palette.textTertiary)
                         // 图标只有 14pt，直接当命中区很难点中；
                         // 补到 32×32 并用矩形 contentShape 把整个方形都变成可点区域。
-                        .frame(width: 32, height: 32)
+                        .frame(width: 44, height: 44)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                 .accessibilityLabel("清除搜索")
             }
         }
         .padding(.horizontal, Theme.Metrics.space3)
-        .frame(height: 36)
+        .frame(minHeight: 48)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.white.opacity(0.08))
+                .fill(Theme.Palette.surfaceSubtle)
         )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(isFocused ? Theme.Palette.accent : Theme.Palette.hairline, lineWidth: isFocused ? 1.5 : 1)
+        )
+        .animation(Theme.Motion.snappy, value: isFocused)
     }
 }
 

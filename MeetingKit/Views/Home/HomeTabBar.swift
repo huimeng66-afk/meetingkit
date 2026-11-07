@@ -65,7 +65,7 @@ struct HomeTabBar: View {
 
             if showsStartMeeting {
                 startMeetingButton
-                    .transition(.scale.combined(with: .opacity))
+                    .transition(GlassMotion.isReduceMotion ? .opacity : .scale.combined(with: .opacity))
             }
         }
         .padding(.horizontal, 14)
@@ -176,7 +176,7 @@ struct HomeTabBar: View {
                 x: 0,
                 y: isDragging ? 6 : 3
             )
-            .scaleEffect(isDragging ? 1.02 : 1.0)
+            .scaleEffect(isDragging ? GlassMotion.scale(1.01) : 1.0)
             .offset(x: slot * CGFloat(activeIndex) + indicatorInset + dragOffset)
             // 拖动态不给动画：跟手要 1:1，有动画就会"追手指"。
             // 松手（dragOffset 归零）和点击切换才走 spring。
@@ -206,7 +206,7 @@ struct HomeTabBar: View {
                     .font(.system(size: 19, weight: isSelected ? .semibold : .regular))
                     // 选中时图标放大 6%：切换瞬间有一次可见的"弹一下"，
                     // 光靠换 symbol（实心/空心）在 19pt 上几乎看不出来。
-                    .scaleEffect(isSelected ? 1.06 : 1.0)
+                    .scaleEffect(isSelected ? GlassMotion.scale(1.02) : 1.0)
                     .animation(GlassMotion.settle, value: isSelected)
                     .frame(height: 22)
 
@@ -313,7 +313,7 @@ private struct TabPressStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.92 : 1.0)
+            .scaleEffect(configuration.isPressed ? GlassMotion.scale(0.97) : 1.0)
             .opacity(configuration.isPressed ? 0.88 : 1.0)
             .animation(
                 configuration.isPressed ? GlassMotion.press : GlassMotion.settle,
@@ -331,7 +331,7 @@ private struct HomeTabFABButtonStyle: ButtonStyle {
                 isInteractive: true,
                 castsShadow: true
             )
-            .scaleEffect(configuration.isPressed ? 0.94 : 1.0)
+            .scaleEffect(configuration.isPressed ? GlassMotion.scale(0.97) : 1.0)
             .animationCompat(Theme.Motion.standard, value: configuration.isPressed)
     }
 }

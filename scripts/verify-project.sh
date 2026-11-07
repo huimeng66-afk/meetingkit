@@ -17,7 +17,7 @@
 #   ./scripts/verify-project.sh
 #   MK_SWIFTC=/opt/swift/usr/bin/swiftc ./scripts/verify-project.sh
 #
-# 退出码：0 全 PASS；1 有 FAIL
+# 退出码：0 无 FAIL（普通模式允许 SKIP）；1 有 FAIL 或 strict 模式有 SKIP
 # 兼容：macOS 自带 bash 3.2（不使用关联数组、mapfile、${var,,}）
 
 set -uo pipefail
@@ -42,8 +42,19 @@ else
     C_OFF=""
 fi
 
+STRICT=0
+case "${1:-}" in
+    --strict) STRICT=1; shift ;;
+    --help|-h) echo "Usage: $0 [--strict] (strict: SKIP causes failure)"; exit 0 ;;
+esac
+[ "$#" -eq 0 ] || { echo "Unknown argument" >&2; exit 1; }
 PASS_COUNT=0
 FAIL_COUNT=0
+SKIP_COUNT=0
+skip() {
+    SKIP_COUNT=$((SKIP_COUNT + 1))
+    printf '  SKIP  %s\n' "$1"
+}
 
 section() {
     printf '\n%s── %s %s\n' "$C_BOLD" "$1" "$C_OFF"
@@ -197,6 +208,17 @@ else:
     ext_bundle = str(ext_s.get("PRODUCT_BUNDLE_IDENTIFIER", ""))
     ext_product = str(ext_s.get("PRODUCT_NAME", ""))
 
+    for label, settings, rel in (("主 App", app_s, "MeetingKit/Info.plist"),
+                                  ("扩展", ext_s, "BroadcastExtension/Info.plist")):
+        configured = str(settings.get("PRODUCT_BUNDLE_IDENTIFIER", ""))
+        info_id = (loaded.get(rel) or {}).get("CFBundleIdentifier")
+        if not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", configured):
+            emit("FAIL", label + " PRODUCT_BUNDLE_IDENTIFIER 无效或未解析")
+        elif info_id not in (configured, "$(PRODUCT_BUNDLE_IDENTIFIER)", "${PRODUCT_BUNDLE_IDENTIFIER}"):
+            emit("FAIL", label + " Info.plist 与 PRODUCT_BUNDLE_IDENTIFIER 不一致")
+        else:
+            emit("PASS", label + " Info.plist Bundle ID 与实际工程配置一致")
+
     # 1) AppGroupConfig 里的三个常量
     swift_rel = "Shared/AppGroupConfig.swift"
     swift_text = ""
@@ -223,8 +245,12 @@ else:
                 emit("PASS", "AppGroupConfig.identifier 为运行时解析，按 preferredIdentifier 校验 (%s)" % fallback.group(1))
             else:
                 emit("FAIL", "AppGroupConfig.identifier 与 preferredIdentifier 均未找到", "期望 static let preferredIdentifier = \"group.xxx\"")
+        elif name == "bundleIdentifier" and re.search(r'static\s+let\s+bundleIdentifier\s*:\s*String\s*=\s*Bundle\.main\.bundleIdentifier', swift_text):
+            emit("PASS", "主 App Bundle ID 来自运行时，校验工程与 Info.plist")
+        elif name == "broadcastExtensionBundleIdentifier" and re.search(r'static\s+let\s+broadcastExtensionBundleIdentifier\s*:\s*String\s*=\s*resolveExtensionBundleIdentifier\(\)', swift_text):
+            emit("PASS", "扩展 Bundle ID 来自内嵌 bundle，校验工程与 Info.plist")
         else:
-            emit("FAIL", "AppGroupConfig.%s 未找到" % name, "期望形如 static let %s = \"...\"" % name)
+            emit("FAIL", "AppGroupConfig.%s 未找到或无法识别" % name)
 
     group_id = values.get("identifier", "")
 
@@ -375,15 +401,18 @@ if [ -z "$MK_SWIFTC" ]; then
     fi
 fi
 
+if ! find "$PROJECT_ROOT" -name '*.swift' -not -path '*/.build/*' -not -path '*/build/*' -print0 >"${TMP_DIR}/swift-files"; then
+    fail "Swift 文件枚举失败"
+fi
 SWIFT_FILES=()
 while IFS= read -r -d '' swift_path; do
     SWIFT_FILES+=("$swift_path")
-done < <(find "$PROJECT_ROOT" -name '*.swift' -not -path '*/.build/*' -not -path '*/build/*' -print0 2>/dev/null)
+done <"${TMP_DIR}/swift-files"
 
 if [ "${#SWIFT_FILES[@]}" -eq 0 ]; then
     fail "没有找到任何 .swift 文件" "$PROJECT_ROOT"
 elif [ -z "$MK_SWIFTC" ]; then
-    fail "未找到 swiftc，跳过语法检查" "设置 MK_SWIFTC=/path/to/swiftc 后重试"
+    skip "未找到 swiftc，未执行语法检查；设置 MK_SWIFTC=/path/to/swiftc 后重试"
 else
     SWIFT_ERR="${TMP_DIR}/swiftc.log"
     if "$MK_SWIFTC" -parse "${SWIFT_FILES[@]}" >/dev/null 2>"$SWIFT_ERR"; then
@@ -403,6 +432,7 @@ SCRIPTS=(
     "scripts/build-ipa.sh"
     "scripts/build-ipa-unsigned.sh"
     "scripts/verify-project.sh"
+    "scripts/sign-ipa.sh"
 )
 
 for rel in "${SCRIPTS[@]}"; do
@@ -465,15 +495,17 @@ fi
 # ---------------------------------------------------------------------- 汇总
 
 printf '\n%s────────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF"
-printf 'PASS: %d  FAIL: %d\n' "$PASS_COUNT" "$FAIL_COUNT"
-if [ "$FAIL_COUNT" -eq 0 ]; then
+printf 'PASS: %d  FAIL: %d  SKIP: %d\n' "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+if [ "$FAIL_COUNT" -eq 0 ] && [ "$SKIP_COUNT" -eq 0 ]; then
     printf '%s工程配置自洽，可以交给 macOS 出包。%s\n' "$C_DIM" "$C_OFF"
+elif [ "$FAIL_COUNT" -eq 0 ]; then
+    printf '检查不完整：存在 SKIP，未验证 Swift 语法。\n'
 else
     printf '%s有 %d 项检查未通过，先修配置再出包。%s\n' "$C_ERR" "$FAIL_COUNT" "$C_OFF"
 fi
 printf '%s────────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF"
 
-if [ "$FAIL_COUNT" -gt 0 ]; then
+if [ "$FAIL_COUNT" -gt 0 ] || { [ "$STRICT" -eq 1 ] && [ "$SKIP_COUNT" -gt 0 ]; }; then
     exit 1
 fi
 exit 0

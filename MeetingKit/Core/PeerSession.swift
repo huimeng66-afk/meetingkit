@@ -119,9 +119,9 @@ final class PeerSession: NSObject {
     /// 最近一次真正在「出帧」的远端轨时钟。
     ///
     /// 为什么不能只信 `screen:state`：服务端共享位有 12 秒 TTL，重连、
-    /// 误纠正、非共享者的 off 都会让这条信令抖一下。以前一收到 off 就
-    /// 把渲染器绑回摄像头轨——摄像头是关的，画面立刻全黑，而屏幕轨
-    /// 其实还在出帧。判据必须回到画面本身：谁在出帧，谁就该被显示。
+    /// 误纠正、非共享者的 off 都会让这条信令抖一下。以前一收到 off 就把
+    /// 渲染器绑回摄像头轨——摄像头是关的，画面立刻全黑，而屏幕轨其实
+    /// 还在出帧。判据必须回到画面本身：谁在出帧，谁就该被显示。
     private let cameraClock = RemoteFrameClock()
     private let screenClock = RemoteFrameClock()
     private weak var clockedCameraTrack: RTCVideoTrack?
@@ -462,7 +462,9 @@ final class PeerSession: NSObject {
            拿它判断"已经挂了"会假阴性：真机上每开一次共享就 add 一条新
            m-line（`SDP video 2` → `video 3`），方向判定被带偏、带宽被白吃。
            `screenTrackId` 是本端写死的字符串，永远读得到。 */
-        if screenSender != nil, screenTrackId == track.trackId {
+        if let sender = screenSender, screenTrackId == track.trackId {
+            sender.track = track
+            _ = screenTransceiver?.setDirection(.sendOnly, error: nil)
             return
         }
         /* 真有 sender 但 trackId 变了：**绝不 add**（多一条 m-line 的代价
@@ -473,16 +475,20 @@ final class PeerSession: NSObject {
            等价于 ObjC 的 replaceTrack：换轨不产生任何协商。 */
         if screenSender != nil, screenTrackId != nil {
             screenSender?.track = track
+            _ = screenTransceiver?.setDirection(.sendOnly, error: nil)
             screenTrackId = track.trackId
             localScreen = track
             return
         }
-        guard let newSender = peerConnection.add(track, streamIds: ["screen-\(peerID)"]) else {
+        // 独立屏幕通道必须显式创建，addTrack 可能复用已有的视频 transceiver。
+        let configuration = RTCRtpTransceiverInit()
+        configuration.direction = .sendOnly
+        configuration.streamIds = ["screen-\(peerID)"]
+        guard let transceiver = peerConnection.addTransceiver(with: track, init: configuration) else {
             return
         }
-        screenSender = newSender
-        screenTransceiver = peerConnection.transceivers.first { $0.sender.senderId == newSender.senderId }
-        _ = screenTransceiver?.setDirection(.sendOnly, error: nil)
+        screenSender = transceiver.sender
+        screenTransceiver = transceiver
         screenTrackId = track.trackId
         screenSenderDead = false
     }
@@ -545,8 +551,8 @@ final class PeerSession: NSObject {
            对方先发 offer 时，answer 不能新增 m-line：sender 建好了、
            轨也开了，但它没有 mid，帧永远到不了编码器。这里以本地 SDP 为准，
            没进就补一次 offer（只补一次，重发由 scheduleOfferRetry 负责）。 */
-        let inSDP = Self.screenMLineAcceptsSend(peerConnection.localDescription?.sdp)
-            && !(screenTransceiver?.mid ?? "").isEmpty
+        let inSDP = Self.screenMLineAcceptsSend(peerConnection.localDescription?.sdp, mid: screenTransceiver?.mid)
+            && Self.videoDirectionAllowsReceive(peerConnection.remoteDescription?.sdp, mid: screenTransceiver?.mid)
         localScreen = track
         ensureScreenSender(track)
         track.isEnabled = true
@@ -666,9 +672,9 @@ final class PeerSession: NSObject {
            （本地描述里 transceiver 一旦创建就会带上），但 WebRTC 不会为它
            建 VideoSendStream——这正是"已进SDP + 0 帧"的假象来源。 */
         let midValue = screenTransceiver?.mid ?? ""
-        let screenInSDP = Self.screenMLineAcceptsSend(localSDP)
+        let screenInSDP = Self.screenMLineAcceptsSend(localSDP, mid: screenTransceiver?.mid)
             && !midValue.isEmpty
-        let remote = Self.videoDirectionAllowsReceive(peerConnection.remoteDescription?.sdp) ? "可收" : "不可收 ⚠️"
+        let remote = Self.videoDirectionAllowsReceive(peerConnection.remoteDescription?.sdp, mid: screenTransceiver?.mid) ? "可收" : "不可收 ⚠️"
         let ice: String
         switch peerConnection.iceConnectionState {
         case .connected: ice = "connected"
@@ -751,90 +757,62 @@ final class PeerSession: NSObject {
     /// `SDP video 3` 就把判断带偏：后补的摄像头流排在共享后面、方向 sendrecv，
     /// 于是共享被误判成"未进SDP"，每开一次共享就补一次协商，m-line 越补越多。
     /// 现在按 msid 定位到共享那一段再判方向，与顺序无关。
-    private static func screenMLineAcceptsSend(_ sdp: String?) -> Bool {
-        guard let sdp, !sdp.isEmpty else { return false }
-        var inVideo = false
-        var hasScreenMSID = false
-        var allows = false
-        for raw in sdp.split(whereSeparator: { $0.isNewline }) {
-            let line = String(raw)
-            if line.hasPrefix("m=") {
-                if inVideo, hasScreenMSID, allows { return true }
-                inVideo = line.hasPrefix("m=video")
-                hasScreenMSID = false
-                allows = false
-                continue
-            }
-            guard inVideo else { continue }
-            if line.hasPrefix("a=msid:screen-") {
-                hasScreenMSID = true
-            } else if line.hasPrefix("a=sendonly") || line.hasPrefix("a=sendrecv") {
-                allows = true
-            } else if line.hasPrefix("a=recvonly") || line.hasPrefix("a=inactive") {
-                allows = false
-            }
+    private static func screenMLineAcceptsSend(_ sdp: String?, mid: String?) -> Bool {
+        guard let mid, !mid.isEmpty else { return false }
+        return videoSections(sdp).contains {
+            $0.mid == mid && $0.screen && !$0.rejected
+                && ($0.direction == "sendonly" || $0.direction == "sendrecv")
         }
-        return inVideo && hasScreenMSID && allows
     }
 
-    /// 远端 SDP 里**共享那条** video m-line 是否允许本端发送。
-    /// 远端写 recvonly / sendrecv = 它能收；inactive / sendonly = 它不收。
-    ///
-    /// 1.8.3 及以前取的是"最后一条 video m-line"。我们本地有 3 条 video
-    /// （摄像头 / 共享 / 收对方画面），远端 answer 里排在最后的往往正是
-    /// "对方发给我"的那条，它的方向天生不是 recvonly——于是这个判断
-    /// **永远显示"远端可收"**，哪怕共享那条被答成 inactive。
-    /// 1.8.3 现场就是"远端可收 + 0 包 0 帧"这种自相矛盾的组合。
-    /// 现在按 msid 定位共享那一段再判方向；找不到 msid 时才退回旧逻辑。
-    private static func videoDirectionAllowsReceive(_ sdp: String?) -> Bool {
-        guard let sdp, !sdp.isEmpty else { return false }
-        var inVideo = false
-        var hasScreenMSID = false
-        var allows = false
-        var foundScreen = false
+    private struct VideoSection {
+        var mid = ""
+        var screen = false
+        var rejected = false
+        var direction = "sendrecv"
+    }
+
+    /// SDP session direction is inherited unless a media section overrides it.
+    /// A rejected (port zero) section cannot send or receive, regardless of msid.
+    private static func videoSections(_ sdp: String?) -> [VideoSection] {
+        guard let sdp else { return [] }
+        var sections: [VideoSection] = []
+        var current: VideoSection?
+        var sessionDirection = "sendrecv"
+        var inSession = true
         for raw in sdp.split(whereSeparator: { $0.isNewline }) {
             let line = String(raw)
             if line.hasPrefix("m=") {
-                if inVideo, hasScreenMSID {
-                    foundScreen = true
-                    if allows { return true }
+                if let current { sections.append(current) }
+                inSession = false
+                let fields = line.split(whereSeparator: { $0.isWhitespace })
+                if fields.first == "m=video" {
+                    current = VideoSection()
+                    current?.direction = sessionDirection
+                    current?.rejected = fields.count < 2 || fields[1].split(separator: "/").first == "0"
+                } else {
+                    current = nil
                 }
-                inVideo = line.hasPrefix("m=video")
-                hasScreenMSID = false
-                allows = false
-                continue
-            }
-            guard inVideo else { continue }
-            if line.hasPrefix("a=msid:screen-") {
-                hasScreenMSID = true
-            } else if line.hasPrefix("a=recvonly") || line.hasPrefix("a=sendrecv") {
-                allows = true
-            } else if line.hasPrefix("a=inactive") || line.hasPrefix("a=sendonly") {
-                allows = false
+            } else if ["a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"].contains(line) {
+                let direction = String(line.dropFirst(2))
+                if inSession { sessionDirection = direction }
+                else { current?.direction = direction }
+            } else if line.hasPrefix("a=mid:") {
+                current?.mid = String(line.dropFirst(6))
+            } else if line.hasPrefix("a=msid:screen-") {
+                current?.screen = true
             }
         }
-        if inVideo, hasScreenMSID {
-            foundScreen = true
-            if allows { return true }
-        }
-        /* 找到了共享那条且它不收 —— 结论就是"不收"，不要拿别的 m-line 洗白。 */
-        if foundScreen { return false }
+        if let current { sections.append(current) }
+        return sections
+    }
 
-        /* 远端没回 msid（个别网关会剥掉）：退回"最后一条 video"的老判定。 */
-        var result = false
-        var scanning = false
-        for raw in sdp.split(whereSeparator: { $0.isNewline }) {
-            let line = String(raw)
-            if line.hasPrefix("m=video") { scanning = true; continue }
-            if line.hasPrefix("m=") { scanning = false; continue }
-            guard scanning else { continue }
-            if line.hasPrefix("a=recvonly") || line.hasPrefix("a=sendrecv") {
-                result = true
-            } else if line.hasPrefix("a=inactive") || line.hasPrefix("a=sendonly") {
-                result = false
-            }
+    private static func videoDirectionAllowsReceive(_ sdp: String?, mid: String?) -> Bool {
+        guard let mid, !mid.isEmpty else { return false }
+        return videoSections(sdp).contains {
+            $0.mid == mid && !$0.rejected
+                && ($0.direction == "recvonly" || $0.direction == "sendrecv")
         }
-        return result
     }
 
     /// 视频上行的完整现场，供共享看门狗与诊断面板使用。
@@ -869,9 +847,10 @@ final class PeerSession: NSObject {
         summary.attached = screenSender?.track?.trackId == track.trackId
         // 最后一条 video m-line 就是共享那条（摄像头先建，共享后建）。
         let localSDP = peerConnection.localDescription?.sdp
-        summary.screenInSDP = Self.screenMLineAcceptsSend(localSDP)
+        summary.screenInSDP = Self.screenMLineAcceptsSend(localSDP, mid: screenTransceiver?.mid)
             && !(screenTransceiver?.mid ?? "").isEmpty
         summary.sendsUpstream = summary.screenInSDP
+            && Self.videoDirectionAllowsReceive(peerConnection.remoteDescription?.sdp, mid: screenTransceiver?.mid)
         summary.senderCount = peerConnection.senders.filter { $0.track?.kind == "video" }.count
         return summary
     }
@@ -1313,17 +1292,8 @@ final class PeerSession: NSObject {
     }
 
     private func acceptRemoteOffer(_ description: RTCSessionDescription, narrowed: Bool = true) {
-        /* 把对端 offer 的视频编码收窄到 H.264。
-           浏览器默认把 VP8 排在最前，answer 只能按 offer 顺序选，
-           协商结果就是 VP8——而 iOS 没有 VP8 硬编码器，880×1920 的屏幕内容
-           软编跑不动：帧率 7fps、每帧 3KB、画面糊成块。详见 SDPCodecFilter。 */
-        var target = description
-        if narrowed {
-            let filtered = SDPCodecFilter.preferH264Only(description.sdp)
-            if filtered != description.sdp {
-                target = RTCSessionDescription(type: .offer, sdp: filtered)
-            }
-        }
+        // 远端 SDP 是对方真实能力，必须保持原文。
+        let target = description
         peerConnection.setRemoteDescription(target) { [weak self] error in
             Task { @MainActor in
                 guard let self = self else { return }
@@ -1448,12 +1418,8 @@ final class PeerSession: NSObject {
         narrowed: Bool = true
     ) {
         var target = description
-        /* offer 和 answer 都要过一遍。
-           answer 的 fmtp 是 libwebrtc 按收到的 offer 生成的：只要 offer 的 level
-           已经抬到 4.0，answer 也会是 4.0。但 iOS 自己发 offer 时 answer 由浏览器给，
-           那边还是 `42001f`，回程同样要抬——否则屏幕上看到的是"共享那条是 3.1"，
-           编码器照样丢帧。`preferH264Only` 幂等，跑两遍不会改坏。 */
-        if narrowed, description.type == .offer || description.type == .answer {
+        // 仅筛选本地 offer；answer 保留 WebRTC 的真实协商结果。
+        if narrowed, description.type == .offer {
             var filtered = SDPCodecFilter.preferH264Only(description.sdp)
             /* 再给这份本地描述写起始码率。
                libwebrtc 对每条新的视频 send stream 固定从 300kbps 起步，
@@ -1476,6 +1442,15 @@ final class PeerSession: NSObject {
             if filtered != description.sdp {
                 target = RTCSessionDescription(type: description.type, sdp: filtered)
             }
+        }
+        /* level 修正与 payload 列表是两件事：它描述的是**本端编码器的能力**，
+           offer / answer 都必须做。
+           少这一条，answer 路径（网页先发 offer、iOS 后进会）拿到的是
+           Chrome 的 `42001f` = Level 3.1，VideoToolbox 编不出 880×1920 的帧，
+           对端看到的仍然是"有包、有轨、没有画面"。 */
+        let leveled = SDPCodecFilter.raiseH264Level(target.sdp)
+        if leveled != target.sdp {
+            target = RTCSessionDescription(type: target.type, sdp: leveled)
         }
         peerConnection.setLocalDescription(target) { [weak self] error in
             Task { @MainActor in

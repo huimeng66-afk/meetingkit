@@ -52,7 +52,7 @@ struct AvatarView: View {
     private var ring: some View {
         Circle()
             .stroke(Theme.Palette.accent, lineWidth: 2)
-            .scaleEffect(isPulsing ? 1.08 : 1.0)
+            .scaleEffect(isPulsing ? GlassMotion.scale(1.04) : 1.0)
             .opacity(ringOpacity)
             .animationCompat(ringAnimation, value: isPulsing)
     }

@@ -154,14 +154,16 @@ struct ChatPanel: View {
             // 回车发送走 iOS 13 就有的 `onCommit` 初始化器。
             // `.submitLabel(.send)` + `.onSubmit {}` 是 15 起的，14 上不可用。
             TextField("发消息…", text: $draft, onCommit: send)
+                .accessibilityLabel("聊天消息")
+                .submitLabel(.send)
                 .font(Theme.Typography.body)
                 .foregroundColor(Theme.Palette.textPrimary)
                 .accentColor(Theme.Palette.accent)
                 .padding(.horizontal, Theme.Metrics.space3)
-                .frame(height: 38)
+                .frame(minHeight: 44)
                 .background(
                     RoundedRectangle(cornerRadius: 19, style: .continuous)
-                        .fill(Color.white.opacity(0.08))
+                        .fill(Theme.Palette.surfaceSubtle)
                 )
 
             Button {
@@ -170,7 +172,7 @@ struct ChatPanel: View {
                 Image(systemName: SymbolCompat.name("arrow.up", "arrow.up.circle.fill"))
                     .font(.system(size: 14, weight: .bold))
                     .foregroundColor(canSend ? .white : Theme.Palette.textTertiary)
-                    .frame(width: 36, height: 36)
+                    .frame(width: 44, height: 44)
                     .background(
                         Circle().fill(
                             canSend
@@ -239,7 +241,7 @@ struct ChatMessageRow: View {
                 .padding(.horizontal, Theme.Metrics.space3)
                 .padding(.vertical, 6)
                 .background(
-                    Capsule().fill(Color.white.opacity(0.08))
+                    Capsule().fill(Theme.Palette.surfaceSubtle)
                 )
             Spacer(minLength: 0)
         }
@@ -297,7 +299,7 @@ struct ChatMessageRow: View {
                     .frame(maxWidth: maxBubbleWidth, alignment: .leading)
                     .background(
                         RoundedRectangle(cornerRadius: Theme.Metrics.cardRadius, style: .continuous)
-                            .fill(Color.white.opacity(0.08))
+                            .fill(Theme.Palette.surfaceSubtle)
                     )
 
                 Text(ChatTimestamp.time(from: message.date))

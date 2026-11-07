@@ -143,7 +143,7 @@ struct SettingsPanel: View {
         }
         .background(
             RoundedRectangle(cornerRadius: Theme.Metrics.cardRadius, style: .continuous)
-                .fill(Color.white.opacity(0.04))
+                .fill(Theme.Palette.surfaceSubtle)
         )
         .overlay(
             RoundedRectangle(cornerRadius: Theme.Metrics.cardRadius, style: .continuous)
@@ -167,7 +167,7 @@ struct SettingsPanel: View {
                 .foregroundColor(Theme.Palette.textTertiary)
                 .padding(.horizontal, 8)
                 .frame(height: 22)
-                .background(Capsule().fill(Color.white.opacity(0.06)))
+                .background(Capsule().fill(Theme.Palette.surfaceSubtle))
         }
         .opacity(0.6)
         .accessibilityElement(children: .combine)
@@ -190,7 +190,7 @@ struct SettingsPanel: View {
                     .foregroundColor(Theme.Palette.textTertiary)
             }
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
     }
 
     private func toggleRow(
@@ -216,7 +216,7 @@ struct SettingsPanel: View {
         HStack(spacing: Theme.Metrics.space3) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
+                    .fill(Theme.Palette.surfaceSubtle)
 
                 Image(systemName: symbol)
                     .font(.system(size: 14, weight: .medium))

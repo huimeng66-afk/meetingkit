@@ -148,11 +148,11 @@ struct HomeSidebar: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(Theme.Palette.ink2)
                     .frame(width: 34, height: 34)
-                    .background(Circle().fill(Color.white.opacity(0.06)))
+                    .background(Circle().fill(Theme.Palette.surfaceSubtle))
                     .frame(width: 44, height: 44)
                     .contentShape(Rectangle())
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .accessibilityLabel("关闭侧边栏")
         }
         .padding(.horizontal, 16)
@@ -187,7 +187,7 @@ struct HomeSidebar: View {
             )
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .accessibilityLabel("发起会议")
     }
 
@@ -315,7 +315,7 @@ struct HomeSidebar: View {
                 .liquidGlass(.clear, cornerStyle: .continuous(16), isInteractive: true, castsShadow: false)
                 .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .accessibilityLabel("账号与个人资料")
         } else {
             Button {
@@ -325,7 +325,7 @@ struct HomeSidebar: View {
                 HStack(spacing: 10) {
                     ZStack {
                         Circle()
-                            .fill(Color.white.opacity(0.08))
+                            .fill(Theme.Palette.surfaceSubtle)
                             .frame(width: 34, height: 34)
 
                         Image(systemName: SymbolCompat.name("person.fill", "person"))
@@ -355,7 +355,7 @@ struct HomeSidebar: View {
                 .liquidGlass(.clear, cornerStyle: .continuous(16), isInteractive: true, castsShadow: false)
                 .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .accessibilityLabel("登录账号")
         }
     }

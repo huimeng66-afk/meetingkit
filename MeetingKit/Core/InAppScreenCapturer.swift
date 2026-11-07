@@ -38,6 +38,7 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
     private var source: RTCVideoSource?
     private var capturer: RTCVideoCapturer?
     private var running = false
+    private var stoppingCapture = false
     /// 已设过的输出画布（见 ScreenOutputSize）。
     private var adaptedCanvas: (width: Int, height: Int)?
     /// 上一帧送进编码器的时间戳与间隔：帧率闸门，多出来的帧直接丢。
@@ -55,15 +56,20 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
     }
 
     func start(source: RTCVideoSource) {
-        // 重复点共享：静默收掉上一轮再重来，不能被 `guard !running` 吞掉。
-        if isRunning || recorder.isRecording {
-            recorder.stopCapture { _ in }
-            stateLock.lock()
-            running = false
-            stateLock.unlock()
+        // ReplayKit stopCapture is asynchronous. A repeated start must not race
+        // its completion or stop an unrelated recording owned by the singleton.
+        stateLock.lock()
+        let busy = running || stoppingCapture
+        stateLock.unlock()
+        guard !busy else { return }
+        guard !recorder.isRecording else {
+            lastError = "系统录屏正在使用，请先停止现有录屏"
+            notify(.failed(lastError!))
+            return
         }
         stateLock.lock()
         epoch += 1
+        let captureEpoch = epoch
         stateLock.unlock()
 
         guard recorder.isAvailable else {
@@ -96,7 +102,7 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
         notify(.picking)
 
         recorder.startCapture { [weak self] sampleBuffer, sampleType, error in
-            guard let self else { return }
+            guard let self, self.acceptsCallback(epoch: captureEpoch) else { return }
             if let error = error {
                 self.lastError = error.localizedDescription
                 self.fail(error.localizedDescription)
@@ -105,7 +111,7 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
             guard sampleType == .video else { return }
             self.handle(sampleBuffer)
         } completionHandler: { [weak self] error in
-            guard let self else { return }
+            guard let self, self.acceptsCallback(epoch: captureEpoch) else { return }
             if let error = error {
                 self.lastError = error.localizedDescription
                 self.fail(error.localizedDescription)
@@ -119,6 +125,7 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
         stateLock.lock()
         let wasRunning = running
         running = false
+        stoppingCapture = stoppingCapture || wasRunning
         // 先占票号：此后排队的旧回调一律作废。
         epoch += 1
         stateLock.unlock()
@@ -129,7 +136,11 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
             return
         }
         recorder.stopCapture { [weak self] _ in
-            self?.notify(.stopped)
+            guard let self else { return }
+            self.stateLock.lock()
+            self.stoppingCapture = false
+            self.stateLock.unlock()
+            self.notify(.stopped)
         }
     }
 
@@ -138,10 +149,26 @@ final class InAppScreenCapturer: NSObject, ScreenSharingSession {
         stopReason = message
         phase = .failed
         stateLock.lock()
+        let shouldStop = running
         running = false
+        stoppingCapture = stoppingCapture || shouldStop
         epoch += 1
         stateLock.unlock()
+        if shouldStop {
+            recorder.stopCapture { [weak self] _ in
+                guard let self else { return }
+                self.stateLock.lock()
+                self.stoppingCapture = false
+                self.stateLock.unlock()
+            }
+        }
         notify(.failed(message))
+    }
+
+    private func acceptsCallback(epoch token: Int) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return running && epoch == token
     }
 
     private func handle(_ sampleBuffer: CMSampleBuffer) {

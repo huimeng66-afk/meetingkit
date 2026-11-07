@@ -41,19 +41,19 @@ enum GlassMotion {
 
     /// 按下。欠阻尼，松手时有可见的过冲——这是"液态"的来源。
     /// 不要拿它做任何整块面板的进出场：过冲放在大面积的面上会像果冻。
-    static let press = Animation.spring(response: 0.26, dampingFraction: 0.62)
+    static var press: Animation { isReduceMotion ? .linear(duration: 0.1) : .easeOut(duration: 0.12) }
 
     /// 松手归位 / 选中切换。比 Theme.Motion.standard 稍快、稍弹。
-    static let settle = Animation.spring(response: 0.38, dampingFraction: 0.82)
+    static var settle: Animation { isReduceMotion ? .linear(duration: 0.1) : .spring(response: 0.28, dampingFraction: 0.94) }
 
     /// 进场。行程 14~24pt 的元素用它。
-    static let enter = Animation.spring(response: 0.52, dampingFraction: 0.86)
+    static var enter: Animation { isReduceMotion ? .linear(duration: 0.12) : .easeOut(duration: 0.28) }
 
     /// 退场。退场永远比进场快：用户已经决定离开，不该再等一次回弹。
     static let exit = Animation.easeIn(duration: 0.16)
 
     /// 形变（宽度拉伸、圆角收敛）。必须和拖拽同帧结束，不能带 spring。
-    static let morph = Animation.interactiveSpring(response: 0.3, dampingFraction: 0.8, blendDuration: 0.2)
+    static var morph: Animation { isReduceMotion ? .linear(duration: 0.1) : .interactiveSpring(response: 0.3, dampingFraction: 0.94, blendDuration: 0.2) }
 
     // MARK: Stagger
 
@@ -63,7 +63,7 @@ enum GlassMotion {
 
     /// 逐条入场延迟。最多累计到第 8 条就封顶，否则长列表尾部会等半秒。
     static func staggerDelay(_ index: Int) -> Double {
-        Double(min(max(index, 0), 8)) * staggerStep
+        Double(min(max(index, 0), 4)) * staggerStep
     }
 
     /// 带延迟的进场曲线。Reduce Motion 下退化为 0.12s 线性淡入。
@@ -190,7 +190,8 @@ extension AnyTransition {
     /// 中间那 0.1 秒里文字互相穿透，看起来像信号不良。
     /// 加一点点缩放（1.02 → 1）能让"新页面压上来"这件事成立。
     static var pagePush: AnyTransition {
-        .asymmetric(
+        if GlassMotion.isReduceMotion { return .opacity }
+        return .asymmetric(
             insertion: .opacity.combined(with: .scale(scale: 1.02)),
             removal: .opacity.combined(with: .scale(scale: 0.985))
         )

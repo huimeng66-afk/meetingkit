@@ -120,7 +120,7 @@ struct ScreenShareStage: View {
                     .blur(radius: 18)
 
                 Circle()
-                    .fill(Color.white.opacity(0.06))
+                    .fill(Theme.Palette.surfaceSubtle)
                     .frame(width: 88, height: 88)
 
                 Image(systemName: SymbolCompat.name(
@@ -185,7 +185,7 @@ struct ScreenShareStage: View {
                 )
                 .contentShape(Capsule())
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .padding(.top, 22)
             .accessibilityLabel("停止共享屏幕")
 
@@ -223,7 +223,7 @@ struct ScreenShareStage: View {
             } else {
                 ZStack {
                     Circle()
-                        .fill(Color.white.opacity(0.06))
+                        .fill(Theme.Palette.surfaceSubtle)
                         .frame(width: 64, height: 64)
 
                     Image(systemName: SymbolCompat.name("rectangle.on.rectangle", "rectangle.fill"))
@@ -324,7 +324,7 @@ struct ScreenShareStage: View {
                 .frame(width: 42, height: 42)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .accessibilityLabel(label)
     }
 

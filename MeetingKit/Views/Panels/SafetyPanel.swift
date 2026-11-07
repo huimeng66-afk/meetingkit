@@ -108,7 +108,7 @@ struct SafetyPanel: View {
         HStack(spacing: Theme.Metrics.space3) {
             ZStack {
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
+                    .fill(Theme.Palette.surfaceSubtle)
 
                 Image(systemName: symbol)
                     .font(.system(size: 15, weight: .medium))

@@ -45,7 +45,9 @@ struct SharedFrameStore {
         fileQueue.sync {
             guard let url = fileURL() else { return false }
             do {
-                try data.write(to: url, options: .atomic)
+                // Keep the transient frame accessible after the device locks, once unlocked
+                // since boot. Atomic replacement must carry protection on every write.
+                try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
                 return true
             } catch {
                 // 静默失败：共享画面丢一帧不影响会议，宁可什么都不做也不能中断广播。

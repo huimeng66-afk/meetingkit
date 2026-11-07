@@ -81,7 +81,7 @@ struct BrandPressStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.98 : 1.0)
+            .scaleEffect(configuration.isPressed ? GlassMotion.scale(0.98) : 1.0)
             .opacity(configuration.isPressed ? 0.9 : 1.0)
             .animationCompat(Theme.Motion.standard, value: configuration.isPressed)
     }

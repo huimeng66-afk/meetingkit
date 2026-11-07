@@ -87,7 +87,7 @@ struct MeetingRoomView: View {
                         bottomInset: insets.bottom
                     )
                     .zIndex(2)
-                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                    .transition(GlassMotion.isReduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.97)))
                 }
 
                 toastLayer(insets: insets)
@@ -131,6 +131,7 @@ struct MeetingRoomView: View {
             }
         }
         // 键盘由 GlassSheet 自己按通知上移；关掉系统的自动避让，避免"移两次"。
+        .environment(\.colorScheme, .dark)
         .ignoresSafeArea(.keyboard, edges: .bottom)
         .onAppear {
             viewModel.onAppear()
@@ -386,7 +387,7 @@ struct MeetingRoomView: View {
                             .frame(height: 44)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(PlainButtonStyle())
+                    .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                     .frame(maxWidth: 220)
                     .accessibilityLabel("返回首页")
                 }

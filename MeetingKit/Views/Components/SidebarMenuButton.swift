@@ -33,7 +33,7 @@ struct SidebarMenuButton: View {
                 .frame(width: 44, height: 44)
                 .contentShape(Circle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .accessibilityLabel("打开导航菜单")
     }
 }

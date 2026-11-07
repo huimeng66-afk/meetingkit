@@ -147,7 +147,7 @@ struct TopStatusBar: View {
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundColor(Theme.Palette.textPrimary)
                 .frame(width: 36, height: 36)
-                .background(Circle().fill(Color.white.opacity(0.06)))
+                .background(Circle().fill(Theme.Palette.surfaceSubtle))
                 .overlay(Circle().stroke(Theme.Palette.glassStroke, lineWidth: 1))
                 // 44pt 外扩命中区：视觉 36，触控 44，满足 HIG 最小触控尺寸。
                 .frame(width: 44, height: 44)
@@ -305,7 +305,7 @@ struct TopStatusBar: View {
                         )
                         .contentShape(Capsule())
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                 .accessibilityLabel("停止共享屏幕")
             } else {
                 Text("观看中")

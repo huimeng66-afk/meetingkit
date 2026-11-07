@@ -42,7 +42,7 @@ struct ControlButton: View {
 
     /// 圆钮直径。底栏 40：7 颗并排后每颗仍有约 51pt 的横向命中区，
     /// 圆钮本身 40 也高于 40pt 的可用下限，手指不会点到隔壁。
-    var size: CGFloat = 40
+    var size: CGFloat = 44
 
     /// 数字角标（成员人数）。传 nil 不显示。
     var badgeText: String? = nil
@@ -100,7 +100,7 @@ struct ControlButton: View {
 
                 if showsTitle {
                     Text(title)
-                        .font(.system(size: 9.5, weight: .medium))
+                        .font(Theme.Typography.label)
                         .foregroundColor(titleColor)
                         .lineLimit(1)
                         .minimumScaleFactor(0.75)
@@ -120,6 +120,8 @@ struct ControlButton: View {
             including: onLongPress == nil ? GestureMask.none : GestureMask.all
         )
         .accessibilityLabel(accessibilityText ?? title)
+        .accessibilityValue(isLoading ? "正在处理" : "")
+        .accessibilityHint(onLongPress == nil ? "" : "长按可打开更多选项")
     }
 
     private var longPressGesture: some Gesture {
@@ -150,7 +152,7 @@ struct ControlButton: View {
         case .neutral:
             return isPrimary ? .white : Theme.Palette.textPrimary
         case .off:
-            return Color(hex: 0xFCA5A5)
+            return Theme.Palette.danger
         case .broadcast:
             return .white
         }
@@ -163,7 +165,7 @@ struct ControlButton: View {
         case .neutral:
             return isPrimary ? Theme.Palette.accent : Theme.Palette.textSecondary
         case .off, .broadcast:
-            return Color(hex: 0xFCA5A5)
+            return Theme.Palette.danger
         }
     }
 
@@ -209,7 +211,7 @@ struct ControlButtonPressStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? GlassMotion.scale(0.92) : 1.0)
+            .scaleEffect(configuration.isPressed ? GlassMotion.scale(0.97) : 1.0)
             .opacity(configuration.isPressed ? 0.9 : 1.0)
             .animation(
                 configuration.isPressed ? GlassMotion.press : GlassMotion.settle,

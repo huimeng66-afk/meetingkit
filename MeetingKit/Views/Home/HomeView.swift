@@ -386,7 +386,7 @@ struct HomeView: View {
             .frame(height: 64)
             .background(
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(Color.white.opacity(0.04))
+                    .fill(Theme.Palette.surfaceSubtle)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
@@ -394,7 +394,7 @@ struct HomeView: View {
             )
             .contentShape(Rectangle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .accessibilityLabel("登录，登录后可发起会议")
     }
 
@@ -697,13 +697,13 @@ struct HomeView: View {
                     .foregroundColor(Theme.Palette.ink)
                     .frame(width: 36, height: 36)
                     .background(
-                        Circle().fill(Color.white.opacity(0.06))
+                        Circle().fill(Theme.Palette.surfaceSubtle)
                     )
                     // 视觉 36、命中 44。
                     .frame(width: 44, height: 44)
                     .contentShape(Circle())
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .accessibilityLabel("打开导航菜单")
 
             RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -743,7 +743,7 @@ struct HomeView: View {
                     .frame(width: 44, height: 44)
                     .contentShape(Circle())
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .accessibilityLabel("账号与个人资料")
         } else {
             Button {
@@ -891,6 +891,7 @@ struct HomeView: View {
                 .frame(width: 22)
 
             TextField("会议号", text: $meetingNumber)
+                .accessibilityLabel("会议号")
                 .keyboardType(.numberPad)
                 // TextField 只有 View 版本的 kerning（iOS 16+），
                 // 会议号的字距交给 rounded + monospacedDigit 的等宽字形，
@@ -919,12 +920,12 @@ struct HomeView: View {
                         .frame(width: 32, height: 32)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                 .accessibilityLabel("清空会议号")
             }
         }
         .padding(.horizontal, 14)
-        .frame(height: 56)
+        .frame(minHeight: 56)
     }
 
     private var nameRow: some View {
@@ -935,6 +936,7 @@ struct HomeView: View {
                 .frame(width: 22)
 
             TextField("你的名称（选填）", text: $guestName)
+                .accessibilityLabel("你的名称，选填")
                 .font(.system(size: 15))
                 .foregroundColor(Theme.Palette.ink)
                 .autocapitalization(.none)
@@ -957,12 +959,12 @@ struct HomeView: View {
                         .frame(width: 32, height: 32)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                 .accessibilityLabel("清空名称")
             }
         }
         .padding(.horizontal, 14)
-        .frame(height: 52)
+        .frame(minHeight: 52)
     }
 
     /// 麦克风 / 摄像头预置。和网页端一样只做「入会前最后一次检查」，
@@ -1022,7 +1024,7 @@ struct HomeView: View {
             )
             .contentShape(Capsule())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .accessibilityLabel(isOn ? "关闭\(title)" : "开启\(title)")
         .accessibilityValue(isOn ? "已开启" : "已关闭")
     }
@@ -1040,10 +1042,10 @@ struct HomeView: View {
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundColor(.white)
                 .frame(maxWidth: .infinity)
-                .frame(height: 50)
+                .frame(minHeight: 50)
                 .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         // 染色玻璃 + 白字，就是系统 `.glassProminent` 的成色。
         // 之前给文字加暗投影是多余的一层：投影会压在玻璃折射之上，字看着发脏。
         .liquidGlass(
@@ -1096,10 +1098,10 @@ struct HomeView: View {
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundColor(.white)
                     .frame(maxWidth: .infinity)
-                    .frame(height: 50)
+                    .frame(minHeight: 50)
                     .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             .liquidGlass(
                 .tinted(Theme.Palette.accent),
                 cornerStyle: .continuous(14),
@@ -1204,7 +1206,7 @@ struct HomeView: View {
                         .frame(minWidth: 44, minHeight: 44)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                 .disabled(router.history.isEmpty)
                 .opacity(router.history.isEmpty ? 0.4 : 1.0)
                 .accessibilityLabel("清空历史会议")
@@ -1473,7 +1475,7 @@ struct HomeView: View {
 
     private var rowDivider: some View {
         Rectangle()
-            .fill(Color.white.opacity(0.06))
+            .fill(Theme.Palette.surfaceSubtle)
             .frame(height: 0.5)
             .padding(.leading, 60)
     }
@@ -1519,7 +1521,7 @@ struct HomeView: View {
                         .background(Capsule().fill(Theme.Palette.accent.opacity(0.12)))
                         .contentShape(Capsule())
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             }
         }
         .padding(.horizontal, 14)
@@ -1678,7 +1680,7 @@ struct HomeView: View {
                             .frame(width: 44, height: 44)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(PlainButtonStyle())
+                    .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
                     .accessibilityLabel("关闭资料编辑")
                 }
 
@@ -1692,10 +1694,10 @@ struct HomeView: View {
                         .foregroundColor(Theme.Palette.ink)
                         .accentColor(Theme.Palette.accent)
                         .padding(.horizontal, 16)
-                        .frame(height: 48)
+                        .frame(minHeight: 48)
                         .background(
                             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .fill(Color.white.opacity(0.06))
+                                .fill(Theme.Palette.surfaceSubtle)
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -1744,7 +1746,7 @@ struct HomeView: View {
                             .foregroundColor(.white)
                     }
                     .frame(maxWidth: .infinity)
-                    .frame(height: 50)
+                    .frame(minHeight: 50)
                     .background(
                         RoundedRectangle(cornerRadius: Theme.Metrics.buttonRadius, style: .continuous)
                             .fill(Theme.Palette.brandGradient)
@@ -1799,7 +1801,7 @@ struct HomeView: View {
             .frame(width: 44, height: 44)
             .contentShape(Circle())
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
         .accessibilityLabel("头像颜色 \(index + 1)")
     }
 

@@ -19,13 +19,8 @@ struct SharePickerPanel: View {
 
     @State private var selectsScreenSource: Bool = true
 
-    /// 是否具备共享能力。
-    ///
-    /// iOS 27 起系统不再创建广播扩展进程（ReplayKit 的广播 API 被判
-    /// "No longer supported"），共享改由 ScreenCaptureKit 在本进程内完成，
-    /// **不需要 App Group**，任何签名都可用。
-    /// iOS 26 及以下仍然依赖广播扩展 + App Group。
-    /// 能力说明。三种实现的能力差别很大，不能共用一句文案——
+    /// 能力说明由运行时后端选择决定，不以未验证的系统版本推断能力。
+    /// 三种实现的能力差别很大，不能共用一句文案——
     /// 用户看到"可以共享整个屏幕"却只能共享 App 内画面，会比不知道更困惑。
     private var shareSubtitle: String {
         switch viewModel.screenSharingBackend {
@@ -307,7 +302,7 @@ struct SharePickerPanel: View {
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundColor(Theme.Palette.accent)
                 }
-                .buttonStyle(PlainButtonStyle())
+                .buttonStyle(LiquidPressStyle(pressedScale: 0.985, highlight: 0))
             }
 
             Text(viewModel.shareDiagnosticsReport)
@@ -459,11 +454,7 @@ struct SharePickerPanel: View {
     // MARK: - 动作
 
     private func startSharing() {
-        /* iOS 27：系统已经不再创建广播扩展进程。
-           继续走 BroadcastPickerPresenter 只会让系统弹出一张
-           "天穹会议 00:04 + 转圈"的卡片，然后永远停在 idle——
-           真机上那一组"扩展进程：本次未启动 / 0 帧"就是这么来的。
-           改由 ScreenCaptureKit 在本进程内共享，选完内容立刻出帧。 */
+        // 使用现有运行时能力判断选择共享入口；系统可用性由后端负责验证。
         if viewModel.supportsNativeScreenShare {
             viewModel.closePanel()
             viewModel.startNativeScreenShare()
