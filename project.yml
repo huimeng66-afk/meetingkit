@@ -68,8 +68,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: MeetingKit/MeetingKit.entitlements
         # 没有这一行，Assets 里的 AppIcon 不会被真正用上，提审时是"图标缺失"。
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: "1.9.11"
-        CURRENT_PROJECT_VERSION: "68"
+        MARKETING_VERSION: "1.9.12"
+        CURRENT_PROJECT_VERSION: "69"
         # ScreenCaptureKit 的链接方式由 scripts/build-ipa-unsigned.sh 按 SDK
         # 版本决定（iOS 27+ 才加 -weak_framework）：Xcode 26 的 iOS SDK 里
         # 没有这个 framework，写死会直接链接失败；而强链接又会让产物在
@@ -95,8 +95,8 @@ targets:
         # 扩展进程禁止调用 application-only 的 API，打开这个开关能让编译器提前拦住误用。
         APPLICATION_EXTENSION_API_ONLY: "YES"
         SKIP_INSTALL: "YES"
-        MARKETING_VERSION: "1.9.11"
-        CURRENT_PROJECT_VERSION: "68"
+        MARKETING_VERSION: "1.9.12"
+        CURRENT_PROJECT_VERSION: "69"
 
 # XcodeGen 默认不会生成共享 scheme，CI 里的 `xcodebuild -scheme MeetingKit`
 # 会因为找不到 scheme 直接失败（本地 Xcode 打开工程时会自动补，所以只在 CI 暴露）。

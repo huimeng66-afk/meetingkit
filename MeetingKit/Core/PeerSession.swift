@@ -561,8 +561,11 @@ final class PeerSession: NSObject {
     func attachScreenTrack(_ track: RTCVideoTrack) {
         guard !isClosed else { return }
 
-        ensureScreenSender(track)
+        /* 先启用再 replace：上一轮停止共享时这条轨被置了 disabled，
+           若先 replace 后启用，编码器会先收到一次"轨禁用"，
+           在极短窗口里把刚建起来的 VideoSendStream 又拆掉。 */
         track.isEnabled = true
+        ensureScreenSender(track)
 
         /* 复用已协商的 camera mid：正常路径这里**一次协商都不该发生**。
            只有两种例外会把帧卡死，必须补一轮：
