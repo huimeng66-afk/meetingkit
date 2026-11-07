@@ -55,6 +55,11 @@ final class RealRTCClient: NSObject, RTCClient {
     private var screenStateHeartbeat: Timer?
     /// 被服务端回显误判、真的回了 off 的次数（诊断用）。
     private var screenFalseCorrections = 0
+    /// 服务端是否已经确认共享位在我身上（收到过自己的 screen:state on）。
+    ///
+    /// 只用于区分 `screen:busy` 是回声还是真冲突：没被确认过的 busy
+    /// 一定是"别人占着位"，继续推流只会让两端各说各话，全场黑屏。
+    private var screenStateConfirmed = false
     /// 当前摄像头设备（RTCCameraVideoCapturer 不暴露当前设备，需要自己记录）。
     private var currentCameraDevice: AVCaptureDevice?
 
@@ -680,6 +685,7 @@ final class RealRTCClient: NSObject, RTCClient {
         screenPusher?.stop()
         screenPusher = nil
         isScreenSharing = false
+        screenStateConfirmed = false
         videoCapturer?.stopCapture()
         videoCapturer = nil
         currentCameraDevice = nil
@@ -941,6 +947,8 @@ final class RealRTCClient: NSObject, RTCClient {
 
         isScreenSharing = true
         lastScreenShareStartAt = Date()
+        /* 新一轮共享从"未确认"开始：服务端还没认这个位。 */
+        screenStateConfirmed = false
 
         let profile = Self.screenEncodingProfile
         // 帧新鲜度下界：早于本次会话请求时刻的 JPEG 属于上一场，不推。
@@ -1000,6 +1008,7 @@ final class RealRTCClient: NSObject, RTCClient {
         isScreenSharing = true
         track.isEnabled = true
         lastScreenShareStartAt = Date()
+        screenStateConfirmed = false
         lastScreenShareStopAt = .distantPast
         zeroEncodeStreak = 0
         screenTrackPulsed = false
@@ -1592,6 +1601,7 @@ final class RealRTCClient: NSObject, RTCClient {
         screenPusher?.stop()
         screenPusher = nil
         isScreenSharing = false
+        screenStateConfirmed = false
         /* 只关轨，不拆 m-line，也不动摄像头那条。
            摄像头 sender 从头到尾没被替换过，所以没有"恢复"这个动作；
            共享 m-line 留着（没有帧就没有 RTP），下一轮点共享只是把轨打开，
@@ -1628,6 +1638,7 @@ final class RealRTCClient: NSObject, RTCClient {
         stopVideoUplinkWatchdog()
         stopRouteGuard()
         isScreenSharing = false
+        screenStateConfirmed = false
         screenPusher?.stop()
         screenPusher = nil
         for peer in remotePeers.values {
@@ -2859,7 +2870,16 @@ extension RealRTCClient: TianqiongSignalingDelegate {
                 if Date().timeIntervalSince(screenStartRequestedAt) < 20 { return }
                 screenFalseCorrections += 1
                 signaling.sendMediaState(audio: nil, video: nil, screen: false)
+                return
             }
+            /* 服务端**确认**共享位在我身上了。
+               这个标志只有一个用途：区分 screen:busy 是"回声"还是"真冲突"。
+               之前用"共享超过 2 秒"当回声判据，结果把真正的冲突也吞了：
+               服务端共享位卡在安卓的幽灵上，我这边推流、编码、发包全正常，
+               但全场看到的共享者始终是安卓——安卓那边拿不到 owner，
+               舞台不亮，用户看到的就是"显示我在共享，但是黑的"。
+               现在只有服务端明确回过 on 才算数，没确认过的一律当真冲突。 */
+            if on { screenStateConfirmed = true } else { screenStateConfirmed = false }
             return
         }
 
@@ -2889,13 +2909,14 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         /* 共享期间每 6 秒重申一次 screen:true。服务端共享位如果正好处在
            迁移窗口（旧 socket 还没清、新 socket 还没接），会对这条重申回一条
            screen:busy —— 那是回声，不是真冲突。
-           已经稳定共享超过 2 秒就把它当回声忽略：否则一次心跳就能把自己
-           正在跑的共享掐断，用户看到的是"共享莫名其妙自己停了"。 */
-        if isScreenSharing, Date().timeIntervalSince(lastScreenShareStartAt) > 2 {
+           判据必须是"服务端确认过共享位在我身上"（screenStateConfirmed），
+           而不是"我已经共享了多久"：真冲突恰恰会在共享 2 秒后才到达
+           （对端幽灵位要先超时、服务端才回 busy），用时间当判据会把它吞掉。 */
+        if isScreenSharing, screenStateConfirmed {
             ScreenShareRuntime.note("共享位回声 busy，已忽略")
             return
         }
-        // 别的参会者正在共享：停掉本地共享推流，提示由 VM 层转 toast。
+        // 服务端明确说别人占着共享位：停掉本地推流，别让画面继续空转。
         abortScreenShare(reason: "已有参会者正在共享屏幕，请稍后再试")
     }
 
