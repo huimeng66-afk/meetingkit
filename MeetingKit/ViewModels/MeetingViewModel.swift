@@ -356,6 +356,15 @@ final class MeetingViewModel: ObservableObject {
         if !notes.isEmpty {
             lines.append("自愈：\(notes)")
         }
+        /* 共享广播现场：心跳是否在跑、有没有把自己误纠正成"已停止"。
+           服务端把共享位清空时全场都会收起舞台，这一行是那种故障的唯一证据。 */
+        if let client = rtc as? RealRTCClient {
+            var stateLine = "共享广播：心跳\(client.isScreenStateHeartbeatAlive ? "开" : "停")"
+            if client.screenStateCorrections > 0 {
+                stateLine += " · 误纠正 \(client.screenStateCorrections) 次 ⚠️"
+            }
+            lines.append(stateLine)
+        }
 
         /* 链路现场：m-line 数 / 远端是否可收 / ICE。
            "挂轨、轨开、SDP 允许"这三项都是本端视角，全绿也可能一个包都发不出去。

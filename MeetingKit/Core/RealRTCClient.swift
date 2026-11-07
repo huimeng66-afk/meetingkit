@@ -46,6 +46,15 @@ final class RealRTCClient: NSObject, RTCClient {
     private var meetingInfo: [String: Any] = [:]
     /// 屏幕共享推流中（Broadcast 扩展确认后置 true）。
     private var isScreenSharing = false
+    /// 最近一次"请求开始共享"的时刻。
+    /// 用来放过"自己刚发的 screen:true 被服务端回显成 screen:state"这一拍：
+    /// 那时 isScreenSharing 可能还没置位，旧代码会立刻回一条 screen:false，
+    /// 服务端据此清空共享位并向全场广播 off——对端舞台当场塌掉。
+    private var screenStartRequestedAt = Date.distantPast
+    /// 共享期间周期性重申 screen:true 的定时器。
+    private var screenStateHeartbeat: Timer?
+    /// 被服务端回显误判、真的回了 off 的次数（诊断用）。
+    private var screenFalseCorrections = 0
     /// 当前摄像头设备（RTCCameraVideoCapturer 不暴露当前设备，需要自己记录）。
     private var currentCameraDevice: AVCaptureDevice?
 
@@ -667,6 +676,7 @@ final class RealRTCClient: NSObject, RTCClient {
         nativeUplinkGuard?.cancel()
         nativeUplinkGuard = nil
         stopRouteGuard()
+        stopScreenStateHeartbeat()
         screenPusher?.stop()
         screenPusher = nil
         isScreenSharing = false
@@ -878,7 +888,9 @@ final class RealRTCClient: NSObject, RTCClient {
         // 这里只做：启动帧推送 + 广播 screen:state。
         // 调用时机由 MeetingViewModel 在 bridge 确认"正在共享"后触发。
         guard isJoined else { return }
+        screenStartRequestedAt = Date()
         signaling?.sendMediaState(audio: nil, video: nil, screen: true)
+        startScreenStateHeartbeat()
     }
 
     func stopScreenShare() {
@@ -891,7 +903,36 @@ final class RealRTCClient: NSObject, RTCClient {
            只要信令还在，就把 off 送出去；重复发是幂等的。 */
         guard let signaling = signaling else { return }
         signaling.sendMediaState(audio: nil, video: nil, screen: false)
+        stopScreenStateHeartbeat()
     }
+
+    /// 共享期间每 6 秒重申一次 `screen:true`。
+    ///
+    /// 服务端在重连、共享位迁移、以及每轮体检时都可能把共享位短暂清空并
+    /// 向全场广播 `screen:state off`；对端（安卓）收到 off 会收起共享舞台，
+    /// 而除了共享者本人，没有任何一方能把它重新点亮。
+    /// 重申是幂等的：服务端只会把共享位记回我名下再广播一条 on。
+    private func startScreenStateHeartbeat() {
+        stopScreenStateHeartbeat()
+        let timer = Timer(timeInterval: 6, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isJoined, self.isScreenSharing else { return }
+                self.signaling?.sendMediaState(audio: nil, video: nil, screen: true)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        screenStateHeartbeat = timer
+    }
+
+    private func stopScreenStateHeartbeat() {
+        screenStateHeartbeat?.invalidate()
+        screenStateHeartbeat = nil
+    }
+
+    /// 诊断用：共享状态心跳是否还在跑。
+    var isScreenStateHeartbeatAlive: Bool { screenStateHeartbeat != nil }
+    /// 诊断用：把服务端回显误判成"我没在共享"、真的回了 off 的次数。
+    var screenStateCorrections: Int { screenFalseCorrections }
 
     /// Broadcast 扩展确认在共享后调用：把共享帧推上所有 peer 的 video sender。
     func beginScreenFramePush() {
@@ -1566,6 +1607,7 @@ final class RealRTCClient: NSObject, RTCClient {
            任何一条漏掉，服务端的共享位就留着我，别人一进会就看到
            "我正在共享"。sendMediaState 幂等，多发一次没有副作用。 */
         signaling?.sendMediaState(audio: nil, video: nil, screen: false)
+        stopScreenStateHeartbeat()
         /* 复位降级阶梯：下一轮共享从原始画布重新开始，
            万一这次只是偶发的编码器抽风，不该永远卡在 320x240。 */
         screenCanvasStage = 0
@@ -1596,6 +1638,7 @@ final class RealRTCClient: NSObject, RTCClient {
         ScreenShareRuntime.clearForcedCanvas()
         applyCameraEncodingBudget()
         signaling?.sendMediaState(audio: nil, video: nil, screen: false)
+        stopScreenStateHeartbeat()
         delegate?.rtcDidScreenShareRejected(reason: reason)
         syncTeardownBox()
     }
@@ -2808,6 +2851,13 @@ extension RealRTCClient: TianqiongSignalingDelegate {
                只忽略不够：不纠正的话，之后每个进会的人都会看到
                "我正在共享屏幕"，而我的共享轨早就关了。 */
             if on, !isScreenSharing {
+                /* 刚点下共享的 20 秒内不要纠正：
+                   我们自己那条 `screen:true` 的回显往往比 SCK 起播先到，
+                   这时 isScreenSharing 还是 false，旧代码会立刻回一条
+                   screen:false，服务端据此清空共享位并向全场广播 off——
+                   共享者自己把舞台拆了。 */
+                if Date().timeIntervalSince(screenStartRequestedAt) < 20 { return }
+                screenFalseCorrections += 1
                 signaling.sendMediaState(audio: nil, video: nil, screen: false)
             }
             return
