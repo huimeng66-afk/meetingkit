@@ -1484,8 +1484,11 @@ final class PeerSession: NSObject {
                     }
                 } else {
                     /* 收窄编码导致 setLocalDescription 被拒：退回原始 offer 重来。
-                       这一步只发生一次，不会递归。 */
-                    if target.sdp != description.sdp {
+                       这一步只发生一次，不会递归。
+                       必须带 `narrowed`：level 修正在退回后仍然生效，若不加这个
+                       条件，任何一次失败都会被判成"还能再退"，同一条描述反复重投
+                       直到栈溢出（协商状态变化导致的失败尤其容易踩到）。 */
+                    if narrowed, target.sdp != description.sdp {
                         self.applyLocalDescriptionAndSignal(
                             description, restart: restart, onDone: onDone, narrowed: false
                         )
