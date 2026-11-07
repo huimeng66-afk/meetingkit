@@ -1806,9 +1806,9 @@ private extension MeetingViewModel {
 
                screen:state 与 replaceTrack 都是幂等的，重复发没有副作用；
                而漏发一次，对端就永远等不到。 */
-            /* 顺序很重要：先把共享轨挂上（新开 m-line），再告诉对端"我在共享"。
-               反过来做，浏览器会先切到共享舞台、再等一条还不存在的轨，
-               那几秒正是用户看到的"正在接收共享画面…"。 */
+            /* 顺序很重要：先把共享轨挂上（复用 camera sender），再告诉对端
+               "我在共享"。反过来做，浏览器会先切到共享舞台、再等一条
+               还没换轨的通道，那几秒正是用户看到的"正在接收共享画面…"。 */
             switch source {
             case .broadcastExtension:
                 // 真实链路：开始把 App Group 里的共享帧推上 video sender。
@@ -1817,9 +1817,13 @@ private extension MeetingViewModel {
                 // 帧由 SCK 直接推进 localScreenSource，这里只挂轨。
                 rtc.beginNativeScreenPush()
             }
-            if !isInitial {
-                rtc.startScreenShare()
-            }
+            /* 无条件调用。`isInitial` 只该决定"要不要弹提示"，不该决定
+               "要不要告诉对端我在共享"：这两个方法都是幂等的，
+               多发一次没有副作用，漏发一次却是全场黑屏。
+               1.9.10 的现场：扩展 active、帧在推（169 帧）、
+               `startScreenShare()` 被 isInitial 跳过 → screen:true 从未发出
+               → 安卓既不亮舞台、也不显示共享者。 */
+            rtc.startScreenShare()
         } else {
             if changed {
                 shareDurationText = "00:00"
@@ -1828,9 +1832,7 @@ private extension MeetingViewModel {
             // 真实链路：停止推流并换回摄像头轨。
             // SCK 路径下 screenPusher 本来就是 nil，endScreenFramePush 同样适用。
             rtc.endScreenFramePush()
-            if !isInitial {
-                rtc.stopScreenShare()
-            }
+            rtc.stopScreenShare()
         }
     }
 

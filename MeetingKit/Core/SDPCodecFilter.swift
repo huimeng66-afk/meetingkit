@@ -97,6 +97,23 @@ enum SDPCodecFilter {
     /// 只改 level 这一个字节：profile_idc 与 constraint flags 原样保留。
     /// 接收端以码流 SPS 里的真实 level 为准，不看 fmtp，所以不会解不了。
     /// 已经 ≥ 4.0 的描述原样返回（幂等，不会把 5.x 降下来）。
+    /// 把 H.264 的 `profile-level-id` 抬到 4.0。
+    ///
+    /// # ⚠️ 不要在 setLocalDescription 之前调用
+    ///
+    /// 1.9.9 试过一次，直接造成「扩展出帧 172 / 已推 RTC 169 / 发送 0 包 /
+    /// 编码 0 帧」。原因是这行 fmtp 并不是"告诉对端我能编多大"，而是
+    /// **本端编码器的构造参数**：`setLocalDescription` 会把它解析进
+    /// VideoChannel 的 `send_codecs_`，`RTCVideoEncoderH264` 拿到后原样映射成
+    /// `kVTCompressionPropertyKey_ProfileLevel`。把 `42001f` 改写成 `420028`
+    /// 之后，部分 iPhone 上 VideoToolbox 直接建不出 session。
+    ///
+    /// 正确做法是让 level 保持协商值，尺寸/码率走 `encodings`、
+    /// `maxFramerate` 与 `adaptOutputFormat`。
+    ///
+    /// 保留这个函数只是为了做离线实验（对一份 SDP 字符串做纯文本变换），
+    /// 代码里**不允许**把它接回发送路径。
+    @available(*, deprecated, message: "会破坏 VideoToolbox 会话初始化，禁止用于 setLocalDescription")
     static func raiseH264Level(_ sdp: String) -> String {
         guard sdp.contains("m=video"), sdp.contains("profile-level-id=") else { return sdp }
         let eol = sdp.contains("\r\n") ? "\r\n" : "\n"

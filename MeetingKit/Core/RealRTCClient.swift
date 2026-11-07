@@ -954,8 +954,35 @@ final class RealRTCClient: NSObject, RTCClient {
 
     /// Broadcast 扩展确认在共享后调用：把共享帧推上所有 peer 的 video sender。
     func beginScreenFramePush() {
-        guard let track = ensureScreenTrack(), let source = localScreenSource else { return }
-        guard screenPusher == nil else { return }
+        guard let track = ensureScreenTrack() else { return }
+        /* 帧必须推进"这条轨自己的 source"。
+           `ensureScreenTrack` 只在 source 为 nil 时才从轨上取；一旦两者
+           曾经分叉（轨被重建过、或 source 被别处换过），source 非 nil 就
+           不会校正，帧会一直推给一条 sender 并不消费的旧 source。
+           面板上"已推 169 帧、轨已挂、编码 0 帧"—— 那个 169 是真的，
+           只是没人收。这一行是把它钉死的最低成本。 */
+        localScreenSource = track.source
+        guard let source = localScreenSource else { return }
+
+        /* 已经在推：不重建 pusher，但"我在共享"必须重新钉一次。
+           共享位（screen:state）以前只在 ViewModel 那条路上发，
+           而那条路有一个 `isInitial` 分支会整段跳过——扩展已经起播、
+           帧在推，服务端却不知道我在共享，安卓既不亮舞台也不显示共享者。
+           把它绑到"真的在推帧"这个事实上，就不依赖任何上层状态机。 */
+        if screenPusher != nil {
+            isScreenSharing = true
+            screenStartRequestedAt = Date()
+            /* 已经在推帧也不代表 sender 上挂着的还是屏幕轨：
+               停止共享会把 sender 换回摄像头，而"停止"和"重新开始"的
+               回调顺序在真机上并不保证。这里重挂一次，代价是一次
+               `SetTrack`（不协商），漏挂的代价是整场黑屏。 */
+            for peer in remotePeers.values {
+                peer.session.attachScreenTrack(track)
+            }
+            applyScreenEncodingBudget()
+            declareScreenOn()
+            return
+        }
 
         isScreenSharing = true
         lastScreenShareStartAt = Date()
@@ -977,7 +1004,9 @@ final class RealRTCClient: NSObject, RTCClient {
            而且这一步必须赶在 start() 之前，否则前几帧会按旧画布推。 */
         pusher.applyOutputFormat(width: profile.width, height: profile.height, fps: profile.fps)
 
-        // 共享轨独占一条新 m-line（见 PeerSession.attachScreenTrack）。
+        /* 复用摄像头那条 sendrecv m-line：不新增 m-line、不产生协商。
+           以前这里是"共享轨独占一条新 m-line"，那条 m-line 一旦协商
+           没谈下来就永远拿不到 encoding，编码器 0 帧。 */
         for peer in remotePeers.values {
             peer.session.attachScreenTrack(track)
         }
@@ -995,6 +1024,7 @@ final class RealRTCClient: NSObject, RTCClient {
         reactivateAudioSession(force: true)
         startRouteGuard()
         scheduleVideoUplinkWatchdog()
+        declareScreenOn()
         syncTeardownBox()
     }
 
@@ -1017,10 +1047,9 @@ final class RealRTCClient: NSObject, RTCClient {
            AdaptedVideoTrackSource::OnFrame。画布由 SCK 在首帧按真实比例
            自己设（ScreenCaptureKitSharer.adaptCanvasIfNeeded）。
 
-           共享 m-line 在入会首轮协商就建好了（每条连接一条 sendonly），
-           这里只是把轨打开。`attachScreenTrack` 内部只在发现 sender 缺失时
-           才协商；正常路径**一次协商都不会发生**，也就不会再出现
-           "offer 发出去没人答、sender 挂着轨但编码器 0 帧"的僵局。 */
+           共享复用摄像头那条 sendrecv m-line（1.9.11），这里只是把 sender 上的轨
+           换成屏幕轨。`attachScreenTrack` 只在发现 mid 缺失或方向不能发时
+           才补一次协商；正常路径**一次协商都不会发生**。 */
         isScreenSharing = true
         track.isEnabled = true
         lastScreenShareStartAt = Date()
@@ -1049,8 +1078,27 @@ final class RealRTCClient: NSObject, RTCClient {
         reactivateAudioSession(force: true)
         startRouteGuard()
         scheduleVideoUplinkWatchdog()
+        /* SCK 路径同样需要上行守护：编码器可能在共享中途 0 帧，
+           靠它把 sender / 预算 / 画布拉回来。 */
         startNativeUplinkGuard()
+        declareScreenOn()
         syncTeardownBox()
+    }
+
+    /// 把"我正在共享"钉在**推帧**这个事实上。
+    ///
+    /// 为什么不能只依赖 ViewModel：`applyScreenSharing` 里有一条
+    /// `if !isInitial { rtc.startScreenShare() }`。`isInitial` 本意是
+    /// "冷启动后第一次同步，只对齐 UI 不重复发信令"，但它的实现是
+    /// "第一次 sink 回调"——扩展如果在订阅建立之前就已经起播，第一条
+    /// 回调就是 true，于是 isInitial 为 true，整个 startScreenShare()
+    /// 被跳过：screen:true 不发、6 秒心跳不启动、screenStartRequestedAt
+    /// 也不刷新。现场就是"扩展 active、帧在推、安卓那边什么都没发生"。
+    /// 现在推帧入口自己发一次，幂等，重复发没有副作用。
+    private func declareScreenOn() {
+        guard isJoined else { return }
+        signaling?.sendMediaState(audio: nil, video: nil, screen: true)
+        startScreenStateHeartbeat()
     }
 
     /// 拿到共享用的 source/track，没有就补建。
@@ -1066,7 +1114,11 @@ final class RealRTCClient: NSObject, RTCClient {
            就会连轨一起换 —— 而 sender 上挂的还是旧轨，帧推到新 source 上，
            编码器一帧都收不到。现在轨是唯一真相，source 永远从轨上取。 */
         if let track = localScreenTrack {
-            if localScreenSource == nil { localScreenSource = track.source }
+            /* 无条件校正，而不是"source 为 nil 才取"。
+               两者一旦分叉（轨重建过、或 source 被别处换过），
+               `source != nil` 的判断会让分叉永远修不回来：
+               帧推进一个没人消费的 source，sender 上挂的却是另一条轨。 */
+            localScreenSource = track.source
             return track
         }
         guard let factory = factory else { return nil }
@@ -1129,9 +1181,13 @@ final class RealRTCClient: NSObject, RTCClient {
         var sendsUpstream = true
         var senderCount = 0
 
+        /* 只认"至少有一条连接真的挂着共享轨"。
+           没有对端时 keep false —— 这正是"我在推帧但没人收"的真相，
+           旧默认值 true 会把它显示成"共享轨已挂"。 */
+        var anyAttached = false
         for peer in remotePeers.values {
             let summary = peer.session.videoUplinkSummary
-            if !summary.attached { totals.markDetached() }
+            if summary.attached { anyAttached = true }
             trackEnabled = trackEnabled && summary.trackEnabled
             sendsUpstream = sendsUpstream && summary.sendsUpstream
             senderCount = max(senderCount, summary.senderCount)
@@ -1306,6 +1362,7 @@ final class RealRTCClient: NSObject, RTCClient {
                 group.leave()
             }
         }
+        totals.setAttached(anyAttached)
 
         group.notify(queue: .main) { [weak self] in
             guard let self, self.isScreenSharing else { return }
@@ -1589,14 +1646,12 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 真机上就是"共享糊成一片、右上角自己倒是清清楚楚"。
     /// 压到 250kbps / 10fps 后，让出来的带宽全部归共享。
     private func duckCameraForScreenShare() {
-        for peer in remotePeers.values {
-            peer.session.setVideoEncoding(
-                maxBitrateBps: 250_000,
-                maxFramerate: 10,
-                keepResolution: false,
-                forScreen: false
-            )
-        }
+        /* 共享期间不再压摄像头——**它们共用同一条 sender**。
+           以前共享单占一条 m-line，压摄像头 250kbps/10fps 是把带宽让给屏幕；
+           现在 sender 上挂的就是屏幕轨，压它等于压屏幕自己。
+           `setVideoEncoding` 里还有一层 `forScreen == isSendingScreen` 的守卫，
+           就算这里恢复调用也会被挡掉；保留空实现是为了让"共享不该动摄像头预算"
+           这件事在调用点上直接可见。 */
     }
 
     /// 共享结束/中断后把摄像头档位恢复回来（同样按人数分摊）。
@@ -2449,7 +2504,7 @@ final class RealRTCClient: NSObject, RTCClient {
                 session: session
             )
             newPeers[peerID] = peer
-            session.attachLocalTracks(audio: localAudioTrack, video: localVideoTrack, screenTrack: localScreenTrack)
+            session.attachLocalTracks(audio: localAudioTrack, video: localVideoTrack, screenTrack: localScreenTrack, screenSharing: isScreenSharing)
         }
         remotePeers = newPeers
 
@@ -2531,7 +2586,7 @@ final class RealRTCClient: NSObject, RTCClient {
                 session: session
             )
             remotePeers[peerID] = peer
-            session.attachLocalTracks(audio: localAudioTrack, video: localVideoTrack, screenTrack: localScreenTrack)
+            session.attachLocalTracks(audio: localAudioTrack, video: localVideoTrack, screenTrack: localScreenTrack, screenSharing: isScreenSharing)
         }
 
         // 断线期间错过的消息（consumeChatMessage 按 id 去重）。
@@ -2792,7 +2847,7 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         reactivateAudioSession()
 
         guard let session = makePeerSession(peerID: peerID) else { return }
-        session.attachLocalTracks(audio: localAudioTrack, video: localVideoTrack, screenTrack: localScreenTrack)
+        session.attachLocalTracks(audio: localAudioTrack, video: localVideoTrack, screenTrack: localScreenTrack, screenSharing: isScreenSharing)
         /* 两路来源都要认：入会快照里带的 screen 标记，以及先于本事件到达、
            被 pendingScreenPeerID 暂存的 screen:state。 */
         let screenOn = (peer["screen"] as? Bool ?? false) || pendingScreenPeerID == peerID
@@ -3218,8 +3273,12 @@ extension RealRTCClient: PeerSessionDelegate {
             return
         }
         // attachLocalTracks 会触发 negotiationneeded → negotiate()，无需手动 restart。
-        newSession.attachLocalTracks(audio: localAudioTrack, video: localVideoTrack, screenTrack: localScreenTrack)
+        newSession.attachLocalTracks(audio: localAudioTrack, video: localVideoTrack, screenTrack: localScreenTrack, screenSharing: isScreenSharing)
         peer.session = newSession
+        /* 重建出来的是**新连接**，编码参数不会从旧 sender 继承。
+           共享中重建却不补这一下，新连接会用摄像头那套 2.5Mbps/30fps，
+           屏幕字一多就糊，而且降级偏好还是 maintainFramerate。 */
+        if isScreenSharing { applyScreenEncodingBudget() }
         publishParticipants()
         syncTeardownBox()
     }
@@ -3297,7 +3356,7 @@ private final class VideoUplinkTotals: @unchecked Sendable {
     private var encoded = 0
     private var screenBytes = 0
     private var cameraBytes = 0
-    private var attached = true
+    private var attached = false
     /* 画质判决书。这些数字全在 getStats 里，但以前一个都没读——
        "编码 38 帧 / 出帧 275 帧"到底是带宽不够还是 CPU 编不动，
        不读 qualityLimitationReason 就只能猜。 */
@@ -3356,9 +3415,16 @@ private final class VideoUplinkTotals: @unchecked Sendable {
         lock.unlock()
     }
 
-    func markDetached() {
+    /// 把"共享轨到底挂没挂"写成**采样得到的结论**。
+    ///
+    /// `attached` 以前默认 true、只在判到未挂时置 false——于是任何一次
+    /// 判断失效（remotePeers 为空、summary 算不出来）都会留下一个
+    /// "共享轨已挂"的假绿灯。1.9.10 现场就是"发送 0 包 · 编码 0 帧 ·
+    /// 共享轨已挂"三条并列，用户据此以为媒体通了、只差对端。
+    /// 现在每次采样都落一次真实值，没有对端时它就是 false。
+    func setAttached(_ value: Bool) {
         lock.lock()
-        attached = false
+        attached = value
         lock.unlock()
     }
 
