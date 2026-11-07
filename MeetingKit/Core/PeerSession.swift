@@ -1547,15 +1547,18 @@ final class PeerSession: NSObject {
             needsNegotiateAfterStable = true
             return
         }
-        guard !makingOffer, !isNegotiating else {
-            /* 协商卡死自愈。
-               `makingOffer` 只在 offer 回调与 setLocalDescription 的
-               completion 里复位。真机上偶发其中一条永远不来，这个标志就
-               永久 true，之后每次 negotiate() 都只记一笔
-               `needsNegotiateAfterStable` 就返回，而那个标志只有"回到
-               stable"才会被消费 —— 永远等不到。现场表现正是
-               "轨挂着、帧在推、编码 0 帧、发送 0 包"。
-               超过 6 秒还在"协商中"，就当上一轮已经死掉，重开一轮。 */
+        /* 协商卡死自愈。
+           `makingOffer` 只在 offer 回调与 setLocalDescription 的
+           completion 里复位。真机上偶发其中一条永远不来，这个标志就
+           永久 true，之后每次 negotiate() 都只记一笔
+           `needsNegotiateAfterStable` 就返回，而那个标志只有"回到
+           stable"才会被消费 —— 永远等不到。现场表现正是
+           "轨挂着、帧在推、编码 0 帧、发送 0 包"。
+           超过 6 秒还在"协商中"，就当上一轮已经死掉，重开一轮。
+
+           注意这里是 if/else 而不是 guard：复位分支必须**继续往下走**
+           去发 offer，用 guard 会要求 else 块一定退出作用域。 */
+        if makingOffer || isNegotiating {
             if let at = negotiateStartedAt,
                Date().timeIntervalSince(at) > 6,
                peerConnection.signalingState == .stable {

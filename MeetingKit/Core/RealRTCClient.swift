@@ -1018,6 +1018,18 @@ final class RealRTCClient: NSObject, RTCClient {
         lastUplinkStreams = []
 
         pusher.start()
+        /* 编码器在 replaceTrack 之后会重建一次：这段时间
+           `sender.parameters.encodings` 可能是空数组，而 `setVideoEncoding`
+           遇到空 encoding 会整段跳过（写回去会把通道写死，只能不写）。
+           上面那次即时调用因此很可能什么也没设上，镜头就带着摄像头的
+           2.5Mbps/30fps 去编整屏——糊，而且占满上行。
+           补两次，覆盖重建窗口；幂等，重复设没有副作用。 */
+        for delay in [0.8, 2.4] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.isScreenSharing else { return }
+                self.applyScreenEncodingBudget()
+            }
+        }
         /* ReplayKit 真正起播会晚于这里 200~800ms，并重配一次音频会话。
            先强制抢一次，再由 routeGuard 每 2 秒兜底——
            只靠这一次同步调用，经常正好打在 ReplayKit 改配置之前。 */
@@ -1083,6 +1095,14 @@ final class RealRTCClient: NSObject, RTCClient {
         startNativeUplinkGuard()
         declareScreenOn()
         syncTeardownBox()
+        /* 与 ReplayKit 路径同样的理由：SCK 首帧前 sender 的 encoding
+           还没重建完，即时那次预算大概率被空数组挡掉。 */
+        for delay in [0.8, 2.4] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.isScreenSharing else { return }
+                self.applyScreenEncodingBudget()
+            }
+        }
     }
 
     /// 把"我正在共享"钉在**推帧**这个事实上。
@@ -3475,9 +3495,17 @@ final class ScreenFramePusher {
     private var running = false
     /// 一帧正在解码。用来丢弃"来不赢处理"的采样，避免串行队列无限堆积。
     private var decoding = false
-    /// 当前输出画布方向：true = 横屏 1920x1080，false = 竖屏 1080x1920。
+    /// 当前已应用给 `RTCVideoSource` 的输出画布。
+    ///
+    /// 以前这里只有一个 `canvasLandscape` 布尔值，只能表达"横 / 竖"两种状态，
+    /// 上行守护要求的降级画布（432×960 / 640×360 / 320×240）根本没有落点：
+    /// `ScreenShareRuntime.forcedCanvas` 只有 SCK 那条路在读，ReplayKit 扩展
+    /// 这条路写完标记就没人消费。于是"编码器 0 帧 → 降一档画布重建"在
+    /// 扩展路径上是一条空转的阶梯——现场能看到守护反复记录"已降档"，
+    /// 画布却始终是 1080×1920。
+    /// 改成记录真实尺寸后，任何尺寸变化都会触发一次 adaptOutputFormat。
     /// 只在 decodeQueue 上读写。
-    private var canvasLandscape = true
+    private var appliedCanvas: (width: Int, height: Int)?
 
     /// 与扩展侧的 24fps 对齐：轮询比生产慢就会积压旧帧，比生产快则空转。
     private static let pollInterval: TimeInterval = 1.0 / 24.0
@@ -3512,7 +3540,7 @@ final class ScreenFramePusher {
     func applyOutputFormat(width: Int32, height: Int32, fps: Int32) {
         Self.decodeQueue.sync {
             self.source.adaptOutputFormat(toWidth: width, height: height, fps: fps)
-            self.canvasLandscape = width >= height
+            self.appliedCanvas = (Int(width), Int(height))
         }
     }
 
@@ -3528,7 +3556,7 @@ final class ScreenFramePusher {
         running = true
         stateLock.unlock()
         lastFrameDate = nil
-        canvasLandscape = true
+        appliedCanvas = nil
 
         // 必须挂在自己的串行队列，不能挂主队列。
         //
@@ -3579,17 +3607,21 @@ final class ScreenFramePusher {
             guard let self = self else { return }
             defer { self.endDecoding() }
             guard self.isRunning else { return }
-            // 按图片宽高比选择画布方向：竖屏共享用 1080x1920，
-            // 避免把竖屏画面硬塞进 1920x1080 留出大面积黑边（远端看不清文字）。
-            guard let result = Self.jpegToPixelBuffer(jpeg) else { return }
-            let landscape = result.width >= result.height
-            if landscape != self.canvasLandscape {
-                self.canvasLandscape = landscape
-                let w = landscape ? 1920 : 1080
-                let h = landscape ? 1080 : 1920
+            /* 画布：优先听上行守护的降级指令，其次按图片方向取默认值。
+               降级标记必须在这里消费——扩展路径没有 SCK 的 sampleQueue，
+               `forceCanvas` 写了不读就等于没有。 */
+            let forced = ScreenShareRuntime.forcedCanvas.map {
+                (width: ScreenOutputSize.align16($0.width),
+                 height: ScreenOutputSize.align16($0.height))
+            }
+            guard let result = Self.jpegToPixelBuffer(jpeg, canvas: forced) else { return }
+            let canvas = (width: Int(result.width), height: Int(result.height))
+            if self.appliedCanvas?.width != canvas.width
+                || self.appliedCanvas?.height != canvas.height {
+                self.appliedCanvas = canvas
                 self.source.adaptOutputFormat(
-                    toWidth: Int32(w),
-                    height: Int32(h),
+                    toWidth: result.width,
+                    height: result.height,
                     fps: RealRTCClient.screenEncodingProfile.fps
                 )
             }
@@ -3622,16 +3654,22 @@ final class ScreenFramePusher {
         stateLock.unlock()
     }
 
-    /// JPEG → BGRA CVPixelBuffer（等比缩放，留黑边）。画布方向按图片宽高比选择。
-    static func jpegToPixelBuffer(_ data: Data) -> (buffer: CVPixelBuffer, width: Int32, height: Int32)? {
+    /// JPEG → BGRA CVPixelBuffer（等比缩放，留黑边）。
+    ///
+    /// `canvas` 非空时用它当输出画布（上行守护降级就是走这条）；
+    /// 为空时按图片宽高比选 1920×1080 / 1080×1920。
+    static func jpegToPixelBuffer(
+        _ data: Data,
+        canvas: (width: Int, height: Int)? = nil
+    ) -> (buffer: CVPixelBuffer, width: Int32, height: Int32)? {
         guard
             let imageSource = CGImageSourceCreateWithData(data as CFData, nil),
             let image = CGImageSourceCreateImageAtIndex(imageSource, 0, nil)
         else { return nil }
 
         let landscape = image.width >= image.height
-        let width = landscape ? 1920 : 1080
-        let height = landscape ? 1080 : 1920
+        let width = canvas?.width ?? (landscape ? 1920 : 1080)
+        let height = canvas?.height ?? (landscape ? 1080 : 1920)
 
         var pixelBuffer: CVPixelBuffer?
         let attributes: [String: Any] = [
