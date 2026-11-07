@@ -297,6 +297,9 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 最近一次采样的逐条 send stream 明细，只给诊断用。
     private var lastUplinkStreams: [String] = []
 
+    /// 共享开始时补的那一轮"重谈 + 关键帧"。取消用。
+    private var screenRefreshWork: DispatchWorkItem?
+
     /// 上行音频看门狗（peerID → 待执行的探测）。
     private var outboundAudioWatchdogs: [String: DispatchWorkItem] = [:]
     private var outboundAudioProbeCounts: [String: Int] = [:]
@@ -1046,6 +1049,7 @@ final class RealRTCClient: NSObject, RTCClient {
         }
         applyScreenEncodingBudget()
         duckCameraForScreenShare()
+        scheduleScreenUplinkRefresh()
         lastScreenBytes = 0
         lastCameraBytes = 0
         lastBitrateSampleAt = nil
@@ -1135,6 +1139,7 @@ final class RealRTCClient: NSObject, RTCClient {
         }
         applyScreenEncodingBudget()
         duckCameraForScreenShare()
+        scheduleScreenUplinkRefresh()
         lastScreenBytes = 0
         lastCameraBytes = 0
         lastBitrateSampleAt = nil
@@ -1758,6 +1763,94 @@ final class RealRTCClient: NSObject, RTCClient {
                 keepResolution: true,
                 forScreen: true
             )
+        }
+    }
+
+    /// 共享开始 3 秒后，逐条连接判断"对端到底收到没有"，只救坏掉的那几条。
+    ///
+    /// 为什么必须做这一轮：`replaceTrack` 按设计**不产生 SDP 变更**，对端的
+    /// 接收器一直停在入会那一轮协商的结果上。只要那一轮有任何一环没落地
+    /// （信令重投、轮次错配、answer 被判重丢弃、连接重建），对端手里就没有
+    /// 当前这条 sender 的 mid/ssrc —— 包发得再多也会被当成"未知 SSRC"丢弃，
+    /// 而同一条连接上的音频照常双向通（音频 SSRC 从入会起就没变过）。
+    ///
+    /// 判据用 RTCP 抖动，不用 `packetsReceived`——后者在
+    /// `remote-inbound-rtp` 里根本不存在，永远读到 0（诊断里那行
+    /// "对端报告 收0包"就是它，浏览器明明有画面也显示 0）。
+    /// 抖动只有真的收到 RTP 才会非零，是唯一能落地的判据。
+    ///
+    /// 两条路分开治：
+    ///   · 没收到 → 补一轮协商（让对端重新学 mid/ssrc）+ 逼关键帧
+    ///   · 收到了 → 只逼关键帧（可能漏了开局那个 IDR）
+    /// **正在正常收包的对端不会被重谈**，工作正常的浏览器不会受牵连。
+    private func scheduleScreenUplinkRefresh() {
+        screenRefreshWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isScreenSharing, !self.remotePeers.isEmpty else { return }
+            self.auditScreenUplinkAndHeal()
+        }
+        screenRefreshWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: work)
+    }
+
+    private func auditScreenUplinkAndHeal() {
+        guard isScreenSharing, !remotePeers.isEmpty else { return }
+        for peer in Array(remotePeers.values) {
+            peer.session.peerConnection.statistics { [weak self] report in
+                var sent = 0
+                var outboundIds = Set<String>()
+                for (_, st) in report.statistics where st.type == "outbound-rtp" {
+                    guard (st.values["kind"] as? String) == "video" else { continue }
+                    outboundIds.insert(st.id)
+                    let n = (st.values["packetsSent"] as? NSNumber)?.intValue ?? 0
+                    if n > sent { sent = n }
+                }
+                guard sent > 60 else { return }   // 还没真正开始发，别乱动
+
+                var rrSeen = false
+                var jitter: Double = -1
+                for (_, st) in report.statistics where st.type == "remote-inbound-rtp" {
+                    let localId = (st.values["localId"] as? String) ?? ""
+                    guard outboundIds.contains(localId) else { continue }
+                    rrSeen = true
+                    let j = (st.values["jitter"] as? NSNumber)?.doubleValue ?? -1
+                    if j > jitter { jitter = j }
+                }
+                /* 三种情形分开处理，宁可少动连接也不误伤正常的那条：
+                   · 完全没有 RR     → 对端连接收器都没建，必须重谈；
+                   · 有 RR 且抖动≈0  → 有接收器但没收包，也重谈；
+                   · 有 RR 但读不到抖动 → 判不了，只补关键帧，不动协商。 */
+                let hasJitter = jitter >= 0
+                let receiving = rrSeen && hasJitter && jitter > 0.0005
+                let mustRenegotiate = !rrSeen || (hasJitter && jitter <= 0.0005)
+
+                DispatchQueue.main.async {
+                    Task { @MainActor in
+                        guard let self, self.isScreenSharing else { return }
+                        if receiving {
+                            peer.session.forceVideoKeyFrame()
+                            ScreenShareRuntime.note(
+                                "共享：对端在收包（抖动 \(String(format: "%.1f", jitter * 1000))ms），已补一个关键帧"
+                            )
+                        } else if mustRenegotiate {
+                            ScreenShareRuntime.note(
+                                "共享：已发 \(sent) 包但对端没有收包迹象，补一轮协商再逼关键帧"
+                            )
+                            peer.session.renegotiateForScreenShare()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+                                Task { @MainActor in
+                                    guard let self, self.isScreenSharing else { return }
+                                    peer.session.forceVideoKeyFrame()
+                                }
+                            }
+                        } else {
+                            // 有 RR 但读不到抖动：判不了，只补关键帧，不动协商。
+                            peer.session.forceVideoKeyFrame()
+                            ScreenShareRuntime.note("共享：对端有 RTCP 但读不到抖动，已补一个关键帧")
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2541,6 +2634,11 @@ final class RealRTCClient: NSObject, RTCClient {
             let senderCount = peer.session.audioSenderCount
             let videoSenders = peer.session.videoSenderCount
             let channelAudit = peer.session.videoChannelAudit
+            /* 协商状态必须一起打：`localDescription` 有 a=ssrc、outbound 在涨、
+               对端却收不到，唯一能同时成立的解释就是**这轮 SDP 从没被对端应用**。
+               本端停在 haveLocalOffer 时，包按新 SSRC 发出去，对端仍按旧 SSRC 收，
+               全部静默丢弃；而同一条连接上的音频照常通。 */
+            let signalingText = peer.session.signalingStateText
 
             peer.session.peerConnection.statistics { report in
                 var inPackets = 0, outPackets = 0, inKB = 0, outKB = 0
@@ -2562,7 +2660,8 @@ final class RealRTCClient: NSObject, RTCClient {
                    它 > 0 说明包真的到了对端（问题在解码/渲染），
                    它 = 0 而本地 outbound 在涨，就是链路或关联断了。
                    少了这一项，只能靠"对面说黑屏"来反推。 */
-                var rrVideoPkts = -1, rrVideoLost = 0
+                var rrVideoSeen = false, rrVideoLost = 0
+                var rrJitterMs = -1.0, rrFracLost = 0.0
                 var videoOutboundIds = Set<String>()
                 for (_, st) in report.statistics where st.type == "outbound-rtp" {
                     if (st.values["kind"] as? String) == "video" { videoOutboundIds.insert(st.id) }
@@ -2596,16 +2695,31 @@ final class RealRTCClient: NSObject, RTCClient {
                     if st.type == "remote-inbound-rtp" {
                         let localId = (st.values["localId"] as? String) ?? ""
                         if videoOutboundIds.contains(localId) {
-                            rrVideoPkts = (st.values["packetsReceived"] as? NSNumber)?.intValue ?? 0
+                            rrVideoSeen = true
                             rrVideoLost = (st.values["packetsLost"] as? NSNumber)?.intValue ?? 0
+                            rrJitterMs = ((st.values["jitter"] as? NSNumber)?.doubleValue ?? -1) * 1000
+                            rrFracLost = (st.values["fractionLost"] as? NSNumber)?.doubleValue ?? 0
                         }
                     }
                 }
-                let rrText = rrVideoPkts < 0 ? "对端未回报" : "对端报告 收\(rrVideoPkts)包/丢\(rrVideoLost)"
+                /* `remote-inbound-rtp` 里**没有** `packetsReceived` 这个字段
+                   （webrtc-stats 只给 packetsLost / jitter / fractionLost /
+                   roundTripTime）。之前拿它兜底成 0，屏幕上永远是
+                   "对端报告 收0包"——浏览器明明能看到画面也照样显示 0，
+                   连着几轮排查都被这行假数据带偏。真正能分辨"对面到底
+                   收没收到"的是抖动：只有真的收到 RTP，抖动才会非零。 */
+                let rrText: String
+                if !rrVideoSeen {
+                    rrText = "对端未回报RTCP⚠️"
+                } else if rrJitterMs <= 0.01 {
+                    rrText = "对端RTCP 丢\(rrVideoLost) · 抖动0（大概率没收到）⚠️"
+                } else {
+                    rrText = "对端RTCP 丢\(rrVideoLost) · 丢率\(String(format: "%.1f", rrFracLost * 100))% · 抖动\(String(format: "%.1f", rrJitterMs))ms"
+                }
                 let line = """
                 \(name)：\(conn) / ICE \(ice)
                   SDP 音频 本端 \(localDir) · 远端 \(remoteDir)
-                  SDP 视频 本端 \(localVideoDir) · 远端 \(remoteVideoDir) · 发送器 音频\(senderCount)/视频\(videoSenders)
+                  SDP 视频 本端 \(localVideoDir) · 远端 \(remoteVideoDir) · 发送器 音频\(senderCount)/视频\(videoSenders) · 信令 \(signalingText)
                   视频通道 \(channelAudit)
                   收音频 \(inPackets) 包 · \(inKB)KB · 电平 \(String(format: "%.2f", level))
                   发音频 \(outPackets) 包 · \(outKB)KB · 电平 \(String(format: "%.2f", outLevel))

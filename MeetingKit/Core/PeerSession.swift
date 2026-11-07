@@ -639,6 +639,64 @@ final class PeerSession: NSObject {
         videoSender == nil ? 0 : 1
     }
 
+    /// 信令状态的人话。诊断必须打这一项：
+    /// `localDescription` 有 `a=ssrc`、`outbound` 在涨、对端却一个包都收不到，
+    /// 唯一能同时成立的解释就是**这轮 offer 从来没被对端应用过**——
+    /// 本端停在 `haveLocalOffer`，包按新 SSRC 发出去，对端还按旧 SSRC 收，
+    /// 于是全部静默丢弃。以前诊断里没有这一栏，只能靠猜。
+    var signalingStateText: String {
+        switch peerConnection.signalingState {
+        case .new: return "new"
+        case .stable: return "stable"
+        case .haveLocalOffer: return "有本地offer⚠️"
+        case .haveRemoteOffer: return "有远端offer"
+        case .haveLocalPrAnswer: return "本地临时应答⚠️"
+        case .haveRemotePrAnswer: return "远端临时应答"
+        case .closed: return "closed"
+        @unknown default: return "未知"
+        }
+    }
+
+    /// 共享开始时**主动重谈一轮**。
+    ///
+    /// 为什么不能只靠 replaceTrack：换轨不产生 SDP 变更，对端的接收器仍然
+    /// 停在入会那一轮协商的结果上。只要那一轮的 offer/answer 有任何一环
+    /// 没落地（信令重投、轮次错配、answer 被判重丢弃），对端手里就没有
+    /// 当前这条 sender 的 SSRC，包发得再多也会被当成"未知 SSRC"丢掉。
+    /// 现场特征正是：本端 `编码 3098 帧 / 发送 13204 包`，对端一片黑，
+    /// 而同一条连接上的音频双向正常（音频 SSRC 从入会起就没变过）。
+    ///
+    /// 只在共享开始时打一次，且 `negotiate()` 内部有 glare / 卡死自愈，
+    /// 不会重演 1.9.10 的协商风暴。
+    func renegotiateForScreenShare() {
+        guard !isClosed else { return }
+        needsNegotiateAfterStable = true
+        negotiate()
+    }
+
+    /// 逼编码器立刻吐一个 IDR。
+    ///
+    /// H.264 的接收端在拿到关键帧之前**一帧都解不出来**，而 libwebrtc 的
+    /// H.264 编码器没有固定 GOP，全靠对端发 PLI。对端一旦漏掉开局那一个
+    /// IDR（解码器还没建好、包还在路上），后面收到的全是 P 帧，
+    /// 表现就是"包在涨、永远黑屏"，而且不会自愈。
+    ///
+    /// `replaceTrack(nil)` → `replaceTrack(track)` 会让 libwebrtc 重建
+    /// VideoSendStream，新编码器的第一帧必然是 IDR。整个过程不触发协商
+    /// （SDP 不变），中断约 80ms，用户看不到。
+    func forceVideoKeyFrame() {
+        guard !isClosed, let sender = videoSender, sender.track != nil else { return }
+        sender.track = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self, weak sender] in
+            Task { @MainActor in
+                guard let self, let sender, !self.isClosed else { return }
+                // 期间用户可能已经停止共享或换了轨，别把旧轨塞回去。
+                guard self.isSendingScreen, let current = self.localScreen else { return }
+                sender.track = current
+            }
+        }
+    }
+
     /// 视频通道对账：**SDP 声明的通道** 对 **sender 实际在用的 mid/ssrc**。
     ///
     /// 为什么必须打这一行：连续几个版本都出现同一组自相矛盾的数字——
