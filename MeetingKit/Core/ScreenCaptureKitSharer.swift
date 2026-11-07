@@ -433,6 +433,33 @@ enum ScreenCaptureKitRuntime {
         boolValue(picker, "isActive")
     }
 
+    /// 给 picker 挂上 presenter。
+    ///
+    /// iOS 27 真机上遇到过：`isActive` 已是 true、`present` 也调到了，
+    /// 但系统面板始终不出现，诊断里只有一句"present 后 4 秒仍无 filter 回调"。
+    /// 原因是没有宿主视图控制器——picker 不知道该从哪个 window 弹。
+    /// macOS 上这个属性是 NSWindow，iOS 上是 UIViewController，都是 setPresenter:。
+    /// 选择子不存在就什么都不做，不猜也不崩。
+    static func attachPresenter(_ picker: AnyObject) -> String? {
+        guard hasInstanceMethod(picker, "setPresenter:"),
+              let host = topViewController() else { return nil }
+        typealias Setter = @convention(c) (AnyObject, Selector, AnyObject) -> Void
+        guard let imp = instanceIMP(picker, "setPresenter:") else { return nil }
+        unsafeBitCast(imp, to: Setter.self)(picker, NSSelectorFromString("setPresenter:"), host)
+        return "\(type(of: host))"
+    }
+
+    private static func topViewController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let window = scenes.flatMap { $0.windows }.first { $0.isKeyWindow }
+            ?? scenes.flatMap { $0.windows }.first
+        var vc = window?.rootViewController
+        while let next = vc?.presentedViewController, !next.isBeingDismissed {
+            vc = next
+        }
+        return vc
+    }
+
     /// 弹出系统面板，返回真正调到的选择子。
     ///
     /// 首选无参 `present`（Apple 示例里整屏共享用的就是它）；
@@ -682,6 +709,8 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     private var running = false
     /// 选择器是否已经给过回应（选中或取消）。用于区分"面板还开着"和"面板没起来"。
     private var didReceivePickerCallback = false
+    /// 这一轮 present 已经试了几次。系统偶尔会把第一次静默吃掉，允许再补一次。
+    private var presentAttempts = 0
 
     /* 轮次号：每次 start / stop 都 +1。
        用途是给异步回调发"票"——旧一轮排队的 .stopped 在新一轮 .running
@@ -778,6 +807,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         captureSummary = nil
         phase = .idle
         didReceivePickerCallback = false
+        presentAttempts = 0
         didSignalRunning = false
         adaptedCanvas = nil
         lastPushAt = 0
@@ -815,9 +845,11 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         }
         ShareBreadcrumb.mark("sck:observer")
 
-        /* 顺序不能反：先把 active 打开，再 present。
+        /* 顺序不能反：先把 active 打开，再挂 presenter，最后 present。
            active 默认是 false，为 false 时 present() 什么都不做。
-           这两步都套异常护盾：系统如果因为权限/entitlement 抛 NSException，
+           presenter 不挂的话，有系统版本会把 active 置上、present 也吃掉，
+           面板却一次都不出现——诊断里只剩"present 后 4 秒仍无 filter 回调"。
+           这几步都套异常护盾：系统如果因为权限/entitlement 抛 NSException，
            护盾能接住并写进诊断，而不是把整个会议 App 带走。 */
         ShareBreadcrumb.mark("sck:activating")
         var setter: String?
@@ -834,6 +866,18 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         }
         ScreenCaptureKitRuntime.note("active=\(setter)")
         ShareBreadcrumb.mark("sck:activated(\(setter))")
+
+        var presenter: String?
+        if let reason = ScreenCaptureKitRuntime.shield({
+            presenter = ScreenCaptureKitRuntime.attachPresenter(picker)
+        }) {
+            ShareBreadcrumb.mark("sck:presenter-exception")
+            ScreenCaptureKitRuntime.note("presenter 挂载异常：\(reason)")
+        } else if let presenter {
+            ScreenCaptureKitRuntime.note("presenter=\(presenter)")
+        } else {
+            ScreenCaptureKitRuntime.note("presenter 未挂载（选择器无 setPresenter 或没有宿主 VC）")
+        }
 
         stateLock.lock()
         running = true
@@ -856,6 +900,7 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
         }
         ScreenCaptureKitRuntime.note("present=\(presentName)")
         ShareBreadcrumb.mark("sck:presented(\(presentName))")
+        presentAttempts = 1
 
         schedulePresentCheck()
     }
@@ -863,9 +908,12 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
     /// present 之后的体检。
     ///
     /// 正常情况下用户会在几秒内选好内容，filter 回调一到就建流。
-    /// 如果 4 秒后既没有回调、active 又被系统复位了，说明面板根本没起来
-    /// （选择子缺失、被系统拒绝都会这样）。与其让用户对着"等待选择"发呆，
-    /// 不如报一次失败，让上层降级到 in-app 捕获——至少画面能出去。
+    /// 现实里有三种"没回调"：
+    ///   1. 面板真的没弹（presenter 缺失、被系统吃掉）——active 会复位；
+    ///   2. 面板弹了但用户还没选——active 仍是 true；
+    ///   3. 面板弹在别的 space / 被我们自己的 sheet 挡住。
+    /// 第 1 种要重试，第 2 种要等，第 3 种只能靠时间兜。
+    /// 所以分两段查：4 秒时补一次 present，10 秒还没回音才算失败。
     private func schedulePresentCheck() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
             guard let self, self.running, self.stream == nil, !self.didReceivePickerCallback else {
@@ -875,11 +923,35 @@ final class ScreenCaptureKitSharer: NSObject, ScreenSharingSession {
             let active = ScreenCaptureKitRuntime.isPickerActive(picker)
             if active == false {
                 ScreenCaptureKitRuntime.note("present 后 4 秒无回调，active 已被复位")
-                self.fail("系统内容面板没有打开")
-            } else {
-                // 面板可能还开着，用户在看内容列表。只记一笔，不打断。
+                self.retryPresent(reason: "active 被系统复位")
+            } else if self.presentAttempts < 2 {
+                /* active 还在，但一帧回调都没有。
+                   真机上这种情况多半是第一次 present 被系统静默吃掉：
+                   再挂一次 presenter、再 present 一次，成功率明显更高。 */
                 ScreenCaptureKitRuntime.note("present 后 4 秒仍无 filter 回调")
+                self.retryPresent(reason: "面板没出现")
             }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 16) { [weak self] in
+            guard let self, self.running, self.stream == nil, !self.didReceivePickerCallback else {
+                return
+            }
+            ScreenCaptureKitRuntime.note("present 后 16 秒仍无 filter 回调，放弃本轮")
+            self.fail("系统面板没有弹出来，请再点一次共享")
+        }
+    }
+
+    private func retryPresent(reason: String) {
+        guard let picker else { return }
+        presentAttempts += 1
+        ShareBreadcrumb.mark("sck:present-retry(\(reason))")
+        var name: String?
+        if let err = ScreenCaptureKitRuntime.shield({
+            name = ScreenCaptureKitRuntime.presentPicker(picker)
+        }) {
+            ScreenCaptureKitRuntime.note("重试 present 异常：\(err)")
+        } else if let name {
+            ScreenCaptureKitRuntime.note("重试 present=\(name)（\(reason)）")
         }
     }
 
