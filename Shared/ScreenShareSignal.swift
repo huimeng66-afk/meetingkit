@@ -507,6 +507,35 @@ enum ScreenShareRuntime {
         lock.unlock()
     }
 
+    /// 真正推给编码器的画布尺寸。
+    ///
+    /// 为什么值得单独记：H.264 Level 3.1 的 MaxFS 是 3600 宏块（=1280×720），
+    /// 分辨率一旦超限，iOS 照样出帧、照样发包，但**安卓的硬件解码器会按
+    /// SDP 声明的 level 拒绝初始化**——对方显示"正在共享"却永远黑屏，
+    /// 而浏览器用软解不校验 level，所以网页端正常。
+    /// 这个数写进诊断后，一眼就能确认"画布有没有真的降到合法范围"，
+    /// 不用再靠推理。
+    private static var _canvas: (width: Int, height: Int)?
+
+    static var canvas: (width: Int, height: Int)? {
+        lock.lock(); defer { lock.unlock() }
+        return _canvas
+    }
+
+    static func noteCanvas(width: Int, height: Int) {
+        guard width > 0, height > 0 else { return }
+        lock.lock()
+        _canvas = (width, height)
+        lock.unlock()
+    }
+
+    /// 宏块数（16×16）。H.264 的 MaxFS 判据就是它，向上取整与编码器一致。
+    static func macroblocks(width: Int, height: Int) -> Int {
+        let cols = (max(width, 1) + 15) / 16
+        let rows = (max(height, 1) + 15) / 16
+        return cols * rows
+    }
+
     static func noteFrameWritten() {
         lock.lock(); _framesWritten += 1; lock.unlock()
     }
@@ -587,6 +616,7 @@ enum ScreenShareRuntime {
     static func reset() {
         lock.lock()
         _forcedCanvas = nil
+        _canvas = nil
         _framesWritten = 0
         _framesPushed = 0
         _lastPushAt = nil

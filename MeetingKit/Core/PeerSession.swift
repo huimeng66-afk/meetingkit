@@ -634,6 +634,158 @@ final class PeerSession: NSObject {
         SDPCodecFilter.h264Level(in: peerConnection.localDescription?.sdp)
     }
 
+    /// 实际挂着的视频发送器数量（0 或 1）。
+    var videoSenderCount: Int {
+        videoSender == nil ? 0 : 1
+    }
+
+    /// 视频通道对账：**SDP 声明的通道** 对 **sender 实际在用的 mid/ssrc**。
+    ///
+    /// 为什么必须打这一行：连续几个版本都出现同一组自相矛盾的数字——
+    /// iOS 侧 `发视频 512 包 / 编码 80 帧`（outbound 明明在跑），
+    /// 而安卓和浏览器的 `收视频` 都是 **0KB**（连一个字节都没关联上）。
+    /// outbound 有数、inbound 为 0，只有一种解释：包发出去，但对端按 SDP
+    /// 里的 mid/ssrc 关联不到这条 m-line，被静默丢弃——丢弃发生在统计之前，
+    /// 所以对端的 inbound 连计数都不涨。
+    /// 成因通常是 sender 重建（replaceTrack / 补建 transceiver）之后 SSRC
+    /// 漂移，而 SDP 没有重新协商，仍写着旧值。
+    ///
+    /// 这一行把"声明"和"实际"并排放，`ssrc✓/✗` 一眼定生死：
+    ///   · 全部 ✓ → 不是漂移，问题在对端的解码/渲染（去查它那边的 inFrames）；
+    ///   · 出现 ✗ 或"无ssrc" → 就是漂移，必须重谈一次让 SDP 追上 sender。
+    var videoChannelAudit: String {
+        guard let sdp = peerConnection.localDescription?.sdp, !sdp.isEmpty else { return "无本地SDP" }
+        let bundle = sdp.split(whereSeparator: { $0.isNewline })
+            .first { $0.hasPrefix("a=group:BUNDLE") }
+            .map { String($0.dropFirst("a=group:BUNDLE".count)).trimmingCharacters(in: .whitespaces) }
+            ?? "无BUNDLE⚠️"
+
+        struct Section { var mid = "-"; var port = "?"; var dir = "sendrecv"; var ssrc: [String] = [] }
+        var sections: [Section] = []
+        var current: Section?
+        var inVideo = false
+
+        for raw in sdp.split(whereSeparator: { $0.isNewline }) {
+            let line = String(raw)
+            if line.hasPrefix("m=") {
+                if let c = current { sections.append(c) }
+                current = nil
+                inVideo = line.hasPrefix("m=video")
+                if inVideo {
+                    let fields = line.split(separator: " ")
+                    var s = Section()
+                    s.port = fields.count > 1 ? String(fields[1]) : "?"
+                    current = s
+                }
+                continue
+            }
+            guard inVideo, var c = current else { continue }
+            if line.hasPrefix("a=mid:") {
+                c.mid = String(line.dropFirst("a=mid:".count))
+            } else if line.hasPrefix("a=ssrc:") {
+                let value = line.dropFirst("a=ssrc:".count)
+                    .split(separator: " ").first.map(String.init) ?? ""
+                if !value.isEmpty, !c.ssrc.contains(value) { c.ssrc.append(value) }
+            } else if ["a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"].contains(line) {
+                c.dir = String(line.dropFirst(2))
+            }
+            current = c
+        }
+        if let c = current { sections.append(c) }
+
+        let senderSsrc = videoSender?.parameters.encodings.first?.ssrc?.stringValue ?? "无"
+        let senderMid = videoTransceiver?.mid ?? "无"
+        let items = sections.map { s -> String in
+            let ssrcText: String
+            if s.ssrc.isEmpty {
+                ssrcText = "无ssrc"
+            } else if senderSsrc == "无" {
+                ssrcText = "ssrc✗"
+            } else {
+                ssrcText = s.ssrc.contains(senderSsrc) ? "ssrc✓" : "ssrc✗"
+            }
+            return "mid\(s.mid)/\(s.dir)/p\(s.port)/\(ssrcText)"
+        }
+        let mismatch = senderSsrc == "无" || sections.contains { !$0.ssrc.isEmpty && !$0.ssrc.contains(senderSsrc) }
+        return "BUNDLE[\(bundle)] · 发送端 mid\(senderMid)/ssrc\(senderSsrc)"
+            + " · \(items.isEmpty ? "无video段⚠️" : items.joined(separator: " · "))"
+            + (mismatch ? " ⚠️漂移" : "")
+    }
+
+    /// 本地 SDP 里所有 video 段声明过的 SSRC。
+    private static func declaredVideoSsrcs(_ sdp: String?) -> [String] {
+        guard let sdp, !sdp.isEmpty else { return [] }
+        var result: [String] = []
+        var inVideo = false
+        for raw in sdp.split(whereSeparator: { $0.isNewline }) {
+            let line = String(raw)
+            if line.hasPrefix("m=") {
+                inVideo = line.hasPrefix("m=video")
+                continue
+            }
+            guard inVideo, line.hasPrefix("a=ssrc:") else { continue }
+            let value = line.dropFirst("a=ssrc:".count)
+                .split(separator: " ").first.map(String.init) ?? ""
+            if !value.isEmpty, !result.contains(value) { result.append(value) }
+        }
+        return result
+    }
+
+    /// 视频通道自愈：把"本端在发、对端一个字节都收不到"这一类结构性问题
+    /// 在一次重新协商里修掉。
+    ///
+    /// 三个触发条件，都会造成同一个现场（outbound 涨、对端 inbound 恒 0）：
+    ///   1. sender 没有 ssrc —— encoding 没建起来，包根本组不出来；
+    ///   2. SDP 声明的 ssrc 里没有 sender 正在用的那个 —— 典型是 replaceTrack
+    ///      / 补建 transceiver 之后 sender 重建、SSRC 换了而 SDP 还是旧的，
+    ///      对端按旧 SSRC 关联不上，静默丢弃（丢弃在统计之前，所以对端
+    ///      连 bytesReceived 都不涨，"收视频 0KB"就是这么来的）；
+    ///   3. transceiver 方向被谈成 recvonly/inactive —— 本端没有发送权。
+    ///
+    /// 只做一次，且只在 stable 时做：协商进行中再插一脚只会制造 glare。
+    @discardableResult
+    func healVideoChannelIfDrifted() -> Bool {
+        guard !isClosed, peerConnection.signalingState == .stable else { return false }
+
+        /* 最严重的一种：墙还没砌起来。
+           现场出现过"对方已进会、我这边的这条 PC 长期停在
+           signalingState=.new / 远端描述为空"——perfect negotiation 里
+           polite 方等对方先开口，impolite 方本该主动，但只要两端算出
+           同一个 polite 结论，就同时沉默，连接永远建不起来（浏览器那条
+           一直是"新建 / ICE 新建 / 远端 无描述"）。
+           没有 SDP 就无从谈 ssrc，所以这一条必须排在对账之前。 */
+        if peerConnection.remoteDescription == nil {
+            ScreenShareRuntime.note("视频通道自愈：远端描述为空，主动发一轮 offer")
+            negotiate()
+            return true
+        }
+
+        let ssrc = videoSender?.parameters.encodings.first?.ssrc?.stringValue
+        let declared = Self.declaredVideoSsrcs(peerConnection.localDescription?.sdp)
+        let direction = videoTransceiver?.direction
+        let cannotSend = direction == .recvOnly || direction == .inactive
+
+        let drifted: Bool
+        if ssrc == nil {
+            drifted = true
+        } else if declared.isEmpty {
+            drifted = true
+        } else {
+            drifted = !declared.contains(ssrc!)
+        }
+
+        guard drifted || cannotSend else { return false }
+
+        if cannotSend {
+            _ = videoTransceiver?.setDirection(.sendRecv, error: nil)
+        }
+        ScreenShareRuntime.note(
+            "视频通道自愈：ssrc=\(ssrc ?? "无")/声明\(declared.count)条/方向\(direction.map { String($0.rawValue) } ?? "?") → 重新协商"
+        )
+        negotiate()
+        return true
+    }
+
     /* 这里曾经有一个 seedBandwidthEstimate，用 IMP 调
        `setBweMinBitrateBps:currentBitrateBps:maxBitrateBps:` 把带宽估计器的
        起点抬到目标的 90%。

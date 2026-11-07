@@ -1035,6 +1035,15 @@ final class RealRTCClient: NSObject, RTCClient {
         for peer in remotePeers.values {
             peer.session.attachScreenTrack(track)
         }
+        /* 挂轨之后立刻对账一次视频通道。
+           现场那组"发 512 包 / 编码 80 帧 / 对端收视频 0KB"只有一个解释：
+           包发出去了，但 SDP 里声明的 mid/ssrc 与 sender 实际用的对不上，
+           对端关联不到这条 m-line，丢在统计之前。replaceTrack 恰好会让
+           sender 重建一次，SSRC 有概率随之漂移。漂了就重谈一轮，
+           没漂什么都不做（幂等，不产生额外协商）。 */
+        for peer in remotePeers.values {
+            peer.session.healVideoChannelIfDrifted()
+        }
         applyScreenEncodingBudget()
         duckCameraForScreenShare()
         lastScreenBytes = 0
@@ -1053,6 +1062,19 @@ final class RealRTCClient: NSObject, RTCClient {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self, self.isScreenSharing else { return }
                 self.applyScreenEncodingBudget()
+            }
+        }
+        /* 视频通道对账补两次。
+           replaceTrack 之后 sender 的重建不是同步完成的，首次对账时
+           `parameters.encodings` 可能还是空的（读不到 ssrc，会被判成漂移
+           而白谈一轮）。3 秒、8 秒各复核一次，只在真的对不上时才动；
+           正常情况两次都是空跑，零副作用。 */
+        for delay in [3.0, 8.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.isScreenSharing else { return }
+                for peer in self.remotePeers.values {
+                    peer.session.healVideoChannelIfDrifted()
+                }
             }
         }
         /* ReplayKit 真正起播会晚于这里 200~800ms，并重配一次音频会话。
@@ -1102,6 +1124,15 @@ final class RealRTCClient: NSObject, RTCClient {
         for peer in remotePeers.values {
             peer.session.attachScreenTrack(track)
         }
+        /* 挂轨之后立刻对账一次视频通道。
+           现场那组"发 512 包 / 编码 80 帧 / 对端收视频 0KB"只有一个解释：
+           包发出去了，但 SDP 里声明的 mid/ssrc 与 sender 实际用的对不上，
+           对端关联不到这条 m-line，丢在统计之前。replaceTrack 恰好会让
+           sender 重建一次，SSRC 有概率随之漂移。漂了就重谈一轮，
+           没漂什么都不做（幂等，不产生额外协商）。 */
+        for peer in remotePeers.values {
+            peer.session.healVideoChannelIfDrifted()
+        }
         applyScreenEncodingBudget()
         duckCameraForScreenShare()
         lastScreenBytes = 0
@@ -1126,6 +1157,19 @@ final class RealRTCClient: NSObject, RTCClient {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self, self.isScreenSharing else { return }
                 self.applyScreenEncodingBudget()
+            }
+        }
+        /* 视频通道对账补两次。
+           replaceTrack 之后 sender 的重建不是同步完成的，首次对账时
+           `parameters.encodings` 可能还是空的（读不到 ssrc，会被判成漂移
+           而白谈一轮）。3 秒、8 秒各复核一次，只在真的对不上时才动；
+           正常情况两次都是空跑，零副作用。 */
+        for delay in [3.0, 8.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.isScreenSharing else { return }
+                for peer in self.remotePeers.values {
+                    peer.session.healVideoChannelIfDrifted()
+                }
             }
         }
     }
@@ -2493,7 +2537,10 @@ final class RealRTCClient: NSObject, RTCClient {
             let localDir = Self.mediaDirection(in: peer.session.peerConnection.localDescription?.sdp, kind: "audio")
             let remoteDir = Self.mediaDirection(in: peer.session.peerConnection.remoteDescription?.sdp, kind: "audio")
             let localVideoDir = Self.mediaDirection(in: peer.session.peerConnection.localDescription?.sdp, kind: "video")
+            let remoteVideoDir = Self.mediaDirection(in: peer.session.peerConnection.remoteDescription?.sdp, kind: "video")
             let senderCount = peer.session.audioSenderCount
+            let videoSenders = peer.session.videoSenderCount
+            let channelAudit = peer.session.videoChannelAudit
 
             peer.session.peerConnection.statistics { report in
                 var inPackets = 0, outPackets = 0, inKB = 0, outKB = 0
@@ -2501,6 +2548,26 @@ final class RealRTCClient: NSObject, RTCClient {
                 var level: Double = 0
                 var outLevel: Double = 0
                 var frameKB = 0
+                /* 视频双向明细。
+                   只打 bytesReceived 是没法定位的：对端"发了但被丢"和
+                   "压根没发"都显示 0KB。拆成 包/解码帧/分辨率/key 帧 之后：
+                     · 收包 > 0、解码 0   → 包到了但解不出（level/profile/关键帧）
+                     · 收包 = 0、发送 > 0 → 对端是按 SDP 关联不到（SSRC 漂移）
+                     · 两边都是 0         → 通道没建（BUNDLE/端口/方向）
+                   三种坏法对应三种完全不同的修法，不拆开就只能猜。 */
+                var inVideoPkts = 0, inVideoFrames = 0, inVideoW = 0, inVideoH = 0, inVideoKey = 0
+                var outVideoFrames = 0, outVideoW = 0, outVideoH = 0
+                /* 对端通过 RTCP RR 报回来的接收量。
+                   这是 iOS 侧唯一能确证"对面到底收没收到"的数：
+                   它 > 0 说明包真的到了对端（问题在解码/渲染），
+                   它 = 0 而本地 outbound 在涨，就是链路或关联断了。
+                   少了这一项，只能靠"对面说黑屏"来反推。 */
+                var rrVideoPkts = -1, rrVideoLost = 0
+                var videoOutboundIds = Set<String>()
+                for (_, st) in report.statistics where st.type == "outbound-rtp" {
+                    if (st.values["kind"] as? String) == "video" { videoOutboundIds.insert(st.id) }
+                }
+
                 for (_, st) in report.statistics {
                     if st.type == "inbound-rtp", (st.values["kind"] as? String) == "audio" {
                         inPackets = (st.values["packetsReceived"] as? NSNumber)?.intValue ?? 0
@@ -2514,17 +2581,36 @@ final class RealRTCClient: NSObject, RTCClient {
                     }
                     if st.type == "outbound-rtp", (st.values["kind"] as? String) == "video" {
                         outVideo = (st.values["packetsSent"] as? NSNumber)?.intValue ?? 0
+                        outVideoFrames = (st.values["framesEncoded"] as? NSNumber)?.intValue ?? 0
+                        outVideoW = (st.values["frameWidth"] as? NSNumber)?.intValue ?? 0
+                        outVideoH = (st.values["frameHeight"] as? NSNumber)?.intValue ?? 0
                     }
                     if st.type == "inbound-rtp", (st.values["kind"] as? String) == "video" {
                         frameKB = ((st.values["bytesReceived"] as? NSNumber)?.intValue ?? 0) / 1024
+                        inVideoPkts = (st.values["packetsReceived"] as? NSNumber)?.intValue ?? 0
+                        inVideoFrames = (st.values["framesDecoded"] as? NSNumber)?.intValue ?? 0
+                        inVideoW = (st.values["frameWidth"] as? NSNumber)?.intValue ?? 0
+                        inVideoH = (st.values["frameHeight"] as? NSNumber)?.intValue ?? 0
+                        inVideoKey = (st.values["keyFramesDecoded"] as? NSNumber)?.intValue ?? 0
+                    }
+                    if st.type == "remote-inbound-rtp" {
+                        let localId = (st.values["localId"] as? String) ?? ""
+                        if videoOutboundIds.contains(localId) {
+                            rrVideoPkts = (st.values["packetsReceived"] as? NSNumber)?.intValue ?? 0
+                            rrVideoLost = (st.values["packetsLost"] as? NSNumber)?.intValue ?? 0
+                        }
                     }
                 }
+                let rrText = rrVideoPkts < 0 ? "对端未回报" : "对端报告 收\(rrVideoPkts)包/丢\(rrVideoLost)"
                 let line = """
                 \(name)：\(conn) / ICE \(ice)
                   SDP 音频 本端 \(localDir) · 远端 \(remoteDir)
-                  SDP 视频 本端 \(localVideoDir) · 音频发送器 \(senderCount)
+                  SDP 视频 本端 \(localVideoDir) · 远端 \(remoteVideoDir) · 发送器 音频\(senderCount)/视频\(videoSenders)
+                  视频通道 \(channelAudit)
                   收音频 \(inPackets) 包 · \(inKB)KB · 电平 \(String(format: "%.2f", level))
-                  发音频 \(outPackets) 包 · \(outKB)KB · 电平 \(String(format: "%.2f", outLevel)) · 发视频 \(outVideo) 包 · 收视频 \(frameKB)KB
+                  发音频 \(outPackets) 包 · \(outKB)KB · 电平 \(String(format: "%.2f", outLevel))
+                  发视频 \(outVideo) 包 · 编码 \(outVideoFrames) 帧 · \(outVideoW)x\(outVideoH) · \(rrText)
+                  收视频 \(inVideoPkts) 包 · 解码 \(inVideoFrames) 帧 · key\(inVideoKey) · \(inVideoW)x\(inVideoH) · \(frameKB)KB
                 """
                 lock.lock(); perPeer.append(line); lock.unlock()
                 group.leave()
@@ -2617,17 +2703,24 @@ final class RealRTCClient: NSObject, RTCClient {
     nonisolated static var screenEncodingProfile: (width: Int32, height: Int32, fps: Int32, bitrate: Int) {
         switch AppSettings.shareQualitySnapshot {
         case .sharp:
-            /* 1080p / 24fps / 4Mbps。
-               档位按 LiveKit 的屏幕共享预设插值（`VideoParameters`）：
-               1080p@15 → 2.5Mbps，1080p@30 → 5Mbps，24fps 落在 4Mbps。
-               之前写 8Mbps 是拍脑袋的：它从来不是"能发多少"，而是
-               `x-google-start-bitrate` 的计算基数——上限给到 8M，
-               起始码率就会按 7.2M 起步，在 4G 上开头两秒必然过冲丢包。
-               screen share 的正确档位是"够清楚 + 起步不过冲"。 */
-            return (1920, 1080, 24, 4_000_000)
+            /* 720p / 24fps / 3Mbps。
+               **这里不能写 1080p。** H.264 Level 3.1（Chrome/WebRTC 默认的
+               `42001f`）的 MaxFS 是 3600 个宏块，正好等于 1280×720；
+               1080p 是 8160 个宏块、竖屏 1080×1920 是 6600 个，都超限一倍。
+               超限的后果不是"编不出来"，而是更隐蔽的一种：
+               VideoToolbox 仍会出帧、RTP 也照发（所以"发送 N 包/编码 M 帧"
+               看着是活的），但**安卓的硬件解码器按 SDP 声明的 level 校验
+               分辨率，直接拒绝初始化**——表现就是"对方显示正在共享、
+               却永远黑屏"，而浏览器用软解不校验 level，所以网页端能看见。
+               这正是连续几个版本"发送正常、安卓全黑"的根因。
+               要 1080p 就必须把 level 抬到 4.0，但 VideoToolbox 会因为
+               `kVTCompressionPropertyKey_ProfileLevel` 与应用层写死的
+               level 冲突而创建失败（0 帧），得不偿失。
+               720p 在 3Mbps 下，手机屏共享的文字边缘是清楚的。 */
+            return (1280, 720, 24, 3_000_000)
         case .balanced:
-            // 720p@15 在 LiveKit 是 1.5Mbps，18fps 取 2Mbps。
-            return (1280, 720, 18, 2_000_000)
+            // 540p / 18fps / 1.6Mbps：弱网优先保帧率，宏块数 2040，余量充足。
+            return (960, 540, 18, 1_600_000)
         }
     }
 
@@ -3720,6 +3813,7 @@ final class ScreenFramePusher {
         Self.decodeQueue.sync {
             self.source.adaptOutputFormat(toWidth: width, height: height, fps: fps)
             self.appliedCanvas = (Int(width), Int(height))
+            ScreenShareRuntime.noteCanvas(width: Int(width), height: Int(height))
         }
     }
 
@@ -3803,6 +3897,7 @@ final class ScreenFramePusher {
                     height: result.height,
                     fps: RealRTCClient.screenEncodingProfile.fps
                 )
+                ScreenShareRuntime.noteCanvas(width: canvas.width, height: canvas.height)
             }
             // 单调时钟（系统校时/休眠不影响帧时间戳连续性）。
             let timestamp = Int64(CACurrentMediaTime() * 1_000_000_000)
@@ -3836,7 +3931,7 @@ final class ScreenFramePusher {
     /// JPEG → BGRA CVPixelBuffer（等比缩放，留黑边）。
     ///
     /// `canvas` 非空时用它当输出画布（上行守护降级就是走这条）；
-    /// 为空时按图片宽高比选 1920×1080 / 1080×1920。
+    /// 为空时按源比例缩到长边 1280 以内。
     static func jpegToPixelBuffer(
         _ data: Data,
         canvas: (width: Int, height: Int)? = nil
@@ -3846,9 +3941,19 @@ final class ScreenFramePusher {
             let image = CGImageSourceCreateImageAtIndex(imageSource, 0, nil)
         else { return nil }
 
-        let landscape = image.width >= image.height
-        let width = canvas?.width ?? (landscape ? 1920 : 1080)
-        let height = canvas?.height ?? (landscape ? 1080 : 1920)
+        /* 默认画布必须是"长边 1280 以内"，不能写死 1920×1080。
+           H.264 Level 3.1 的 MaxFS = 3600 宏块 = 1280×720；写死 1080p 是
+           8160 宏块、竖屏 1080×1920 是 6600 宏块，都超限。超限时 iOS 照样
+           出帧发包，安卓硬件解码器却按 SDP 的 level 拒绝初始化 —— 对方
+           一直黑屏。`ScreenOutputSize.fit` 同时保证 16 对齐与同比例，
+           不留黑边、不做无谓放大。 */
+        let fitted = ScreenOutputSize.fit(
+            width: image.width,
+            height: image.height,
+            maxLongEdge: 1280
+        )
+        let width = canvas?.width ?? fitted.width
+        let height = canvas?.height ?? fitted.height
 
         var pixelBuffer: CVPixelBuffer?
         let attributes: [String: Any] = [
