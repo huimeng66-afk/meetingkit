@@ -19,7 +19,41 @@
 //
 
 import Foundation
+import QuartzCore
 import WebRTC
+
+/// 远端轨的"最近一帧"时钟。
+///
+/// 回调来自 WebRTC 的视频线程，必须自己加锁；读侧在主线程。
+/// 放在文件作用域而不是 PeerSession 内部：避免嵌套类型被主 actor 隔离，
+/// 那样会无法满足 `RTCVideoRenderer` 的非隔离协议要求。
+private final class RemoteFrameClock: NSObject, RTCVideoRenderer {
+    private let lock = NSLock()
+    private var last: CFTimeInterval = 0
+
+    func setSize(_ size: CGSize) {}
+
+    func renderFrame(_ frame: RTCVideoFrame?) {
+        lock.lock()
+        last = CACurrentMediaTime()
+        lock.unlock()
+    }
+
+    var lastFrameAt: CFTimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        return last
+    }
+
+    /// 距上一帧多久；从没出过帧返回无穷大。
+    var age: CFTimeInterval {
+        let at = lastFrameAt
+        return at <= 0 ? .greatestFiniteMagnitude : CACurrentMediaTime() - at
+    }
+
+    func reset() {
+        lock.lock(); last = 0; lock.unlock()
+    }
+}
 
 // MARK: - 会话事件
 
@@ -78,6 +112,117 @@ final class PeerSession: NSObject {
     private(set) var remoteAudioTrack: RTCAudioTrack?
     /// 远端视频轨道。共享期间内容为屏幕画面（replaceTrack），区分靠 screen:state 事件。
     private(set) var remoteVideoTrack: RTCVideoTrack?
+    private var remoteCameraTrack: RTCVideoTrack?
+    private var remoteScreenTrack: RTCVideoTrack?
+    private var remoteScreenSharing = false
+
+    /// 最近一次真正在「出帧」的远端轨时钟。
+    ///
+    /// 为什么不能只信 `screen:state`：服务端共享位有 12 秒 TTL，重连、
+    /// 误纠正、非共享者的 off 都会让这条信令抖一下。以前一收到 off 就
+    /// 把渲染器绑回摄像头轨——摄像头是关的，画面立刻全黑，而屏幕轨
+    /// 其实还在出帧。判据必须回到画面本身：谁在出帧，谁就该被显示。
+    private let cameraClock = RemoteFrameClock()
+    private let screenClock = RemoteFrameClock()
+    private weak var clockedCameraTrack: RTCVideoTrack?
+    private weak var clockedScreenTrack: RTCVideoTrack?
+
+    /// 屏幕状态刚变成"在共享"后的保护窗口：这期间即使屏幕轨还没出帧，
+    /// 也优先选它。否则摄像头还开着时会先闪一段摄像头画面。
+    private var screenLatchUntil: CFTimeInterval = 0
+    private var pendingScreenOffWork: DispatchWorkItem?
+
+    /// 独立 screen m-line 与 replaceTrack 两种协议都支持；状态改变时重新绑定。
+    ///
+    /// off 做 4 秒防抖：TTL / 重连 / 误纠正造成的瞬时 off 不该把画面切走。
+    /// 真正的停止会在 4 秒后生效；这期间屏幕轨没有新帧，切换时也不会显示旧画面。
+    func setRemoteScreenSharing(_ sharing: Bool) {
+        pendingScreenOffWork?.cancel()
+        pendingScreenOffWork = nil
+        if sharing {
+            remoteScreenSharing = true
+            screenLatchUntil = CACurrentMediaTime() + 8
+            selectRemoteVideoTrack()
+            return
+        }
+        guard remoteScreenSharing else { return }
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.remoteScreenSharing = false
+                self.selectRemoteVideoTrack()
+                /* 刚停共享的一两秒里屏幕轨可能还在吐最后几帧，上一次选轨
+                   会故意留住画面。5 秒后再核一次，把它真正交还给摄像头。 */
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    Task { @MainActor in
+                        guard let self, !self.remoteScreenSharing else { return }
+                        self.selectRemoteVideoTrack()
+                    }
+                }
+            }
+        }
+        pendingScreenOffWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
+    }
+
+    /// 把渲染器时钟挂到轨道上。每条轨只挂一次，换轨时从旧轨摘掉。
+    private func attachFrameClock(to track: RTCVideoTrack, isScreen: Bool) {
+        let clock = isScreen ? screenClock : cameraClock
+        if isScreen {
+            if clockedScreenTrack === track { return }
+            if let old = clockedScreenTrack { old.remove(clock) }
+            clockedScreenTrack = track
+            screenClock.reset()
+        } else {
+            if clockedCameraTrack === track { return }
+            if let old = clockedCameraTrack { old.remove(clock) }
+            clockedCameraTrack = track
+            cameraClock.reset()
+        }
+        track.add(clock)
+    }
+
+    private func selectRemoteVideoTrack() {
+        let now = CACurrentMediaTime()
+        let screen = remoteScreenTrack
+        let camera = remoteCameraTrack
+        let selected: RTCVideoTrack?
+
+        if remoteScreenSharing {
+            let screenFresh = screen != nil && screenClock.age < 3
+            let inLatch = now < screenLatchUntil
+            let cameraFresh = camera != nil && cameraClock.age < 3
+            if screen != nil, screenFresh || inLatch {
+                /* 正常共享：屏幕轨在出帧，或者刚开共享还在第一帧的路上。 */
+                selected = screen
+            } else if screen != nil, !cameraFresh {
+                /* 屏幕轨暂时没帧、摄像头也没帧（大概率根本没开）：
+                   宁可停在屏幕轨上等，也不要切到一条永远黑的摄像头轨。 */
+                selected = screen
+            } else if screen == nil {
+                /* 对端走的是 replaceTrack 协议：只有一条视频轨。 */
+                selected = camera
+            } else {
+                /* 屏幕轨确实死了、摄像头活着：显示摄像头，至少不是黑屏。 */
+                selected = camera
+            }
+        } else {
+            /* 共享结束：屏幕轨若还在出帧（对端刚发完 off、帧还在路上），
+               先留住画面，等它自然停；否则回到摄像头。 */
+            if let screen, screenClock.age < 1.5 {
+                selected = screen
+            } else if let camera {
+                selected = camera
+            } else {
+                selected = screen
+            }
+        }
+
+        if remoteVideoTrack !== selected {
+            remoteVideoTrack = selected
+            bindRemoteVideoRenderer()
+        }
+    }
 
     /// 远端视频渲染视图（RTCMTLVideoView），收到 track 时创建。
     private(set) var remoteVideoView: RTCMTLVideoView?
@@ -962,6 +1107,7 @@ final class PeerSession: NSObject {
     }
 
     func handleRemoteCandidate(_ raw: [String: Any]) {
+        guard !isClosed, !ignoreOffer else { return }
         guard
             let sdpMid = raw["sdpMid"] as? String,
             let sdpMLineIndex = (raw["sdpMLineIndex"] as? NSNumber)?.intValue,
@@ -1049,14 +1195,21 @@ final class PeerSession: NSObject {
         view.backgroundColor = .black
         view.clipsToBounds = true
         remoteVideoView = view
+        bindRemoteVideoRenderer()
         return view
     }
+
+    /// 当前绑在预览视图上的那条轨。重复 add/remove 会让 MTL 渲染器
+    /// 重建纹理，屏幕共享期间每次 screen:state 抖一下就是一次黑闪。
+    private weak var boundRemoteTrack: RTCVideoTrack?
 
     /// 把远端 track 绑到渲染视图。
     func bindRemoteVideoRenderer() {
         guard let track = remoteVideoTrack, let view = remoteVideoView else { return }
-        track.remove(view)
+        if boundRemoteTrack === track { return }
+        boundRemoteTrack?.remove(view)
         track.add(view)
+        boundRemoteTrack = track
     }
 
     // MARK: - 关闭
@@ -1086,8 +1239,19 @@ final class PeerSession: NSObject {
         if let track = remoteVideoTrack, let view = remoteVideoView {
             track.remove(view)
         }
+        boundRemoteTrack = nil
+        pendingScreenOffWork?.cancel()
+        pendingScreenOffWork = nil
+        if let track = clockedCameraTrack { track.remove(cameraClock) }
+        if let track = clockedScreenTrack { track.remove(screenClock) }
+        clockedCameraTrack = nil
+        clockedScreenTrack = nil
+        cameraClock.reset()
+        screenClock.reset()
         remoteVideoView = nil
         remoteVideoTrack = nil
+        remoteCameraTrack = nil
+        remoteScreenTrack = nil
         remoteAudioTrack = nil
 
         // 断开 delegate，防止旧会话迟到的回调再进入上层（避免误杀重建后的新会话）。
@@ -1262,6 +1426,7 @@ final class PeerSession: NSObject {
                     self.delegate?.peerSessionNeedsRebuild(self)
                     return
                 }
+                self.ignoreOffer = false
                 self.lastRemoteSetError = nil
                 self.answerSetFailureCount = 0
                 self.pendingOfferRound = nil
@@ -1537,6 +1702,8 @@ extension PeerSession: RTCPeerConnectionDelegate {
         streams mediaStreams: [RTCMediaStream]
     ) {
         let track = rtpReceiver.track
+        let streamIDs = mediaStreams.map { $0.streamId }
+        let receiverID = rtpReceiver.receiverId
         Task { @MainActor in
             guard let track = track, !self.isClosed else { return }
             switch track.kind {
@@ -1548,12 +1715,28 @@ extension PeerSession: RTCPeerConnectionDelegate {
                 }
             case "video":
                 if let video = track as? RTCVideoTrack {
-                    // 替换前把旧 track 从渲染视图上摘下来，
-                    // 避免两条轨道同时向同一视图出帧。
-                    if let old = self.remoteVideoTrack, old !== video, let view = self.remoteVideoView {
-                        old.remove(view)
+                    // streamless Unified Plan 也从对应 mid 的远端 SDP 读取 msid。
+                    let mid = self.peerConnection.transceivers.first {
+                        $0.receiver.receiverId == receiverID
+                    }?.mid
+                    let sections = (self.peerConnection.remoteDescription?.sdp ?? "")
+                        .components(separatedBy: "\nm=")
+                    let section = mid.flatMap { value in
+                        sections.first { section in
+                            section.components(separatedBy: "\n").contains {
+                                $0.trimmingCharacters(in: .whitespacesAndNewlines) == "a=mid:\(value)"
+                            }
+                        }
+                    } ?? ""
+                    let isScreen = streamIDs.contains { $0.hasPrefix("screen-") }
+                        || section.contains("a=msid:screen-")
+                    if isScreen {
+                        self.remoteScreenTrack = video
+                    } else {
+                        self.remoteCameraTrack = video
                     }
-                    self.remoteVideoTrack = video
+                    self.attachFrameClock(to: video, isScreen: isScreen)
+                    self.selectRemoteVideoTrack()
                     self.delegate?.peerSession(self, didReceiveRemoteVideo: video)
                 }
             default:

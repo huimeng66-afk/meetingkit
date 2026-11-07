@@ -2456,6 +2456,7 @@ final class RealRTCClient: NSObject, RTCClient {
         if let screenPeerID = snapshot.screenPeerID {
             if let peer = remotePeers[screenPeerID] {
                 peer.screen = true
+                peer.session.setRemoteScreenSharing(true)
                 delegate?.rtcDidReceiveRemoteScreen(peer.session.makeRemoteVideoView(), for: screenPeerID)
             }
         }
@@ -2537,6 +2538,7 @@ final class RealRTCClient: NSObject, RTCClient {
         pendingScreenPeerID = nil
         if let screenPeerID = snapshot.screenPeerID, let peer = remotePeers[screenPeerID] {
             peer.screen = true
+            peer.session.setRemoteScreenSharing(true)
             delegate?.rtcDidReceiveRemoteScreen(peer.session.makeRemoteVideoView(), for: screenPeerID)
         }
         if isScreenSharing {
@@ -2801,6 +2803,7 @@ extension RealRTCClient: TianqiongSignalingDelegate {
             session: session
         )
         remotePeers[peerID] = remote
+        session.setRemoteScreenSharing(screenOn)
         if pendingScreenPeerID == peerID { pendingScreenPeerID = nil }
 
         /* 人数变了，共享码率要重新分摊：3 人共享和 2 人共享，
@@ -2841,6 +2844,7 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         if let video = video { peer.video = video }
         if let screen = screen {
             peer.screen = screen
+            peer.session.setRemoteScreenSharing(screen)
             if screen {
                 delegate?.rtcDidReceiveRemoteScreen(peer.session.makeRemoteVideoView(), for: peerID)
             } else {
@@ -2887,6 +2891,12 @@ extension RealRTCClient: TianqiongSignalingDelegate {
                 screenFalseCorrectionWork?.cancel()
                 let work = DispatchWorkItem { [weak self] in
                     guard let self, !self.isScreenSharing else { return }
+                    /* 还有帧在推进 = 采集侧明明在共享，只是 isScreenSharing 这个
+                       状态位慢了半拍（SCK 起播、bridge 握手都比一条 socket 消息慢）。
+                       这时候回 off 等于共享者自己把共享位拆掉：服务端广播 off，
+                       安卓收台、iOS 换轨，全场一起黑。 */
+                    let native = ScreenShareRuntime.nativeFrameStats
+                    if let at = native.lastAt, Date().timeIntervalSince(at) < 5 { return }
                     self.screenFalseCorrections += 1
                     self.signaling?.sendMediaState(audio: nil, video: nil, screen: false)
                 }
@@ -2919,6 +2929,7 @@ extension RealRTCClient: TianqiongSignalingDelegate {
         }
 
         peer.screen = on
+        peer.session.setRemoteScreenSharing(on)
         let view = peer.session.makeRemoteVideoView()
         if on {
             delegate?.rtcDidReceiveRemoteScreen(view, for: peerID)
@@ -3137,6 +3148,11 @@ extension RealRTCClient: PeerSessionDelegate {
     func peerSession(_ session: PeerSession, didReceiveRemoteVideo track: RTCVideoTrack) {
         guard let peer = remotePeers[session.peerID] else { return }
         let view = session.makeRemoteVideoView()
+        /* 只在"对端确实在共享"时切换。false 会走 4 秒防抖，
+           每来一条轨就传一次 false 只会平白排一堆待执行任务。 */
+        if peer.screen {
+            session.setRemoteScreenSharing(true)
+        }
         session.bindRemoteVideoRenderer()
         if peer.screen {
             delegate?.rtcDidReceiveRemoteScreen(view, for: session.peerID)

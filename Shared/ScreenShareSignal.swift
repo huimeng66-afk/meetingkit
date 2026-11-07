@@ -101,10 +101,20 @@ enum ScreenShareStore {
     private static let fileName = "screen-share-state.json"
 
     /// 写串行化：扩展侧在广播开始/心跳/结束时都会写，避免两次写交叉。
-    private static let writeQueue = DispatchQueue(
-        label: "com.tianqiong.meetingkit.sharestore",
-        qos: .userInitiated
-    )
+    /// 同时挂一个队列标记：读改写已经在这条队列里时不再 sync，否则必死锁。
+    private static let queueKey = DispatchSpecificKey<UInt8>()
+    private static let writeQueue: DispatchQueue = {
+        let queue = DispatchQueue(
+            label: "com.tianqiong.meetingkit.sharestore",
+            qos: .userInitiated
+        )
+        queue.setSpecific(key: queueKey, value: 1)
+        return queue
+    }()
+
+    private static var isOnWriteQueue: Bool {
+        DispatchQueue.getSpecific(key: queueKey) == 1
+    }
 
     // MARK: 路径
 
@@ -129,18 +139,34 @@ enum ScreenShareStore {
 
     /// 写快照（原子替换）。失败静默：共享画面丢一次状态不该中断广播。
     private static func write(_ snapshot: Snapshot) {
-        writeQueue.sync {
-            guard let url = fileURL() else { return }
-            guard let data = try? JSONEncoder().encode(snapshot) else { return }
-            try? data.write(to: url, options: .atomic)
+        if isOnWriteQueue {
+            writeOnQueue(snapshot)
+        } else {
+            writeQueue.sync { writeOnQueue(snapshot) }
         }
     }
 
-    /// 读-改-写。所有 setter 都走这里，避免"改一个字段把别的字段覆盖回旧值"。
+    /// 仅在 writeQueue 内调用，避免嵌套 sync 死锁。
+    private static func writeOnQueue(_ snapshot: Snapshot) {
+        guard let url = fileURL(),
+              let data = try? JSONEncoder().encode(snapshot) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    /// 读取也必须在队列内：否则心跳会用旧快照覆盖刚写入的 paused/active。
+    /// 此队列只保证同进程串行，不等同于主 App 与扩展之间的跨进程锁。
     private static func mutate(_ body: (inout Snapshot) -> Void) {
-        var current = snapshot() ?? Snapshot()
-        body(&current)
-        write(current)
+        if isOnWriteQueue {
+            var current = snapshot() ?? Snapshot()
+            body(&current)
+            writeOnQueue(current)
+            return
+        }
+        writeQueue.sync {
+            var current = snapshot() ?? Snapshot()
+            body(&current)
+            writeOnQueue(current)
+        }
     }
 
     // MARK: 对外属性

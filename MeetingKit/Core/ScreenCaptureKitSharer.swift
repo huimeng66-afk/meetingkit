@@ -128,9 +128,19 @@ enum ScreenSharingSessionFactory {
     }
 
     static var backend: ScreenSharingBackend {
-        // 顺序不能反：iOS 27 上广播扩展已经不会被系统拉起，
-        // 必须先看 SCK，再退 in-app，最后才轮到扩展。
-        guard #available(iOS 27.0, *) else { return .broadcastExtension }
+        /* 顺序不能反，也不能被 App Group 的可用性带偏。
+           iOS 27 起 `RPBroadcastSampleHandler` 被标为 "No longer supported"，
+           真机上的现场是：系统弹出共享卡片、转圈，但**永不创建扩展进程**，
+           App Group 里没有会话头，主 App 一帧都读不到。
+           这时 App Group 明明是通的（containerURL 非 nil），
+           如果因此判定"扩展可用"，用户点共享后就是彻底的黑屏。
+           所以：系统版本是第一判据；App Group 只在 iOS 26 及以下参与。 */
+        guard #available(iOS 27.0, *) else {
+            return .broadcastExtension
+        }
+        if AppGroupConfig.isAvailable {
+            ScreenCaptureKitRuntime.note("iOS 27 已停用广播扩展，改走 ScreenCaptureKit")
+        }
 
         /* 连续两次把进程带走，就不再让用户陪着试了。
            计数按版本存：换新版本会重新给一次机会（见 ShareBreadcrumb）。
