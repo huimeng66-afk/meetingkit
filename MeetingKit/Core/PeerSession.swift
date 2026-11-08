@@ -271,6 +271,13 @@ final class PeerSession: NSObject {
     /// 当前挂在共享通道上的轨道 id，仅用于诊断与去重。
     private var screenTrackId: String?
 
+    /// 共享 m-line 是否已经以 `screen-` 流名真正落进过 SDP。
+    ///
+    /// 只有第一次共享需要新建 m-line（为了让对端收到 onAddTrack）；
+    /// 之后同一条连接内的反复开关一律走 replaceTrack，避免每共享一次
+    /// 就多堆一条 video m-line。PeerSession 重建时随实例归零，正是我们要的。
+    private var screenSdpBound = false
+
     /// 本端音频发送通道。
     ///
     /// 与 videoSender 同理必须缓存：麦克风轨因设备切换 / 音频会话重建被整体替换时，
@@ -482,6 +489,45 @@ final class PeerSession: NSObject {
     private func ensureScreenSender(_ track: RTCVideoTrack) {
         localScreen = track
         isSendingScreen = true
+
+        /* 首次共享必须真的**新建一条 m-line**，不能只 replaceTrack。
+         *
+         * replaceTrack 不产生 SDP 变更 —— 这是「iOS 在共享、浏览器看得见、
+         * 安卓全黑」的根因。接收端拿远端轨只有 `onAddTrack` 一个入口，
+         * 而它只在新 msid 出现在 SDP 里时触发。replaceTrack 之后 SDP 一字未变，
+         * 对端手里就永远没有那条 VideoTrack：RTP 照样收、RTCP 零丢包、
+         * 解码器照样工作，但没有任何东西 addSink 到渲染器 —— 纯黑。
+         *
+         * 这里先摘掉旧 sender，再用 `screen-` 流名新建一条：
+         * SDP 里会出现全新的 `a=msid:screen-<peer> <trackId>`，
+         * 对端必定收到 onAddTrack，而且 msid 前缀能被直接认成共享位
+         * （安卓的 isScreenTrack 就是按这个前缀判的，不用再猜）。
+         *
+         * 代价是多一条 video m-line（旧那条退化成 recvonly，不占上行）。
+         * 只在本次 PeerSession 的第一次共享发生一次，之后回到 replaceTrack。 */
+        if !screenSdpBound {
+            screenSdpBound = true
+            let previous = videoSender
+            if let sender = previous {
+                peerConnection.removeTrack(sender)
+                videoSender = nil
+                videoTransceiver = nil
+            }
+            let configuration = RTCRtpTransceiverInit()
+            configuration.direction = .sendRecv
+            configuration.streamIds = ["screen-\(peerID)"]
+            if let transceiver = peerConnection.addTransceiver(with: track, init: configuration) {
+                videoTransceiver = transceiver
+                videoSender = transceiver.sender
+                screenTrackId = track.trackId
+                ScreenShareRuntime.note("共享：已新建 screen m-line（让对端能收到 onAddTrack）")
+                negotiate()
+                return
+            }
+            /* 新建失败：退回 replaceTrack 路径，至少别把画面彻底断掉。 */
+            ScreenShareRuntime.note("共享：新建 screen m-line 失败，退回 replaceTrack")
+            videoSender = previous
+        }
 
         if videoSender == nil {
             let configuration = RTCRtpTransceiverInit()
