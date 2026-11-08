@@ -507,12 +507,24 @@ final class PeerSession: NSObject {
          * 只在本次 PeerSession 的第一次共享发生一次，之后回到 replaceTrack。 */
         if !screenSdpBound {
             screenSdpBound = true
+            /* 只把旧 sender 的轨摘掉，**绝不 removeTrack**。
+             *
+             * 1.9.19 用 `removeTrack` 换新 m-line，现场直接变成
+             * 「SDP 视频 本端 recvonly / 发视频 0 包 / 编码 0 帧」——
+             * removeTrack 会把这个 transceiver 的方向改成 recvonly 并立刻触发
+             * 一次重协商，正在工作的 VideoSendStream 被整条拆掉，
+             * 新建的那条再也建不起来（轨挂着、帧在推、编码恒 0）。
+             *
+             * `sender.track = nil` 只是 replaceTrack(nil)：不改 SDP 方向、
+             * 不动 transport、不拆 encoder。下一次重协商时这条 m-line
+             * 自然变成 recvonly（没有 track 就没有 a=ssrc），对端也就知道
+             * 它不该再等这一条了。 */
             let previous = videoSender
             if let sender = previous {
-                peerConnection.removeTrack(sender)
-                videoSender = nil
-                videoTransceiver = nil
+                sender.track = nil
             }
+            videoSender = nil
+            videoTransceiver = nil
             let configuration = RTCRtpTransceiverInit()
             configuration.direction = .sendRecv
             configuration.streamIds = ["screen-\(peerID)"]
