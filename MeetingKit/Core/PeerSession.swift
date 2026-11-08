@@ -541,6 +541,24 @@ final class PeerSession: NSObject {
         negotiate()
     }
 
+    /// 唤醒已经挂着的音频 sender（不产生 SDP 变更）。
+    ///
+    /// 只把 `track.isEnabled` 置 true，对**在我关着麦时新加入**的对端不生效：
+    /// 它建连接那一刻拿到的是一条 disabled 的轨，audio send stream 从建立起
+    /// 就停在"不发送"，之后再改 isEnabled 不会让 ADM 重新喂数据。
+    /// `replaceTrack(nil)` → `replaceTrack(track)` 会重建这条 send stream，
+    /// 不进协商、不改 mid，中断约 60ms，用户听不出来。
+    func pulseAudioTrack(_ track: RTCAudioTrack) {
+        guard !isClosed, let sender = audioSender else { return }
+        sender.track = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self, weak sender] in
+            Task { @MainActor in
+                guard let self, let sender, !self.isClosed else { return }
+                sender.track = track
+            }
+        }
+    }
+
     // MARK: - 屏幕共享（m-line 预建，只开关轨）
 
     /// 开始/续接共享：打开共享轨。

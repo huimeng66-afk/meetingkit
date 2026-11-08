@@ -764,6 +764,23 @@ final class RealRTCClient: NSObject, RTCClient {
             reactivateAudioSession()
         }
         track.isEnabled = enabled
+        if enabled {
+            /* 还有一类"开了麦没效果"：我关着麦的时候有新人进会，它那条
+               连接是在"我静音"的状态下建的，audio send stream 从建立起就
+               没发过包。对他只改 isEnabled 不会复活，必须把轨重新挂一遍
+               （replaceTrack，不改 SDP、不重谈，约 60ms 的静音）。 */
+            for peer in remotePeers.values {
+                peer.session.pulseAudioTrack(track)
+            }
+            /* 重挂只是"把门推开"，但门后面有没有水还得量一下。
+               开麦这一下同时重启上行探针，4 秒后就有第一个数据点：
+               如果 packetsSent 起来了，计数清零不再管；起不来就按五级
+               阶梯继续救。以前这里不重排，探针在入会几十秒内就把两轮
+               额度用完，用户关一次麦再开就永久哑了。 */
+            for peer in remotePeers.values {
+                scheduleOutboundAudioWatchdog(for: peer.session, delay: 4)
+            }
+        }
         publishLocalMediaState()
         publishParticipants()
     }
@@ -933,6 +950,14 @@ final class RealRTCClient: NSObject, RTCClient {
         screenStartRequestedAt = Date()
         signaling?.sendMediaState(audio: nil, video: nil, screen: true)
         startScreenStateHeartbeat()
+        /* 共享开始是音频最容易被挤掉的时刻：Broadcast 扩展启动、音频会话
+           被抢到 record 模式、AudioUnit 重新配置，任何一步都可能把上行
+           按停，而界面上一切正常（"本地麦克风 开启/live"），对方却听不见。
+           顺手把上行探针重新点一遍，共享到一半突然哑掉的情况 8 秒内就能
+           被量到并按阶梯自愈。 */
+        for peer in remotePeers.values {
+            scheduleOutboundAudioWatchdog(for: peer.session, delay: 6)
+        }
     }
 
     func stopScreenShare() {
@@ -2129,6 +2154,14 @@ final class RealRTCClient: NSObject, RTCClient {
         localAudioTrack = audioTrack
         if audioOn && !micGranted {
             delegate?.rtcDidUpdateLocalMic(false)
+        }
+        /* 入会就把音频会话抢到 playAndRecord，不等有人进来。
+           用户的原话是"不要等任何人进来才调麦克风"——WebRTC 在没有对端时
+           本来就不会启动 audio unit（这是它的设计，不是 bug），但 session
+           必须先处于录制态：否则第一个对端进来的瞬间要做一次路由切换，
+           开头半秒的话会直接丢掉，听起来就是"刚进会那会儿没声音"。 */
+        DispatchQueue.main.async { [weak self] in
+            self?.reactivateAudioSession(force: true)
         }
 
         // 摄像头（前置，720p@30）。
@@ -3598,33 +3631,50 @@ extension RealRTCClient: PeerSessionDelegate {
         let attempt = (outboundAudioProbeCounts[peerID] ?? 0) + 1
         outboundAudioProbeCounts[peerID] = attempt
 
-        // 最多两轮补救：再往下就是无限重建，对用户没有任何好处。
-        guard attempt <= 2 else { return }
-
-        if attempt == 1 {
-            /* 关键判断：如果有 audio sender、SDP 是 sendrecv、轨道也 live，
-               那 0 包就不是"挂错了"，而是音频设备根本没在出帧。
-               这时先把设备整条重启；重启函数内部会重建轨并重挂所有 peer，
-               不需要再单独 forceReattach。 */
-            let trackLive = localAudioTrack?.readyState == .live
-            if trackLive {
-                restartAudioPipeline(reason: "peer \(peerID) 连接 3 秒 0 包")
-            } else {
-                let track = rebuildAudioTrack()
-                track?.isEnabled = true
-                if let track = track {
-                    session.forceReattachAudio(track)
-                } else {
-                    session.ensureLocalSenders()
-                }
+        /* 这里原来只给两轮，第二轮直接 `peerSessionNeedsRebuild`。
+           现场代价很大：重建整条 PeerConnection 会把视频一起推倒，
+           在"共享进行中"等于主动制造一次黑屏；而且两轮补救在入会后
+           几十秒内就耗尽了，之后状态机彻底停摆 —— 用户看到的就是
+           "关过麦之后再也开不回来，一晚上都没声音"。
+           现在改成五级阶梯 + **无限循环**：每级之间隔 8 秒，走完六轮
+           计数清零从头再来。只要人还在会议里、麦克风还是开着的，
+           它就一直试下去，不会停在"我已经修过两次，不管了"的状态。 */
+        switch attempt {
+        case 1:
+            /* 轨道还 live 却 0 包，说明不是"挂错了"，是音频设备根本没出帧。
+               设备级问题重挂 sender 没用，先把整条音频链路重启。 */
+            restartAudioPipeline(reason: "peer \(peerID) 连接后 0 包")
+        case 2:
+            /* 设备活着、sender 也在，但 send stream 是僵的（典型：关麦期间
+               新入会的人，从建立起就没收到过数据）。摘轨再挂回去会重建
+               send stream，不产生 SDP 变更、不改 mid，中断约 60ms。 */
+            if let track = localAudioTrack { session.pulseAudioTrack(track) }
+        case 3:
+            /* 前两级都没叫醒它：翻转 isEnabled 逼 ADM 重新贴一次源，
+               同时强制把 AudioSession 抢回来（被来电/共享广播打断过时，
+               active 标志可能还是 true，但实际已经不再喂数据）。 */
+            if let track = localAudioTrack {
+                track.isEnabled = false
+                track.isEnabled = true
             }
-            scheduleOutboundAudioWatchdog(for: session, delay: 4)
-            return
+            reactivateAudioSession(force: true)
+        case 4:
+            /* 换一条新的麦克风轨，并把这条连接上的 sender 拆了重挂。
+               这一步会引入一次协商，所以放在第三级之后才用。 */
+            if let track = rebuildAudioTrack() {
+                track.isEnabled = true
+                localAudioTrack = track
+                session.forceReattachAudio(track)
+            } else {
+                session.ensureLocalSenders()
+            }
+        case 5:
+            restartAudioPipeline(reason: "peer \(peerID) 五级补救最后一档")
+        default:
+            // 六轮走完，计数归零，下一轮从第一级重新来过。
+            outboundAudioProbeCounts[peerID] = 0
         }
-
-        // 第二轮仍 0 包：这条连接上的音频通道已经不可信，换一条。
-        outboundAudioProbeCounts.removeValue(forKey: peerID)
-        peerSessionNeedsRebuild(session)
+        scheduleOutboundAudioWatchdog(for: session, delay: 8)
     }
 
     func peerSession(_ session: PeerSession, didReceiveRemoteVideo track: RTCVideoTrack) {
