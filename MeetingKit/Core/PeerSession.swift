@@ -789,7 +789,15 @@ final class PeerSession: NSObject {
             .map { String($0.dropFirst("a=group:BUNDLE".count)).trimmingCharacters(in: .whitespaces) }
             ?? "无BUNDLE⚠️"
 
-        struct Section { var mid = "-"; var port = "?"; var dir = "sendrecv"; var ssrc: [String] = [] }
+        struct Section {
+            var mid = "-"
+            var port = "?"
+            var dir = "sendrecv"
+            var ssrc: [String] = []
+            /// `a=msid:<stream> <track>`。**这是对端能不能拿到轨的唯一凭据。**
+            /// 缺了它，接收端的 onAddTrack 不会触发，RTP 收得再齐也画不出来。
+            var msid = ""
+        }
         var sections: [Section] = []
         var current: Section?
         var inVideo = false
@@ -815,6 +823,8 @@ final class PeerSession: NSObject {
                 let value = line.dropFirst("a=ssrc:".count)
                     .split(separator: " ").first.map(String.init) ?? ""
                 if !value.isEmpty, !c.ssrc.contains(value) { c.ssrc.append(value) }
+            } else if line.hasPrefix("a=msid:") {
+                c.msid = String(line.dropFirst("a=msid:".count)).trimmingCharacters(in: .whitespaces)
             } else if ["a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"].contains(line) {
                 c.dir = String(line.dropFirst(2))
             }
@@ -833,12 +843,22 @@ final class PeerSession: NSObject {
             } else {
                 ssrcText = s.ssrc.contains(senderSsrc) ? "ssrc✓" : "ssrc✗"
             }
-            return "mid\(s.mid)/\(s.dir)/p\(s.port)/\(ssrcText)"
+            /* msid 单独一个字段，因为它是"对端有没有轨"的直接判据。
+               以前这行只打 ssrc，于是出现了一个解释不了的现场：
+               本端 14233 包零丢包、对端 RTCP 也在回，可对方的 onAddTrack
+               就是不触发 —— 因为 SDP 里这条 m-line 根本没有 a=msid。
+               打出来就没什么可猜的了：
+                 · `ms`      → 有 msid，对端该拿到轨；
+                 · `ms✗`     → 没有，对端必定拿不到，就是黑屏的根。 */
+            let msidText = s.msid.isEmpty ? "ms✗" : "ms"
+            return "mid\(s.mid)/\(s.dir)/p\(s.port)/\(ssrcText)/\(msidText)"
         }
         let mismatch = senderSsrc == "无" || sections.contains { !$0.ssrc.isEmpty && !$0.ssrc.contains(senderSsrc) }
+        let noMsid = sections.contains { !$0.msid.isEmpty == false && $0.ssrc.isEmpty == false }
         return "BUNDLE[\(bundle)] · 发送端 mid\(senderMid)/ssrc\(senderSsrc)"
             + " · \(items.isEmpty ? "无video段⚠️" : items.joined(separator: " · "))"
             + (mismatch ? " ⚠️漂移" : "")
+            + (noMsid ? " ⚠️无msid" : "")
     }
 
     /// 本地 SDP 里所有 video 段声明过的 SSRC。
@@ -1896,7 +1916,12 @@ final class PeerSession: NSObject {
     /// 只能等看门狗拆连接，结果把"重发一次就能好"的问题变成了"整场会话没了"。
     private func scheduleOfferRetry() {
         offerRetryTask?.cancel()
-        guard offerRetryCount < 3 else { return }
+        /* 以前只重发 3 次。现场「远端 无描述 + 有本地offer」的卡死经常拖到
+           第 3 次之后才恢复——对端刚进会、它的信令还在重连、answer 排在队列
+           后面，前三次全部落空，这条连接就永久停在 haveLocalOffer：
+           对方那边一片黑，而本端所有计数器都是正常的。
+           重发一份 SDP 的成本只是一条信令消息，没必要设这么死的上限。 */
+        guard offerRetryCount < 20 else { return }
         let item = DispatchWorkItem { [weak self] in
             Task { @MainActor in
                 guard let self, !self.isClosed else { return }
