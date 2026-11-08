@@ -645,8 +645,15 @@ final class PeerSession: NSObject {
     /// 本端停在 `haveLocalOffer`，包按新 SSRC 发出去，对端还按旧 SSRC 收，
     /// 于是全部静默丢弃。以前诊断里没有这一栏，只能靠猜。
     var signalingStateText: String {
-        switch peerConnection.signalingState {
-        case .new: return "new"
+        /* 注意：`RTCSignalingState` 里**没有** `.new`（`.new` 属于
+           RTCIceGatheringState）。写 `case .new` 会直接编译失败——
+           1.9.17 就是死在这一行，CI 43 秒退出，四个版本都没出包。
+           "还没建起来"这个语义只能从远端描述是否为空来判断。 */
+        let state = peerConnection.signalingState
+        if state == .stable, peerConnection.remoteDescription == nil {
+            return "new/无远端描述⚠️"
+        }
+        switch state {
         case .stable: return "stable"
         case .haveLocalOffer: return "有本地offer⚠️"
         case .haveRemoteOffer: return "有远端offer"
