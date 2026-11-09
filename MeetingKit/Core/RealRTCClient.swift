@@ -94,6 +94,11 @@ final class RealRTCClient: NSObject, RTCClient {
 
     private var remotePeers: [String: RemotePeer] = [:]
 
+    /// 已被判定"打洞不通、只能走中继"的 peer。
+    /// 只进不出：一旦认定就保持到离会，避免反复重建把会话搅碎。
+    private var relayOnlyPeers: Set<String> = []
+    private var relayWatchdog: DispatchSourceTimer?
+
     /// 收到 `screen:state(on)` 时对应 peer 还没建出来（信令事件先于 peer:joined
     /// 到达的竞态）。先记下，等 peer 建好立刻补一次屏幕态，否则这条共享
     /// 会永远停在"服务端说在共享、客户端没有舞台"的状态。
@@ -433,6 +438,7 @@ final class RealRTCClient: NSObject, RTCClient {
         startAudioLevelPolling()
         startAudioUplinkWatchdog()
         startLifecycleObservers()
+        startRelayWatchdog()
     }
 
     // MARK: - 前后台与音频恢复
@@ -622,6 +628,70 @@ final class RealRTCClient: NSObject, RTCClient {
     ///
     /// 为什么不能只在 beginScreenFramePush 里同步抢一次：那个时间点常常
     /// 早于 ReplayKit 的第二次重配，抢了等于没抢。
+    // MARK: - 中继兜底
+
+    /// 打洞失败的看门狗。
+    ///
+    /// 会议室、酒店、企业 WiFi 常见的两种拦法——客户端隔离、直接丢 UDP——
+    /// 会让 host 和 srflx 候选全部失效，`iceConnectionState` 停在 checking
+    /// 或者干脆 failed。用户看到的现象是"麦克风听不见、共享一片黑"，
+    /// 而界面一切正常：人在线、轨挂着、就是没有一个包。
+    ///
+    /// 正常直连 2-3 秒就 connected，超过 18 秒还没通，基本只剩中继一条路。
+    /// 这里**只重建一次**，并且只针对这条连接（不像 ICE restart 那样无限循环），
+    /// 因为重建本身会把已经建立的一半协商推倒重来。
+    private func startRelayWatchdog() {
+        guard relayWatchdog == nil else { return }
+        let timer = DispatchSource.makeTimerSource(
+            queue: DispatchQueue(label: "com.tianqiong.meetingkit.relaywatchdog", qos: .utility)
+        )
+        timer.schedule(deadline: .now() + 12, repeating: 6.0, leeway: .milliseconds(500))
+        timer.setEventHandler { [weak self] in
+            Task { @MainActor in self?.checkIceHealth() }
+        }
+        relayWatchdog = timer
+        timer.resume()
+    }
+
+    private func stopRelayWatchdog() {
+        relayWatchdog?.cancel()
+        relayWatchdog = nil
+    }
+
+    private func checkIceHealth() {
+        guard isJoined else { return }
+        /* 没有 TURN 就没有兜底可言：iceServers 里没有 turn: 时强制 relay
+           等于把"本来还能直连"的路也堵死。 */
+        let hasTurn = iceServers.contains { server in
+            server.urlStrings.contains { $0.hasPrefix("turn:") || $0.hasPrefix("turns:") }
+        }
+        guard hasTurn else { return }
+
+        for (peerID, peer) in remotePeers {
+            let session = peer.session
+            guard !session.isClosed, !session.isIceConnected else { continue }
+            guard !relayOnlyPeers.contains(peerID) else { continue }
+            guard Date().timeIntervalSince(session.createdAt) >= 18 else { continue }
+            relayOnlyPeers.insert(peerID)
+            print("[rtc] peer \(peerID) 18 秒未连通，改用 TURN 中继重建")
+            peerSessionNeedsRebuild(session)
+        }
+    }
+
+    /// 上报用的一句话：这台设备到底拿到了几个 ICE 服务器、其中几个是 TURN、
+    /// 有几条连接已经被按到中继上。
+    ///
+    /// 排查"双方 0 包"时第一个要排除的就是它：
+    /// `srv=0` 说明 /rtc/ice 没拿到（只剩 host 候选，跨网必死）；
+    /// `turn0` 说明服务端没下发中继；`relay=1` 说明已经切过中继。
+    var iceFacts: String {
+        let turnCount = iceServers.filter { server in
+            server.urlStrings.contains { $0.hasPrefix("turn:") || $0.hasPrefix("turns:") }
+        }.count
+        let relayed = remotePeers.keys.filter { relayOnlyPeers.contains($0) }.count
+        return "srv=\(iceServers.count)(turn\(turnCount)) relay=\(relayed)"
+    }
+
     private func startRouteGuard() {
         guard routeGuardTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(
@@ -673,6 +743,8 @@ final class RealRTCClient: NSObject, RTCClient {
         isJoined = false
         stopAudioLevelPolling()
         stopAudioUplinkWatchdog()
+        stopRelayWatchdog()
+        relayOnlyPeers.removeAll()
         hasCompletedJoin = false
         options = nil
         // 先告诉服务端"主动离开"（释放位置，不等断线宽限），
@@ -2992,7 +3064,8 @@ final class RealRTCClient: NSObject, RTCClient {
             factory: factory,
             peerID: peerID,
             iceServers: iceServers,
-            polite: polite
+            polite: polite,
+            forceRelay: relayOnlyPeers.contains(peerID)
         ) else {
             print("[rtc] PeerSession 创建失败，跳过 peer \(peerID)")
             return nil
@@ -3023,6 +3096,9 @@ final class RealRTCClient: NSObject, RTCClient {
         }
         remotePeers.removeAll()
         clearAllAudioLevelState()
+        /* socket.id 变了，旧的 relayOnly 标记已经指不到人；
+           新 uid 重新判断，否则曾走中继的那台设备会永远被按在中继上。 */
+        relayOnlyPeers.removeAll()
 
         for raw in snapshot.peers {
             guard let peerID = raw["peerId"] as? String else { continue }

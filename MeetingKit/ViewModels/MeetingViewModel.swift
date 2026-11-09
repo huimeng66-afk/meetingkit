@@ -413,6 +413,10 @@ final class MeetingViewModel: ObservableObject {
             "mic": isMicOn,
             "speaker": isSpeakerOn,
             "panel": activePanel.map { String(describing: $0) } ?? "none",
+            /* ICE 事实：srv=拿到了几个服务器(turnN) relay=已切中继的连接数。
+               "两端都 0 包"时先看这一栏——srv=0 是配置没拿到，
+               turn0 是服务端没下发中继，relay>0 是打洞失败已兜底。 */
+            "ice": (rtc as? RealRTCClient)?.iceFacts ?? "-",
             "sampled": video.sampled,
             "senders": video.senders,
             "attached": video.screenAttached,

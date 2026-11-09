@@ -101,7 +101,18 @@ final class PeerSession: NSObject {
 
     let peerID: String
     let polite: Bool
+    /// 只走 TURN 中继。打洞全失败的兜底：牺牲延迟换"一定能连"。
+    let forceRelay: Bool
+    /// 建会话的时刻。看门狗用它判断"已经等了多久还没通"。
+    let createdAt = Date()
     private(set) var isClosed = false
+
+    /// 看门狗用：这条连接到底通没通。
+    /// 只认 connected/completed——`checking` 停多久都不算通。
+    var isIceConnected: Bool {
+        let state = peerConnection.iceConnectionState
+        return state == .connected || state == .completed
+    }
 
     weak var delegate: PeerSessionDelegate?
 
@@ -385,13 +396,20 @@ final class PeerSession: NSObject {
         factory: RTCPeerConnectionFactory,
         peerID: String,
         iceServers: [RTCIceServer],
-        polite: Bool
+        polite: Bool,
+        forceRelay: Bool = false
     ) {
         self.peerID = peerID
         self.polite = polite
+        self.forceRelay = forceRelay
 
         let config = RTCConfiguration()
         config.iceServers = iceServers
+        /* 兜底通道：公司/酒店 WiFi 常见"客户端隔离 + 拦截 UDP"，
+           host 与 srflx 候选全部打不通，局面就是两条 0 包。
+           这时唯一能救的是 TURN 中继——`relay` 让 ICE 只拿中继候选，
+           连不上至少能通，代价是延迟从几十毫秒涨到一百多。 */
+        config.iceTransportPolicy = forceRelay ? .relay : .all
         // ICE 走 bundle，减少候选数量与协商轮次。
         config.bundlePolicy = .maxBundle
         config.rtcpMuxPolicy = .require
