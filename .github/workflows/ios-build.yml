@@ -100,6 +100,18 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate --spec project.yml
 
+      - name: Reset SwiftPM binary cache
+        # GitHub 的 macOS 镜像自带一份 SwiftPM 缓存。当缓存里的二进制产物
+        # 与 Package.resolved 对不上时，依赖解析会死在
+        # "…already exists in file system"，整个 job 连编译都进不去。
+        # 1.9.25 连挂两次就是这个原因（1.9.24 只是恰好碰到干净的那台）。
+        # 每次清空，多花几十秒重新拉 WebRTC，换的是构建可重复。
+        run: |
+          rm -rf ~/Library/Caches/org.swift.swiftpm
+          rm -rf ~/Library/Developer/Xcode/DerivedData/SourcePackages
+          rm -rf .build
+          echo "SwiftPM 缓存已清空"
+
       - name: Build unsigned IPA
         id: build
         # 失败不立刻中断：下一步要把日志回写到 commit，
