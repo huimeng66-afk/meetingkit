@@ -389,10 +389,30 @@ final class MeetingViewModel: ObservableObject {
     /// 只看某一秒的截图分不清"一直 200kbps"和"刚掉到 200kbps"。
     /// 任何失败都静默，这条通道绝不能影响正在进行的通话。
     private func reportShareDiagnostics() {
-        guard supportsNativeScreenShare else { return }
+        /* 不再用 `supportsNativeScreenShare` 把旧路径挡在外面。
+           公开测试时设备型号不可控，iOS 26- 走广播扩展的那些机器同样需要
+           把现场传回来——它们不上报，就等于整批测试数据缺一半。 */
+        DiagReporter.shared.setPhase(isScreenSharing ? "sharing" : "meeting")
+
+        /* 完整 getStats（「系统管理员：… 发视频 N 包 · 收视频 N 包」那一段）
+           要遍历每条连接的统计项，比心跳重得多，所以每 6 拍采一次。
+           只发共享侧的自检数字是不够的：黑屏的三种成因（没发 / 没人收 /
+           收了解不出）只能靠对端的收包与解码数分开，缺了它整批日志都白传。 */
+        diagTick &+= 1
+        if diagTick % 6 == 1, let real = rtc as? RealRTCClient {
+            real.collectDiagnostics { [weak self] text in
+                self?.lastPeerReport = text
+            }
+        }
+
         let video = ScreenShareRuntime.videoStats
         var stats: [String: Any] = [
             "sharing": isScreenSharing,
+            "joined": connectionState == .connected,
+            "peers": participants.count,
+            "mic": isMicOn,
+            "speaker": isSpeakerOn,
+            "panel": activePanel.map { String(describing: $0) } ?? "none",
             "sampled": video.sampled,
             "senders": video.senders,
             "attached": video.screenAttached,
@@ -423,13 +443,24 @@ final class MeetingViewModel: ObservableObject {
             let dump = client.screenUplinkStreamDump
             if !dump.isEmpty { stats["streams"] = dump }
         }
+        /* 面板原文 + 对端统计拼在一起发。服务端按会议号能搜到全文，
+           不用再让测试者截图——他们往往只截一半。 */
+        var fullText = shareDiagnosticsReport
+        if !lastPeerReport.isEmpty {
+            fullText += "\n\n" + lastPeerReport
+        }
         DiagReporter.shared.report(
             room: meetingNumber,
             uid: localUser?.id ?? "",
-            text: shareDiagnosticsReport,
+            text: fullText,
             stats: stats
         )
     }
+
+    /// 诊断上报的节拍计数与最近一次对端统计。
+    /// 完整 `getStats` 要遍历所有统计项，比心跳重得多，所以按拍数降频。
+    private var diagTick = 0
+    private var lastPeerReport = ""
 
     /// 共享轨当前是否 enabled。
     ///
@@ -571,6 +602,16 @@ final class MeetingViewModel: ObservableObject {
         rtc = resolvedClient
         rtc.delegate = self
         teardown.store(client: rtc)
+
+        /* 装包确认：外部测试者一进会议页就来一条，哪怕后面入会失败、
+           一次共享都没开，服务端也能立刻看到"谁、什么版本、哪个会议号连上来过"。
+           没有这一条，测试者说"我装了但没数据"时根本分不清是没装还是没跑。 */
+        DiagReporter.shared.event(
+            "app.launch",
+            room: meetingNumber,
+            uid: "",
+            extra: ["title": roomTitle]
+        )
     }
 
     deinit {
@@ -1787,6 +1828,15 @@ private extension MeetingViewModel {
 
         if broadcasting {
             if changed {
+                /* 时刻型事件：共享真正开始的这一刻单独上报一条。
+                   心跳是每 2 秒一次，起播那 2 秒里发生的编码器初始化、
+                   IDR 生成、对端重新绑轨全都会落在两次心跳之间。 */
+                DiagReporter.shared.event(
+                    "share.start",
+                    room: meetingNumber,
+                    uid: localUser?.id ?? "",
+                    extra: ["backend": screenSharingBackend.displayName]
+                )
                 // 共享时优先保证画面与警示条可见，任何面板都让位。
                 activePanel = nil
                 isChromeVisible = true
@@ -1827,6 +1877,12 @@ private extension MeetingViewModel {
         } else {
             if changed {
                 shareDurationText = "00:00"
+                DiagReporter.shared.event(
+                    "share.stop",
+                    room: meetingNumber,
+                    uid: localUser?.id ?? "",
+                    extra: ["backend": screenSharingBackend.displayName]
+                )
             }
             pendingStopAt = nil
             // 真实链路：停止推流并换回摄像头轨。
