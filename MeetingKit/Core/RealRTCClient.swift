@@ -692,6 +692,18 @@ final class RealRTCClient: NSObject, RTCClient {
         return "srv=\(iceServers.count)(turn\(turnCount)) relay=\(relayed)"
     }
 
+    /// 远端共享画面的渲染链路：有轨 → 有视图 → 绑上 → 进了视图树。
+    ///
+    /// 黑屏有三种成因（没收到、收到没解、解了没上屏），前两种 getStats 能分，
+    /// 第三种只有这条能分。安卓那边靠"轨✓/轨✗ + 收N包·解M帧"徽标定位，
+    /// iOS 没有可见界面，只能回传。
+    var remoteRenderFacts: String {
+        let sharer = remotePeers.first(where: { $0.value.screen })?.value
+            ?? remotePeers.values.first
+        guard let sharer else { return "无对端" }
+        return sharer.session.renderDebugSummary
+    }
+
     private func startRouteGuard() {
         guard routeGuardTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(
@@ -2845,6 +2857,7 @@ final class RealRTCClient: NSObject, RTCClient {
                   发音频 \(outPackets) 包 · \(outKB)KB · 电平 \(String(format: "%.2f", outLevel))
                   发视频 \(outVideo) 包 · 编码 \(outVideoFrames) 帧 · \(outVideoW)x\(outVideoH) · \(rrText)
                   收视频 \(inVideoPkts) 包 · 解码 \(inVideoFrames) 帧 · key\(inVideoKey) · \(inVideoW)x\(inVideoH) · \(frameKB)KB
+                  渲染 \(peer.session.renderDebugSummary)
                 """
                 lock.lock(); perPeer.append(line); lock.unlock()
                 group.leave()

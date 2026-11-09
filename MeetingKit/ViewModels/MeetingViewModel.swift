@@ -417,6 +417,9 @@ final class MeetingViewModel: ObservableObject {
                "两端都 0 包"时先看这一栏——srv=0 是配置没拿到，
                turn0 是服务端没下发中继，relay>0 是打洞失败已兜底。 */
             "ice": (rtc as? RealRTCClient)?.iceFacts ?? "-",
+            /* 远端画面渲染链路：轨/视图/绑定/入层。黑屏但收包解码都正常时，
+               这一栏直接指出是"压根没轨"还是"解了没上屏"。 */
+            "render": (rtc as? RealRTCClient)?.remoteRenderFacts ?? "-",
             "sampled": video.sampled,
             "senders": video.senders,
             "attached": video.screenAttached,

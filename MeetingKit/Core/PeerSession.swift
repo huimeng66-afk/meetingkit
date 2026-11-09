@@ -154,6 +154,14 @@ final class PeerSession: NSObject {
             remoteScreenSharing = true
             screenLatchUntil = CACurrentMediaTime() + 8
             selectRemoteVideoTrack()
+            /* 共享信令常常比首帧早到几百毫秒：那一刻 receivers 可能还是空的，
+               认领会落空。1.5 秒后补一次，此时首帧基本已经进解码器。 */
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                Task { @MainActor in
+                    guard let self, !self.isClosed, self.remoteScreenSharing else { return }
+                    self.selectRemoteVideoTrack()
+                }
+            }
             return
         }
         guard remoteScreenSharing else { return }
@@ -193,8 +201,28 @@ final class PeerSession: NSObject {
         track.add(clock)
     }
 
+    /// 主动从 `receivers` 认领视频轨。
+    ///
+    /// `didAdd rtpReceiver` 只在 SDP 新增 m-line 时触发。1.9.23 之后共享固定走
+    /// 单条 video m-line + `replaceTrack`，共享开始**不产生新 m-line**，这个回调
+    /// 永远不会再来。如果入会时它也没触发（对端先发 offer、摄像头没开、glare
+    /// 回滚过），`remoteCameraTrack` 就一直是 nil：解码器照常工作
+    /// （`framesDecoded` 一路涨），但没有任何一条轨被绑到渲染视图上——用户看到
+    /// 的就是纯黑。安卓 1.0.26 修的是同一个坑，iOS 这边漏了。
+    @discardableResult
+    private func adoptRemoteVideoTrackIfNeeded() -> RTCVideoTrack? {
+        if let screen = remoteScreenTrack { return screen }
+        if let camera = remoteCameraTrack { return camera }
+        let candidates = peerConnection.receivers.compactMap { $0.track as? RTCVideoTrack }
+        guard let video = candidates.first else { return nil }
+        remoteCameraTrack = video
+        attachFrameClock(to: video, isScreen: false)
+        return video
+    }
+
     private func selectRemoteVideoTrack() {
         let now = CACurrentMediaTime()
+        adoptRemoteVideoTrackIfNeeded()
         let screen = remoteScreenTrack
         let camera = remoteCameraTrack
         let selected: RTCVideoTrack?
@@ -231,8 +259,12 @@ final class PeerSession: NSObject {
 
         if remoteVideoTrack !== selected {
             remoteVideoTrack = selected
-            bindRemoteVideoRenderer()
         }
+        /* 不能只在换轨时绑。视图可能比轨道晚建、也可能被上层的
+           UIViewRepresentable 重建过父视图，而 track 一直没变——
+           那时 boundRemoteTrack 已经失效，条件换轨永远等不到。
+           bind 内部有 `boundRemoteTrack === track` 早退，重复调用无代价。 */
+        bindRemoteVideoRenderer()
     }
 
     /// 远端视频渲染视图（RTCMTLVideoView），收到 track 时创建。
@@ -1469,6 +1501,11 @@ final class PeerSession: NSObject {
         view.backgroundColor = .black
         view.clipsToBounds = true
         remoteVideoView = view
+        /* 视图可能比轨道先到（共享信令先于首帧、或 didAdd 压根没触发）。
+           这里补一次认领，否则 bind 的 guard 会直接返回，之后除非有人再调
+           selectRemoteVideoTrack，画面永远不上屏。 */
+        adoptRemoteVideoTrackIfNeeded()
+        selectRemoteVideoTrack()
         bindRemoteVideoRenderer()
         return view
     }
@@ -1484,6 +1521,17 @@ final class PeerSession: NSObject {
         boundRemoteTrack?.remove(view)
         track.add(view)
         boundRemoteTrack = track
+    }
+
+    /// 渲染链路的四个节点：有轨 → 有视图 → 绑上 → 真的进了视图树。
+    /// 缺任何一环都是黑屏，但现象完全一样，上报里必须能分清。
+    var renderDebugSummary: String {
+        let hasTrack = remoteVideoTrack != nil
+        let hasView = remoteVideoView != nil
+        let isBound = hasView && boundRemoteTrack != nil
+        let inTree = remoteVideoView?.superview != nil
+        let size = remoteVideoView.map { "\(Int($0.bounds.width))x\(Int($0.bounds.height))" } ?? "-"
+        return "轨\(hasTrack ? "✓" : "✗") 视图\(hasView ? "✓" : "✗") 绑定\(isBound ? "✓" : "✗") 入层\(inTree ? "✓" : "✗") \(size)"
     }
 
     // MARK: - 关闭
