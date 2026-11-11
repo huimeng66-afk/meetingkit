@@ -1131,15 +1131,27 @@ final class RealRTCClient: NSObject, RTCClient {
         screenStateConfirmed = false
 
         let profile = Self.screenEncodingProfile
+        /* 画布跟着协商出来的 H.264 level 走：
+           L5.2 → 1920 长边；只要有一条链路是 3.1 就回退 1280。
+           这一步必须在 applyOutputFormat 之前算，编码器一旦按超限画布
+           建好，后面再改就是重建会话，中间那几秒对方是黑的。 */
+        let canvas = Self.screenCanvas(
+            profile: profile,
+            levels: remotePeers.values.map { $0.session.screenH264Level }
+        )
         // 帧新鲜度下界：早于本次会话请求时刻的 JPEG 属于上一场，不推。
         let floor = ScreenShareStore.sessionFloor ?? Date().addingTimeInterval(-2)
-        let pusher = ScreenFramePusher(source: source, notBefore: floor)
+        let pusher = ScreenFramePusher(
+            source: source,
+            notBefore: floor,
+            maxLongEdge: Int(max(canvas.width, canvas.height))
+        )
         screenPusher = pusher
         /* 格式切换必须和 tick() 的解码走同一个串行队列：
            RTCVideoSource.adaptOutputFormat 内部会重建 video adapter，
            主线程和 decodeQueue 同时调，偶发崩在 AdaptedVideoTrackSource::OnFrame。
            而且这一步必须赶在 start() 之前，否则前几帧会按旧画布推。 */
-        pusher.applyOutputFormat(width: profile.width, height: profile.height, fps: profile.fps)
+        pusher.applyOutputFormat(width: canvas.width, height: canvas.height, fps: profile.fps)
 
         /* 复用摄像头那条 sendrecv m-line：不新增 m-line、不产生协商。
            以前这里是"共享轨独占一条新 m-line"，那条 m-line 一旦协商
@@ -2950,25 +2962,51 @@ final class RealRTCClient: NSObject, RTCClient {
     nonisolated static var screenEncodingProfile: (width: Int32, height: Int32, fps: Int32, bitrate: Int) {
         switch AppSettings.shareQualitySnapshot {
         case .sharp:
-            /* 720p / 24fps / 3Mbps。
-               **这里不能写 1080p。** H.264 Level 3.1（Chrome/WebRTC 默认的
-               `42001f`）的 MaxFS 是 3600 个宏块，正好等于 1280×720；
-               1080p 是 8160 个宏块、竖屏 1080×1920 是 6600 个，都超限一倍。
-               超限的后果不是"编不出来"，而是更隐蔽的一种：
-               VideoToolbox 仍会出帧、RTP 也照发（所以"发送 N 包/编码 M 帧"
-               看着是活的），但**安卓的硬件解码器按 SDP 声明的 level 校验
-               分辨率，直接拒绝初始化**——表现就是"对方显示正在共享、
-               却永远黑屏"，而浏览器用软解不校验 level，所以网页端能看见。
-               这正是连续几个版本"发送正常、安卓全黑"的根因。
-               要 1080p 就必须把 level 抬到 4.0，但 VideoToolbox 会因为
-               `kVTCompressionPropertyKey_ProfileLevel` 与应用层写死的
-               level 冲突而创建失败（0 帧），得不偿失。
-               720p 在 3Mbps 下，手机屏共享的文字边缘是清楚的。 */
-            return (1280, 720, 24, 3_000_000)
+            /* 1080p / 30fps / 5Mbps：长边 1920，竖屏整屏出 880×1920。
+
+               以前这里写的是 1280/24fps/3Mbps，理由是"Level 3.1 的 MaxFS
+               只有 3600 宏块"。那个理由只对 **Chrome 默认 offer**（`42001f`）
+               成立；iOS 自己发 offer 时，VideoToolbox 给的 level 是 5.2
+               （现场 h264Level=L5.2），MaxFS 36864 宏块，1080p 绰绰有余。
+               被压在 1280 的直接后果就是现场看到的"共享画面糊、像被压缩过"：
+               手机整屏 1179×2556 先被缩到 576×1280，对方再放大回自己的
+               2K 屏，等于一来一回两次重采样。
+
+               ⚠️ 1080p 有一个硬前提：level ≥ 4.0。安卓发 offer 时会把
+               fmtp 钉在 3.1，这时 1920 长边会让 VideoToolbox 每帧拒绝
+               （编码 0 帧、对端全黑）。所以真正下发画布前必须过
+               `screenCanvas(profile:levels:)` 这道闸，按协商结果回退。 */
+            return (1920, 1080, 30, 5_000_000)
         case .balanced:
             // 540p / 18fps / 1.6Mbps：弱网优先保帧率，宏块数 2040，余量充足。
             return (960, 540, 18, 1_600_000)
         }
+    }
+
+    /// 真正下发给 `adaptOutputFormat` 的共享画布。
+    ///
+    /// 1080p 不是无条件可用的：H.264 的 **MaxFS 由 level 决定**，
+    /// Level 3.1 = 3600 宏块（1280×720），Level 4.0 = 8192 宏块（1920×1080）。
+    /// 安卓/Chrome 发 offer 时 fmtp 默认写 `42001f`（3.1），这时按 1920 长边
+    /// 出帧，VideoToolbox 每帧都被拒绝 —— 统计上"发 N 包 / 编码 0 帧"，
+    /// 对端一直黑。所以画布必须跟着本条链路协商到的 level 走。
+    ///
+    /// `levels` 传各对端 `screenH264Level`（形如 `L5.2`）。取最小值：
+    /// 多人会议里只要有一条链路是 3.1，就必须整场回退到 720p 档——
+    /// 同一路编码不可能对 A 发 1080p、对 B 发 720p。
+    nonisolated static func screenCanvas(
+        profile: (width: Int32, height: Int32, fps: Int32, bitrate: Int),
+        levels: [String]
+    ) -> (width: Int32, height: Int32) {
+        guard profile.width >= 1920 else { return (profile.width, profile.height) }
+
+        let parsed = levels.compactMap { text -> Double? in
+            guard text.hasPrefix("L"), let value = Double(text.dropFirst()) else { return nil }
+            return value
+        }
+        // 一条 level 都拿不到（还没协商完）：按 720p 起步，宁可糊一点也不能黑。
+        guard let weakest = parsed.min() else { return (1280, 720) }
+        return weakest >= 4.0 ? (profile.width, profile.height) : (1280, 720)
     }
 
     /// 前置优先；没有前置（少见的 iPad 外接场景）就退回第一个可用设备。
@@ -4028,6 +4066,14 @@ final class ScreenFramePusher {
     private let source: RTCVideoSource
     /// 本次会话的帧新鲜度下界。早于它的 JPEG 属于上一场，直接跳过。
     private let notBefore: Date
+    /// 解码时的长边上限（像素）。
+    ///
+    /// 这一项才是共享画质的真正开关：`startScreenShare` 里那次
+    /// `adaptOutputFormat` 只是设定"期望格式"，**每帧解码完都会用
+    /// 实际 buffer 尺寸再覆盖一次**。所以只改档位、不改这里，
+    /// 竖屏画面依旧会被压回 576×1280 —— 现场"改了 1080p 还是糊"
+    /// 就是这么来的。取值来自 `RealRTCClient.screenCanvas`（已按 level 回退）。
+    private let maxLongEdge: Int
     private var timer: DispatchSourceTimer?
     private var lastFrameDate: Date?
     /// isRunning 主线程写、decodeQueue 读：用锁保护，避免 stop 后仍在解码的帧再推一帧。
@@ -4047,8 +4093,8 @@ final class ScreenFramePusher {
     /// 只在 decodeQueue 上读写。
     private var appliedCanvas: (width: Int, height: Int)?
 
-    /// 与扩展侧的 24fps 对齐：轮询比生产慢就会积压旧帧，比生产快则空转。
-    private static let pollInterval: TimeInterval = 1.0 / 24.0
+    /// 与扩展侧 30fps 对齐：轮询比生产慢就会积压旧帧，比生产快则空转。
+    private static let pollInterval: TimeInterval = 1.0 / 30.0
     private static let decodeQueue = DispatchQueue(
         label: "com.tianqiong.meetingkit.screenpush",
         qos: .userInitiated
@@ -4066,9 +4112,10 @@ final class ScreenFramePusher {
     /// 这里挂一个只用于转发的采集器实例（真正推帧走 didCapture，不经过它的采集回调）。
     private let frameCapturer: RTCVideoCapturer
 
-    init(source: RTCVideoSource, notBefore: Date) {
+    init(source: RTCVideoSource, notBefore: Date, maxLongEdge: Int) {
         self.source = source
         self.notBefore = notBefore
+        self.maxLongEdge = maxLongEdge
         self.frameCapturer = RTCVideoCapturer(delegate: source)
     }
 
@@ -4155,7 +4202,7 @@ final class ScreenFramePusher {
                 (width: ScreenOutputSize.align16($0.width),
                  height: ScreenOutputSize.align16($0.height))
             }
-            guard let result = Self.jpegToPixelBuffer(jpeg, canvas: forced) else { return }
+            guard let result = Self.jpegToPixelBuffer(jpeg, canvas: forced, maxLongEdge: self.maxLongEdge) else { return }
             let canvas = (width: Int(result.width), height: Int(result.height))
             if self.appliedCanvas?.width != canvas.width
                 || self.appliedCanvas?.height != canvas.height {
@@ -4199,26 +4246,26 @@ final class ScreenFramePusher {
     /// JPEG → BGRA CVPixelBuffer（等比缩放，留黑边）。
     ///
     /// `canvas` 非空时用它当输出画布（上行守护降级就是走这条）；
-    /// 为空时按源比例缩到长边 1280 以内。
+    /// 为空时按源比例缩到 `maxLongEdge` 以内，默认 1280。长边由调用方
+    /// 按协商到的 H.264 level 决定（见 `RealRTCClient.screenCanvas`）。
     static func jpegToPixelBuffer(
         _ data: Data,
-        canvas: (width: Int, height: Int)? = nil
+        canvas: (width: Int, height: Int)? = nil,
+        maxLongEdge: Int = 1280
     ) -> (buffer: CVPixelBuffer, width: Int32, height: Int32)? {
         guard
             let imageSource = CGImageSourceCreateWithData(data as CFData, nil),
             let image = CGImageSourceCreateImageAtIndex(imageSource, 0, nil)
         else { return nil }
 
-        /* 默认画布必须是"长边 1280 以内"，不能写死 1920×1080。
-           H.264 Level 3.1 的 MaxFS = 3600 宏块 = 1280×720；写死 1080p 是
-           8160 宏块、竖屏 1080×1920 是 6600 宏块，都超限。超限时 iOS 照样
-           出帧发包，安卓硬件解码器却按 SDP 的 level 拒绝初始化 —— 对方
-           一直黑屏。`ScreenOutputSize.fit` 同时保证 16 对齐与同比例，
-           不留黑边、不做无谓放大。 */
+        /* 长边上限由调用方给：`screenCanvas` 已经按 H.264 level 算过
+           （L3.1 只能 1280，L4.0+ 才给 1920）。这里不能再写死 1280，
+           否则上面刚抬到 1080p 的档位会被这一行悄悄压回去。
+           `ScreenOutputSize.fit` 保证 16 对齐与同比例，不留黑边、不放大。 */
         let fitted = ScreenOutputSize.fit(
             width: image.width,
             height: image.height,
-            maxLongEdge: 1280
+            maxLongEdge: maxLongEdge
         )
         let width = canvas?.width ?? fitted.width
         let height = canvas?.height ?? fitted.height
