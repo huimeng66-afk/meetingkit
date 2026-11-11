@@ -698,8 +698,21 @@ final class PeerSession: NSObject {
     /// 远端到底收不收、ICE 通不通。缺了这三项，前几轮只能靠猜。
     /// 本地 SDP 里 H.264 的 level，形如 `L4.0`。诊断回传用它判断
     /// "编码器是不是被 SDP 限在 3.1 而编不出整屏"。
+    ///
+    /// ⚠️ 这是**本端**写进 offer 的 level，不是对端的解码能力。
+    /// 拿它当画布闸门会出事：iOS 自己发 offer 时常是 4.1/5.2，而对端
+    /// answer 里可能只有 3.1，按 1920 长边出帧 VideoToolbox 每帧拒绝，
+    /// 统计上就是"发 N 包 / 编码 0 帧 / 对端全黑"（1.9.27 现场）。
     var screenH264Level: String {
         SDPCodecFilter.h264Level(in: peerConnection.localDescription?.sdp)
+    }
+
+    /// 远端 SDP 里 H.264 的 level —— **对端解码能力**的唯一可靠来源。
+    ///
+    /// answer 是两端能力的交集，对端真的收不了 1080p 时这里会落在 3.1。
+    /// 画布必须按这一项决定（见 `RealRTCClient.screenCanvas`）。
+    var remoteH264Level: String {
+        SDPCodecFilter.h264Level(in: peerConnection.remoteDescription?.sdp)
     }
 
     /// 实际挂着的视频发送器数量（0 或 1）。

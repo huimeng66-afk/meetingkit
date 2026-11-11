@@ -179,9 +179,22 @@ final class RealRTCClient: NSObject, RTCClient {
 
     /// 协商出来的 H.264 level。`L3.1` 就是"整屏编不出来"的确诊单：
     /// Level 3.1 只允许 3600 个宏块（1280×720），880×1920 是 6600 个。
+    /// 这是**本端** SDP（offer）里的 level，只说明自己能编多大。
     var screenH264Level: String {
         guard let first = remotePeers.values.first else { return "-" }
         return first.session.screenH264Level
+    }
+
+    /// 对端 SDP 里的 level，画布闸门要用的就是这一项。
+    /// 多人会议取最小值：同一路编码不可能对 A 发 1080p、对 B 发 720p。
+    var screenRemoteH264Level: String {
+        let levels = remotePeers.values.map { $0.session.remoteH264Level }
+        let parsed = levels.compactMap { text -> Double? in
+            guard text.hasPrefix("L"), let value = Double(text.dropFirst()) else { return nil }
+            return value
+        }
+        guard let weakest = parsed.min() else { return "-" }
+        return String(format: "L%.1f", weakest)
     }
 
     /// 逐条 video send stream 的原始账本，进诊断回传。
@@ -274,6 +287,11 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 只降不升：一旦某一档确认能出帧，就守在那一档。
     /// 来回升降会让编码器反复重建，画面反而一直黑。
     private static let screenCanvasLadder: [(width: Int, height: Int)] = [
+        /* 第一刀只降到 1.9.26 长期跑通的档位（长边 1280，竖屏 576×1280）。
+           以前第一档直接砍到 432×960，是因为初始画布就是 880×1920；
+           现在初始可能是 1920，中间这一档必须留着——1080p 编不动时
+           720p 往往就够了，一刀砍半会让整场共享糊到看不清。 */
+        (576, 1280),
         (432, 960),   // 880x1920 的等比一半，16 对齐
         (640, 360),   // 标清横屏：H.264 硬件编码器的最低公共档
         (320, 240),   // 兜底：只用来裁决"编码器究竟能不能工作"
@@ -298,6 +316,12 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 上一次采样时两条流的累计字节数，用来算实际码率。
     private var lastScreenBytes = 0
     private var lastCameraBytes = 0
+    /// 上一次采样时的累计发包数 / 编码帧数。
+    ///
+    /// 这两个值**只用来算增量**。看门狗判"还在不在出包"必须看增量：
+    /// 累计值出过 49 个包就永远大于 0，`packets == 0` 那种判据一次都不会成立。
+    private var lastUplinkPackets = 0
+    private var lastUplinkEncoded = 0
     private var lastBitrateSampleAt: Date?
     /// 最近一次采样的逐条 send stream 明细，只给诊断用。
     private var lastUplinkStreams: [String] = []
@@ -1131,13 +1155,16 @@ final class RealRTCClient: NSObject, RTCClient {
         screenStateConfirmed = false
 
         let profile = Self.screenEncodingProfile
-        /* 画布跟着协商出来的 H.264 level 走：
-           L5.2 → 1920 长边；只要有一条链路是 3.1 就回退 1280。
+        /* 画布跟着**对端**协商出来的 H.264 level 走：
+           L4.0+ → 1920 长边；只要有一条链路是 3.1 就回退 1280。
+           必须读 remoteDescription：answer 才是两端能力的交集，
+           读自己的 offer 会得到 4.1/5.2，闸门形同虚设——1.9.27 现场
+           就是这样把 880×1920 硬推给只认 3.1 的安卓，编码器 0 帧。
            这一步必须在 applyOutputFormat 之前算，编码器一旦按超限画布
            建好，后面再改就是重建会话，中间那几秒对方是黑的。 */
         let canvas = Self.screenCanvas(
             profile: profile,
-            levels: remotePeers.values.map { $0.session.screenH264Level }
+            levels: remotePeers.values.map { $0.session.remoteH264Level }
         )
         // 帧新鲜度下界：早于本次会话请求时刻的 JPEG 属于上一场，不推。
         let floor = ScreenShareStore.sessionFloor ?? Date().addingTimeInterval(-2)
@@ -1173,6 +1200,8 @@ final class RealRTCClient: NSObject, RTCClient {
         scheduleScreenUplinkRefresh()
         lastScreenBytes = 0
         lastCameraBytes = 0
+        lastUplinkPackets = 0
+        lastUplinkEncoded = 0
         lastBitrateSampleAt = nil
         lastUplinkStreams = []
 
@@ -1263,6 +1292,8 @@ final class RealRTCClient: NSObject, RTCClient {
         scheduleScreenUplinkRefresh()
         lastScreenBytes = 0
         lastCameraBytes = 0
+        lastUplinkPackets = 0
+        lastUplinkEncoded = 0
         lastBitrateSampleAt = nil
         lastUplinkStreams = []
 
@@ -1597,6 +1628,15 @@ final class RealRTCClient: NSObject, RTCClient {
             }
             self.lastScreenBytes = snapshot.screenBytes
             self.lastCameraBytes = snapshot.cameraBytes
+            /* 包增量才是"现在还在不在出包"的唯一判据。
+               `snapshot.packets` 是从共享开始累计的单调值：共享第一秒
+               出过 49 个包之后，它永远不会回到 0，看门狗里那句
+               `packets == 0` 也就永远不会成立 —— 1.9.27 现场编码器
+               卡死 90 秒、一档画布都没降，就是这么来的。 */
+            let packetDelta = max(snapshot.packets - self.lastUplinkPackets, 0)
+            let encodedDelta = max(snapshot.encoded - self.lastUplinkEncoded, 0)
+            self.lastUplinkPackets = snapshot.packets
+            self.lastUplinkEncoded = snapshot.encoded
             self.lastBitrateSampleAt = now
             self.lastUplinkStreams = snapshot.streams
 
@@ -1617,11 +1657,17 @@ final class RealRTCClient: NSObject, RTCClient {
                 remoteCandidate: snapshot.remoteCandidate,
                 encoderFacts: snapshot.encoderFacts
             )
-            /* 只把"要不要改本地轨"需要的那三个字段传下去。
+            /* 只把"要不要改本地轨"需要的那几个字段传下去。
                整个元组传进去会让签名跟着 stats 一起膨胀，
                以后再加一个字段就要改三处。 */
             self.reactToUplinkSample(
-                (packets: snapshot.packets, encoded: snapshot.encoded, attached: snapshot.attached),
+                (
+                    packets: snapshot.packets,
+                    packetDelta: packetDelta,
+                    encoded: snapshot.encoded,
+                    encodedDelta: encodedDelta,
+                    attached: snapshot.attached
+                ),
                 trackEnabled: trackEnabled,
                 sendsUpstream: sendsUpstream
             )
@@ -1635,7 +1681,7 @@ final class RealRTCClient: NSObject, RTCClient {
     /// 那条还在路上的 offer。共享 m-line 现在在入会首轮就谈好，链路正常时
     /// 这里没有事情要做；只有"轨被谁关掉了"这种本地状态才值得修。
     private func reactToUplinkSample(
-        _ snapshot: (packets: Int, encoded: Int, attached: Bool),
+        _ snapshot: (packets: Int, packetDelta: Int, encoded: Int, encodedDelta: Int, attached: Bool),
         trackEnabled: Bool,
         sendsUpstream: Bool
     ) {
@@ -1660,19 +1706,22 @@ final class RealRTCClient: NSObject, RTCClient {
             ScreenShareRuntime.note("上行守护：共享轨被关，已打开")
         }
 
-        guard snapshot.packets == 0 else {
+        guard snapshot.packetDelta == 0 else {
             zeroEncodeStreak = 0
             recoverCanvasIfHealthy()
             return
         }
 
-        /* 冷启动窗口一过还是 0 包 0 帧，就换一档更小的画布。
+        /* 冷启动窗口一过还是不出包，就换一档更小的画布。
+           判据用**增量**而不是累计：现场 1.9.27 共享第一秒发过 49 个包，
+           累计值从此不再为 0，旧判据 `packets == 0` 一次都没成立过，
+           编码器卡死 90 秒、画布一档没降，用户看到的就是"共享卡死"。
            旧逻辑要等"连续 3 次采样"（≈6 秒）才动第一刀，加上 8 秒门槛，
            用户要盯着黑屏 14 秒才等到第一次自救——那时他早就退出了。
            降级只影响这一轮共享，停共享会复位（见 endScreenFramePush）。
            两刀之间至少隔 6 秒：编码器每重配一次都要 1~2 秒才出首帧，
            砍太密等于让它一直在重启。 */
-        if snapshot.encoded == 0,
+        if snapshot.encodedDelta == 0,
            screenCanvasStage < Self.screenCanvasLadder.count,
            Date().timeIntervalSince(lastCanvasDowngradeAt) >= 6 {
             let step = Self.screenCanvasLadder[screenCanvasStage]
