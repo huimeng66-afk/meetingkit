@@ -1,0 +1,13 @@
+{
+  "app": "MeetingKit",
+  "version": "1.9.28",
+  "build": "85",
+  "configuration": "Release",
+  "asset": "MeetingKit-1.9.28-unsigned.ipa",
+  "size_bytes": 8593124,
+  "signed": false,
+  "commit": "9889b1fd67cb8830c6bb60d3abe79f9cb572e5b4",
+  "ref": "v1.9.28",
+  "run_id": "42981848305",
+  "built_at": "2026-11-11T07:49:01Z"
+}
